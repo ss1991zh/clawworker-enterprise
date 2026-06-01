@@ -490,6 +490,37 @@ def _looks_like_percent_column(name: str) -> bool:
     return any(k.lower() in n for k in PERCENT_HINT_KEYWORDS)
 
 
+def _pick_cell_format(result_col_name: str) -> Optional[str]:
+    """
+    根据列名自动选 openpyxl number_format。
+    优先级:百分比 > 天数 > 货币(金额/单价)> KPI rule value_kind > 默认无格式。
+
+    所有 sheet(明细 / 大区/仓库汇总 / TOP10 / BOTTOM10 / 呆滞)共用这个选择,
+    避免出现"明细页 1 位小数,排行榜 6 位小数"的不一致。
+    """
+    rule = KPI_RULES_BY_COLNAME.get(result_col_name) or {}
+    decimals = rule.get("value_decimals", 2)
+
+    # 1. 百分比
+    if _looks_like_percent_column(result_col_name):
+        return "0.00%"
+
+    # 2. 天数(默认 1 位)
+    if "天数" in result_col_name or "周转" in result_col_name:
+        n = rule.get("value_decimals", 1)
+        return "0" if n == 0 else f"0.{'0' * n}"
+
+    # 3. 货币
+    if rule.get("value_kind") == "currency" or "金额" in result_col_name or "单价" in result_col_name:
+        return f"¥#,##0.{'0' * decimals}"
+
+    # 4. KPI rule 指定 number
+    if rule.get("value_kind") == "number":
+        return "0" if decimals == 0 else f"0.{'0' * decimals}"
+
+    return None
+
+
 def _render_row_aligned_rich(
     *,
     decrypted: list,
@@ -513,17 +544,8 @@ def _render_row_aligned_rich(
         if extras:
             result_col_name = extras[-1]
     result_col_name = EN_TO_ZH_COLUMN_NAMES.get(result_col_name.lower(), result_col_name)
-    # 数字格式自动选择:百分比 / 货币 / 默认
-    pct_fmt: Optional[str]
-    if _looks_like_percent_column(result_col_name):
-        pct_fmt = "0.00%"
-    else:
-        # 库存场景的"金额"列用货币格式
-        rule = KPI_RULES_BY_COLNAME.get(result_col_name) or {}
-        if rule.get("value_kind") == "currency" or "金额" in result_col_name or "单价" in result_col_name:
-            pct_fmt = "¥#,##0.00"
-        else:
-            pct_fmt = None
+    # 集中选择 cell number_format(所有 sheet 共用)
+    pct_fmt: Optional[str] = _pick_cell_format(result_col_name)
 
     # === 2. 列顺序调整:让"分组维度"紧贴在"主体名称"之前 ===
     cols_out = list(cols_in)
@@ -728,9 +750,6 @@ def _build_detail_sheet(
     number_formats: dict[str, str] = {}
     if pct_fmt:
         number_formats[result_col_name] = pct_fmt
-    # 周转天数列用整数格式
-    if result_col_name == "库存周转天数":
-        number_formats[result_col_name] = "0.0"
 
     tier_colors: dict[str, list[tuple[float, str]]] = {}
     if result_col_name in TIER_MAP_BY_COLNAME:
@@ -815,7 +834,7 @@ def _build_dormant_sheet(*, records: list[dict], result_col_name: str) -> Option
             [i] + [r.get(c) for c in base_cols] + [r[result_col_name], r.get("健康度", "滞销")]
         )
 
-    number_formats = {result_col_name: "0.0"}
+    number_formats = {result_col_name: _pick_cell_format(result_col_name) or "0.0"}
     tier_colors = {result_col_name: TURNOVER_DAYS_TIERS}
 
     return SheetData(
