@@ -30,6 +30,9 @@ class Account:
     password_salt: str
     status: AccountStatus = AccountStatus.ACTIVE
     created_at: datetime = field(default_factory=datetime.now)
+    # 绑定的 LLM 配置 id(对应 LLMConfigStore 里某条);
+    # None 表示"稍后补选",此时 /llm/chat 返回 503 提示前往配置
+    llm_config_id: Optional[str] = None
 
     # 兼容旧字段
     @property
@@ -70,7 +73,15 @@ class UserManager:
         return self._auth_manager
 
     # ----- 账户管理 -----
-    def create_account(self, *, username: str, password: str, auth_id: Optional[str] = None, cert_id: Optional[str] = None) -> Account:
+    def create_account(
+        self,
+        *,
+        username: str,
+        password: str,
+        auth_id: Optional[str] = None,
+        cert_id: Optional[str] = None,
+        llm_config_id: Optional[str] = None,
+    ) -> Account:
         """
         用户授权激活账户 + 设密码。
 
@@ -79,6 +90,7 @@ class UserManager:
             password: 密码
             auth_id: 关联的 user_authorization id;若不传则查找已绑定到该 username 的授权
             cert_id: 旧名兼容,等同 auth_id
+            llm_config_id: 可选;绑定该用户走哪份 LLM 配置(None = 稍后补选)
         """
         if username in self._accounts:
             raise ValueError(f"账户 {username} 已存在")
@@ -99,9 +111,16 @@ class UserManager:
             auth_id=auth.auth_id,
             password_hash=_hash_password(password, salt),
             password_salt=salt,
+            llm_config_id=llm_config_id,
         )
         self._accounts[username] = acct
         return acct
+
+    def set_llm_config(self, username: str, llm_config_id: Optional[str]) -> None:
+        """绑定 / 解绑用户的 LLM 配置;传 None 表示清空(稍后补选)。"""
+        if username not in self._accounts:
+            raise ValueError(f"账户 {username} 不存在")
+        self._accounts[username].llm_config_id = llm_config_id or None
 
     def disable(self, username: str) -> None:
         if username in self._accounts:

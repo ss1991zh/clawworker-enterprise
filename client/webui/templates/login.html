@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>登录 · Clawworker</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body class="login-body">
+  <div class="login-wrap">
+    <div class="login-card">
+      <div class="login-head">
+        <div class="logo">爪</div>
+        <div>
+          <h1>Clawworker</h1>
+          <p>同态加密 · 企业版客户端</p>
+        </div>
+      </div>
+
+      {% if messages %}
+        {% for category, msg in messages %}
+          <div class="login-alert {{ category }}">{{ msg }}</div>
+        {% endfor %}
+      {% endif %}
+
+      <form method="post" action="/login">
+        <div class="field">
+          <label>主机地址</label>
+          <input type="text" name="host_url" value="{{ default_host }}" required
+                 placeholder="http://127.0.0.1:8443">
+        </div>
+        <div class="field">
+          <label>用户名</label>
+          <input type="text" name="username" required autocomplete="username"
+                 pattern="[a-zA-Z0-9_-]+" autofocus>
+        </div>
+        <div class="field">
+          <label>密码</label>
+          <input type="password" name="password" required autocomplete="current-password">
+        </div>
+        <button type="submit" class="btn-primary login-btn">登录</button>
+      </form>
+
+      <p class="login-foot">凭据 8 小时有效 · 密钥永不出本机</p>
+    </div>
+  </div>
+</body>
+</html>

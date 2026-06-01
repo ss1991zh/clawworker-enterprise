@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <title>Clawworker · 同态加密分析助手</title>
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <!-- ============ 侧栏:会话列表 ============ -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar__head">
+      <div class="logo">爪</div>
+      <div>
+        <h1>Clawworker</h1>
+        <p>同态加密 · 企业版</p>
+      </div>
+    </div>
+    <button class="new-btn ic-btn" id="newBtn">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      新建会话
+    </button>
+    <div class="session-list" id="sessionList"></div>
+    <div class="sidebar__foot">
+      <span class="user-chip">{{ username }}</span>
+      <button class="settings-btn" id="settingsBtn" title="设置">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+
+  <!-- ============ 主区:Chat ============ -->
+  <div class="panel">
+    <div class="topbar">
+      <button class="menu-btn" id="menuBtn">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <h2 id="topTitle">智能分析助手</h2>
+    </div>
+
+    <main id="main">
+      <div class="chat" id="chat">
+        <div class="welcome" id="welcome">
+          <div class="logo welcome-logo">爪</div>
+          <div class="big">同态加密 · 数据分析助手</div>
+          <div class="sub">明文不出本机 · 计算全程密文 · 输出 Excel 解密回本机</div>
+          <div class="chips">
+            <div class="chip">按大区统计销售目标完成率,完成档位涂色,导 Excel</div>
+            <div class="chip">用 ARIMA + EWMA 预测未来 12 个月销量,看产品线</div>
+            <div class="chip">算库存周转天数 + ABC 分类,标记呆滞物料</div>
+            <div class="chip">月度回款率 TOP10 / BOTTOM10 排行</div>
+          </div>
+          <p class="welcome-hint">点击左侧 <strong>新建会话</strong> 开始 · 或选一条已有会话继续</p>
+        </div>
+      </div>
+    </main>
+
+    <footer>
+      <div class="composer" id="composer">
+        <!-- 上下文条:当前会话绑定的密文 + schema -->
+        <div class="ctx-bar" id="ctxBar" style="display:none;">
+          <div class="ctx-chip" id="ctxCipher">
+            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+            <span class="ctx-name">未绑定密文</span>
+          </div>
+          <div class="ctx-chip" id="ctxSchema">
+            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+            <span class="ctx-name">未设置 schema</span>
+          </div>
+        </div>
+
+        <div class="attach-chips" id="attachChips"></div>
+
+        <div class="composer-row">
+          <button class="attach-btn" id="attachBtn" type="button" title="附件:数据文件 / schema JSON">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="fileInput" hidden multiple>
+          <textarea id="input" rows="1" placeholder="问问看 · 回车发送 · Shift+回车换行" disabled></textarea>
+          <button class="send" id="sendBtn" disabled>发送</button>
+        </div>
+      </div>
+    </footer>
+
+    <div class="drop-overlay" id="dropOverlay">
+      <div class="drop-overlay__box">
+        <svg class="ic-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
+        </svg>
+        <span>松开鼠标 · 数据(CSV/XLSX)自动加密 · JSON 文件作为 schema</span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ============ 设置 Modal ============ -->
+  <div class="modal-mask" id="modalMask">
+    <div class="modal" style="position:relative;">
+      <button class="modal__close" id="modalClose">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <nav class="modal__nav">
+        <h3>设置</h3>
+        <button class="tab-btn active" data-tab="general">连接 / 计算</button>
+        <button class="tab-btn" data-tab="files">密文文件</button>
+        <button class="tab-btn" data-tab="keys">同态密钥</button>
+        <button class="tab-btn" data-tab="schema">会话 schema</button>
+        <button class="tab-btn" data-tab="account">账户</button>
+      </nav>
+      <div class="modal__body" id="modalBody"></div>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

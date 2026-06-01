@@ -31,6 +31,13 @@ class LLMProvider(ABC):
     @abstractmethod
     def chat(self, system: str, user: str) -> LLMResponse: ...
 
+    def raw_chat(self, system: str, user: str) -> str:
+        """
+        返回模型原始文本(不 parse 出 computation_plan)。
+        默认实现:不支持(子类必须重写)。用于自由聊天场景。
+        """
+        raise NotImplementedError("provider 不支持 raw_chat")
+
 
 # ---------------------------------------------------------------------------
 # Stub Provider —— 测试与无 API key 场景
@@ -44,9 +51,23 @@ class StubLLMProvider(LLMProvider):
 
     def __init__(self, response: LLMResponse):
         self._response = response
+        # 调用方约定:每次 chat 完毕后,provider.last_usage 应是
+        # {"prompt_tokens": int, "completion_tokens": int}。stub 模拟一份非零值
+        # 以便统计页面在 stub 模式下也能看到数字。
+        self.last_usage: dict[str, int] = {}
 
     def chat(self, system: str, user: str) -> LLMResponse:
+        # 简单按字符数估 tokens(粗略 1:4)
+        pt = max(1, (len(system) + len(user)) // 4)
+        ct = 200  # 假定固定输出长度
+        self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
         return self._response
+
+    def raw_chat(self, system: str, user: str) -> str:
+        pt = max(1, (len(system) + len(user)) // 4)
+        ct = 30
+        self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
+        return "(stub 模式 · 来自测试 provider 的回复 · 请配置真实 LLM)"
 
 
 # ---------------------------------------------------------------------------
@@ -65,8 +86,9 @@ class AnthropicLLMProvider(LLMProvider):
         self._client = anthropic.Anthropic(api_key=api_key)
         self._model = model
         self._max_tokens = max_tokens
+        self.last_usage: dict[str, int] = {}
 
-    def chat(self, system: str, user: str) -> LLMResponse:
+    def _complete(self, system: str, user: str) -> str:
         resp = self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -74,7 +96,22 @@ class AnthropicLLMProvider(LLMProvider):
             messages=[{"role": "user", "content": user}],
         )
         text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        return parse_llm_text(text)
+        # 抓 token 用量(Anthropic 返回 input_tokens / output_tokens)
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self.last_usage = {
+                "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
+            }
+        else:
+            self.last_usage = {}
+        return text
+
+    def chat(self, system: str, user: str) -> LLMResponse:
+        return parse_llm_text(self._complete(system, user))
+
+    def raw_chat(self, system: str, user: str) -> str:
+        return self._complete(system, user)
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -111,8 +148,11 @@ class OpenAICompatibleProvider(LLMProvider):
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
+        # 每次调用后填:{"prompt_tokens", "completion_tokens", 可选 "cost_usd"}
+        # cost_usd 在 OpenRouter 时来自服务端返回的 usage.cost(优先),否则按 PRICE_PER_1K 估
+        self.last_usage: dict[str, float] = {}
 
-    def chat(self, system: str, user: str) -> LLMResponse:
+    def _complete(self, system: str, user: str) -> str:
         resp = self._client.chat.completions.create(
             model=self._model,
             messages=[
@@ -123,7 +163,26 @@ class OpenAICompatibleProvider(LLMProvider):
             temperature=self._temperature,
         )
         text = resp.choices[0].message.content or ""
-        return parse_llm_text(text)
+        # 抓 token 用量
+        usage = getattr(resp, "usage", None)
+        if usage is not None:
+            self.last_usage = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", 0) or 0,
+                "completion_tokens": getattr(usage, "completion_tokens", 0) or 0,
+            }
+            # OpenRouter 在 usage 里附带 cost 字段(美元)
+            cost = getattr(usage, "cost", None)
+            if cost is not None:
+                self.last_usage["cost_usd"] = float(cost)
+        else:
+            self.last_usage = {}
+        return text
+
+    def chat(self, system: str, user: str) -> LLMResponse:
+        return parse_llm_text(self._complete(system, user))
+
+    def raw_chat(self, system: str, user: str) -> str:
+        return self._complete(system, user)
 
 
 # OpenRouter 是 OpenAI 兼容协议的代理,常用预设
@@ -210,6 +269,30 @@ def parse_llm_text(text: str) -> LLMResponse:
 # ---------------------------------------------------------------------------
 
 
+# 国内厂商默认 base_url(给 make_provider 在没传 base_url 时兜底)
+_DEFAULT_BASE_URLS: dict[str, str] = {
+    "openai":      "https://api.openai.com/v1",
+    "openrouter":  "https://openrouter.ai/api/v1",
+    "deepseek":    "https://api.deepseek.com/v1",
+    "zhipu":       "https://open.bigmodel.cn/api/paas/v4",
+    "moonshot":    "https://api.moonshot.cn/v1",
+    "qwen":        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    "doubao":      "https://ark.cn-beijing.volces.com/api/v3",
+    "hunyuan":     "https://api.hunyuan.cloud.tencent.com/v1",
+    "baichuan":    "https://api.baichuan-ai.com/v1",
+    "minimax":     "https://api.minimax.chat/v1",
+    "stepfun":     "https://api.stepfun.com/v1",
+    "spark":       "https://spark-api-open.xf-yun.com/v1",
+    "baidu":       "https://qianfan.baidubce.com/v2",
+    "sensetime":   "https://api.sensenova.cn/compatible-mode/v1",
+    "yi":          "https://api.lingyiwanwu.com/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+}
+
+# 走 OpenAI 兼容协议的 provider 类型(包括所有国内厂商)
+_OPENAI_COMPATIBLE = set(_DEFAULT_BASE_URLS.keys())
+
+
 def make_provider(model_type: str, **kwargs: Any) -> LLMProvider:
     """
     根据 model_type 创建对应 provider。
@@ -217,8 +300,10 @@ def make_provider(model_type: str, **kwargs: Any) -> LLMProvider:
     支持:
     - "stub"        - 测试用,kwargs["response"]: LLMResponse
     - "anthropic"   - Anthropic Claude,kwargs["api_key"] + kwargs["model"]
-    - "openrouter"  - OpenRouter,kwargs["api_key"] + kwargs["model"](如 deepseek/deepseek-v4-pro)
-    - "openai"      - OpenAI 官方,kwargs["api_key"] + kwargs["model"]
+    - openai 兼容协议:openai / openrouter / deepseek / zhipu / moonshot /
+                      qwen / doubao / hunyuan / baichuan / minimax / stepfun /
+                      spark / baidu / sensetime / yi / siliconflow
+      kwargs["api_key"] + kwargs["model"](+ 可选 base_url 覆盖默认)
     """
     if model_type == "stub":
         return StubLLMProvider(kwargs["response"])
@@ -227,18 +312,11 @@ def make_provider(model_type: str, **kwargs: Any) -> LLMProvider:
             api_key=kwargs["api_key"],
             model=kwargs.get("model", "claude-sonnet-4-5"),
         )
-    if model_type == "openrouter":
-        return make_openrouter_provider(
-            api_key=kwargs["api_key"],
-            model=kwargs["model"],
-            max_tokens=kwargs.get("max_tokens", 4096),
-            temperature=kwargs.get("temperature", 0.2),
-        )
-    if model_type == "openai":
+    if model_type in _OPENAI_COMPATIBLE:
         return OpenAICompatibleProvider(
             api_key=kwargs["api_key"],
             model=kwargs["model"],
-            base_url=kwargs.get("base_url", "https://api.openai.com/v1"),
+            base_url=kwargs.get("base_url") or _DEFAULT_BASE_URLS[model_type],
             max_tokens=kwargs.get("max_tokens", 4096),
             temperature=kwargs.get("temperature", 0.2),
         )

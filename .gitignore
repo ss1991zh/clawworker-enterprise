@@ -65,6 +65,20 @@ Thumbs.db
 !.env.example
 **/credentials.json
 
+# 主机持久化的 LLM 配置(含 API key!)、用量统计、客户端本地配置
+**/host-config/
+**/llm_configs.json
+**/client-config.json
+
+# 客户端历史任务记录(含业务问题、产物路径)
+**/history/
+
+# 用户保存的 schema(可能含内部字段名)
+**/schemas/
+
+# vault/ 沙盒(冗余兜底,已被 keystore/ 覆盖)
+**/vault/
+
 # 密文数据(用户的业务数据,即使加密也不上传)
 **/ciphertexts/
 **/*.cipher

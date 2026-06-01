@@ -4,7 +4,7 @@
   <h1 class="page-title">用户管理</h1>
   <p class="page-subtitle">
     一个证书绑定一个用户 · 双因子(证书激活 + 账户密码登录) ·
-    同一证书反复上传也只能绑给一个用户
+    同一证书反复上传也只能绑给一个用户 · 每个用户可选择走哪份 LLM 配置
   </p>
 
   <div class="panel">
@@ -32,6 +32,22 @@
             <input type="password" name="password" placeholder="至少 6 位" required minlength="6">
           </div>
         </div>
+        <div class="field">
+          <label>LLM 配置(可稍后补选)</label>
+          <select name="llm_config_id">
+            <option value="">— 稍后补选 —</option>
+            {% for c in llm_configs %}
+              {% if c.enabled %}
+                <option value="{{ c.id }}">{{ c.name }} · {{ c.model_name }}</option>
+              {% endif %}
+            {% endfor %}
+          </select>
+          {% if not llm_configs %}
+            <div style="font-size:12px; color:var(--text-muted); margin-top:6px;">
+              ⚠️ 当前还没有任何 LLM 配置 · <a href="/admin/llm">前往新建 →</a>
+            </div>
+          {% endif %}
+        </div>
         <button type="submit" class="btn btn-primary" style="margin-top:8px;">创建用户</button>
       </form>
     </div>
@@ -48,9 +64,10 @@
           <tr>
             <th>用户名</th>
             <th>证书指纹</th>
+            <th>LLM 配置</th>
             <th>状态</th>
             <th>创建时间</th>
-            <th style="width:280px;">操作</th>
+            <th style="width:300px;">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -58,6 +75,14 @@
           <tr>
             <td><strong>{{ u.username }}</strong></td>
             <td class="mono">{{ u.auth_id }}</td>
+            <td>
+              {% if u.llm_config_name %}
+                <span class="pill muted">{{ u.llm_config_name }}</span>
+                <div class="mono" style="font-size:11px; color:var(--text-muted); margin-top:2px;">{{ u.llm_model_name }}</div>
+              {% else %}
+                <span class="pill warning">未配置</span>
+              {% endif %}
+            </td>
             <td>
               {% if u.status == 'active' %}
                 <span class="pill active">活跃</span>
@@ -70,7 +95,7 @@
             </td>
             <td class="mono">{{ u.created_at }}</td>
             <td>
-              <a class="btn btn-secondary btn-sm" href="/admin/users/{{ u.username }}/edit">修改密码</a>
+              <a class="btn btn-secondary btn-sm" href="/admin/users/{{ u.username }}/edit">修改</a>
               {% if u.status == 'active' %}
                 <form method="post" action="/admin/users/{{ u.username }}/disable" style="display:inline;">
                   <button class="btn btn-secondary btn-sm" type="submit">禁用</button>

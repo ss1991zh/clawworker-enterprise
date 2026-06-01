@@ -2,66 +2,275 @@
 {% block title %}LLM 配置 · Admin{% endblock %}
 {% block content %}
   <h1 class="page-title">LLM 代理配置</h1>
-  <p class="page-subtitle">所有客户端通过本主机 /llm/chat 统一调用 · 不接触明文数据 · 不接触密钥</p>
+  <p class="page-subtitle">
+    支持同时保存多份配置(DeepSeek / 智谱 GLM / Kimi / 通义 / 豆包 / Claude / OpenAI ...)·
+    国内厂商大多走 OpenAI 兼容协议 · 配置改动即时生效(无需重启)
+  </p>
 
+  <!-- 注入 provider 元数据 + fallback model 列表给 JS -->
+  <script id="provider-data" type="application/json">
+    {
+      "providers": [
+        {% for p in provider_options %}
+        {"id":"{{ p.id }}","label":"{{ p.label }}","base_url":"{{ p.base_url }}","kind":"{{ p.kind }}"}{% if not loop.last %},{% endif %}
+        {% endfor %}
+      ],
+      "fallback_models": {
+        {% for pid, models in fallback_models_json.items() %}
+        "{{ pid }}": [{% for m in models %}"{{ m }}"{% if not loop.last %},{% endif %}{% endfor %}]{% if not loop.last %},{% endif %}
+        {% endfor %}
+      }
+    }
+  </script>
+
+  <!-- ============ 新建配置 ============ -->
   <div class="panel">
-    <div class="panel-header"><h3>当前配置</h3></div>
+    <div class="panel-header"><h3>新增配置</h3></div>
     <div class="panel-body">
-      <dl>
-        <div class="dl-row"><dt>Provider 类型</dt><dd>{{ llm.provider_type or '— 未配置 —' }}</dd></div>
-        <div class="dl-row"><dt>模型名称</dt><dd>{{ llm.model_name or '—' }}</dd></div>
-        <div class="dl-row"><dt>API Base URL</dt><dd>{{ llm.base_url or '—' }}</dd></div>
-        <div class="dl-row"><dt>API Key</dt><dd>{{ llm.api_key_masked }}</dd></div>
-        <div class="dl-row"><dt>状态</dt>
-          <dd>
-            {% if llm.ready %}
-              <span class="pill active">已就绪</span>
-            {% else %}
-              <span class="pill warning">未配置(/llm/chat 将返回 503)</span>
-            {% endif %}
-          </dd>
+      <form method="post" action="/admin/llm" id="create-form">
+        <div class="form-grid">
+          <div class="field">
+            <label>配置名(展示用)</label>
+            <input type="text" name="name" placeholder="DeepSeek V4 Pro / GLM-4-Plus / Kimi K1.5" required>
+          </div>
+          <div class="field">
+            <label>Provider(厂商)</label>
+            <select name="provider_type" id="create-provider" required>
+              {% for p in provider_options %}
+                <option value="{{ p.id }}" {% if p.id == 'deepseek' %}selected{% endif %}>{{ p.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
         </div>
-      </dl>
+        <div class="field">
+          <label>API Key</label>
+          <input type="password" name="api_key" id="create-apikey" placeholder="sk-...... / 各厂商颁发的密钥">
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>
+              模型名
+              <a href="#" id="create-discover" style="font-size:11px; margin-left:8px;">用 API Key 实时拉取 →</a>
+            </label>
+            <select name="model_name" id="create-model" required></select>
+            <div id="create-discover-status" style="font-size:11px; color:var(--text-muted); margin-top:4px;"></div>
+          </div>
+          <div class="field">
+            <label>Base URL(留空 = 用厂商默认)</label>
+            <input type="text" name="base_url" id="create-baseurl" placeholder="自动按厂商填充">
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:8px;">保存配置</button>
+      </form>
     </div>
   </div>
 
+  <!-- ============ 配置列表 ============ -->
   <div class="panel">
-    <div class="panel-header"><h3>如何切换 / 重新配置</h3></div>
-    <div class="panel-body">
-      <p style="margin-top:0; color: var(--text-muted);">
-        Provider 由主机环境变量驱动,修改后需重启 uvicorn 进程。
-      </p>
-
-<pre style="background:var(--bg); padding:16px; border-radius:4px; font-size:12px; font-family:SF Mono, Menlo, monospace; overflow-x:auto; border:1px solid var(--border);">
-# OpenRouter + DeepSeek(当前推荐)
-MODEL_TYPE=openrouter \
-OPENROUTER_API_KEY=sk-or-v1-...... \
-MODEL_NAME=deepseek/deepseek-v4-pro \
-uvicorn host.server:app --host 0.0.0.0 --port 8443
-
-# Anthropic Claude
-MODEL_TYPE=anthropic \
-ANTHROPIC_API_KEY=sk-ant-...... \
-MODEL_NAME=claude-sonnet-4-5 \
-uvicorn host.server:app ...
-
-# OpenAI 官方
-MODEL_TYPE=openai \
-OPENAI_API_KEY=sk-...... \
-MODEL_NAME=gpt-4o \
-uvicorn host.server:app ...
-</pre>
+    <div class="panel-header">
+      <h3>已保存配置({{ configs|length }})</h3>
+    </div>
+    <div class="panel-body compact">
+      {% if configs %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>配置名</th>
+            <th>厂商</th>
+            <th>模型</th>
+            <th>API Key</th>
+            <th>状态</th>
+            <th style="width:280px;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for c in configs %}
+          <tr>
+            <td><strong>{{ c.name }}</strong><br><span class="mono" style="font-size:11px; color:var(--text-muted);">id={{ c.id }}</span></td>
+            <td><span class="pill muted">{{ c.provider_label }}</span></td>
+            <td class="mono">{{ c.model_name }}</td>
+            <td class="mono">{{ c.api_key_masked }}</td>
+            <td>
+              {% if c.enabled and c.ready %}
+                <span class="pill active">就绪</span>
+              {% elif c.enabled %}
+                <span class="pill warning">init 失败</span>
+              {% else %}
+                <span class="pill disabled">已禁用</span>
+              {% endif %}
+            </td>
+            <td>
+              <a class="btn btn-secondary btn-sm" href="#edit-{{ c.id }}">修改</a>
+              <form method="post" action="/admin/llm/{{ c.id }}/toggle" style="display:inline;">
+                <button class="btn btn-secondary btn-sm" type="submit">{% if c.enabled %}禁用{% else %}启用{% endif %}</button>
+              </form>
+              <form method="post" action="/admin/llm/{{ c.id }}/delete"
+                    style="display:inline;"
+                    onsubmit="return confirm('确认删除「{{ c.name }}」?\n绑定该配置的用户会被自动解绑(需重新选)。');">
+                <button class="btn btn-danger" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <div class="empty">还没有任何 LLM 配置 · 用上方表单创建第一份</div>
+      {% endif %}
     </div>
   </div>
 
-  <div class="panel">
-    <div class="panel-header"><h3>调用统计</h3></div>
+  <!-- ============ 修改面板(每个配置一张) ============ -->
+  {% for c in configs %}
+  <div class="panel" id="edit-{{ c.id }}">
+    <div class="panel-header"><h3>修改「{{ c.name }}」</h3></div>
     <div class="panel-body">
-      <dl>
-        <div class="dl-row"><dt>累计 LLM 调用</dt><dd>{{ llm.total_calls }} 次</dd></div>
-        <div class="dl-row"><dt>成功</dt><dd>{{ llm.successful_calls }} 次</dd></div>
-        <div class="dl-row"><dt>失败</dt><dd>{{ llm.failed_calls }} 次</dd></div>
-      </dl>
+      <form method="post" action="/admin/llm/{{ c.id }}/update" data-cid="{{ c.id }}" class="edit-form">
+        <div class="form-grid">
+          <div class="field">
+            <label>配置名</label>
+            <input type="text" name="name" value="{{ c.name }}">
+          </div>
+          <div class="field">
+            <label>Provider(厂商)</label>
+            <select name="provider_type" class="edit-provider">
+              {% for p in provider_options %}
+                <option value="{{ p.id }}" {% if p.id == c.provider_type %}selected{% endif %}>{{ p.label }}</option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>API Key(留空 = 不修改;已保存:<span class="mono">{{ c.api_key_masked }}</span>)</label>
+          <input type="password" name="api_key" class="edit-apikey" placeholder="留空保持不变,或粘贴新 key">
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>
+              模型名
+              <a href="#" class="edit-discover" style="font-size:11px; margin-left:8px;">用 API Key 实时拉取 →</a>
+            </label>
+            <select name="model_name" class="edit-model" data-current="{{ c.model_name }}"></select>
+            <div class="edit-discover-status" style="font-size:11px; color:var(--text-muted); margin-top:4px;"></div>
+          </div>
+          <div class="field">
+            <label>Base URL</label>
+            <input type="text" name="base_url" value="{{ c.base_url }}" class="edit-baseurl">
+          </div>
+        </div>
+        <div class="field">
+          <label>
+            <input type="checkbox" name="enabled" {% if c.enabled %}checked{% endif %} style="width:auto; margin-right:6px;">
+            启用此配置
+          </label>
+        </div>
+        <button type="submit" class="btn btn-primary">保存修改</button>
+        <a class="btn btn-secondary" href="/admin/llm">取消</a>
+      </form>
     </div>
   </div>
+  {% endfor %}
+
+  <script>
+    const META = JSON.parse(document.getElementById('provider-data').textContent);
+    const PROVIDER_BY_ID = Object.fromEntries(META.providers.map(p => [p.id, p]));
+
+    // 给 <select> 填一组 options(可选指定 selected)
+    function fillModelSelect(selectEl, models, selected) {
+      selectEl.innerHTML = '';
+      // 当前模型不在列表里也保留(可能是 fallback 之外的自定义模型)
+      const list = (selected && !models.includes(selected)) ? [selected, ...models] : models;
+      list.forEach(m => {
+        const o = document.createElement('option');
+        o.value = m; o.textContent = m;
+        if (m === selected) o.selected = true;
+        selectEl.appendChild(o);
+      });
+      // 再加一个 "其他(手动输入)" 选项 — 触发 prompt 输入
+      const o = document.createElement('option');
+      o.value = '__custom__'; o.textContent = '其他(手动输入)…';
+      selectEl.appendChild(o);
+      selectEl.addEventListener('change', e => {
+        if (e.target.value === '__custom__') {
+          const v = prompt('请输入模型名:', selected || '');
+          if (v) {
+            const opt = document.createElement('option');
+            opt.value = v; opt.textContent = v; opt.selected = true;
+            selectEl.insertBefore(opt, selectEl.firstChild);
+            selectEl.value = v;
+          } else {
+            selectEl.value = selected || (models[0] || '');
+          }
+        }
+      }, { once: false });
+    }
+
+    function applyProvider(providerSel, modelSel, baseUrlInp, currentModel) {
+      const p = PROVIDER_BY_ID[providerSel.value];
+      if (!p) return;
+      const fallback = META.fallback_models[p.id] || [];
+      fillModelSelect(modelSel, fallback, currentModel);
+      // 自动填默认 base_url(只在用户没改过时)
+      if (!baseUrlInp.value || baseUrlInp.dataset.autofilled === '1') {
+        baseUrlInp.value = p.base_url === '—' ? '' : p.base_url;
+        baseUrlInp.dataset.autofilled = '1';
+      }
+    }
+
+    async function discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp) {
+      const provider = providerSel.value;
+      const apiKey = apiKeyInp.value;
+      statusEl.textContent = '探测中…';
+      try {
+        const fd = new FormData();
+        fd.append('provider_type', provider);
+        fd.append('api_key', apiKey || '');
+        fd.append('base_url', baseUrlInp.value || '');
+        const r = await fetch('/admin/llm/discover', { method: 'POST', body: fd });
+        const data = await r.json();
+        const current = modelSel.value && modelSel.value !== '__custom__' ? modelSel.value : '';
+        fillModelSelect(modelSel, data.models, current);
+        const tag = data.source === 'api' ? '✓ 实时' : '⚠ 离线列表(' + data.source + ')';
+        statusEl.textContent = tag + ' · 共 ' + data.count + ' 个模型';
+      } catch (e) {
+        statusEl.textContent = '探测失败:' + e.message;
+      }
+    }
+
+    // ---- 新建表单初始化 ----
+    (function() {
+      const providerSel = document.getElementById('create-provider');
+      const modelSel    = document.getElementById('create-model');
+      const apiKeyInp   = document.getElementById('create-apikey');
+      const baseUrlInp  = document.getElementById('create-baseurl');
+      const statusEl    = document.getElementById('create-discover-status');
+      const link        = document.getElementById('create-discover');
+      if (!providerSel) return;
+      applyProvider(providerSel, modelSel, baseUrlInp, null);
+      providerSel.addEventListener('change', () => applyProvider(providerSel, modelSel, baseUrlInp, null));
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp);
+      });
+    })();
+
+    // ---- 每个修改表单初始化 ----
+    document.querySelectorAll('.edit-form').forEach(form => {
+      const providerSel = form.querySelector('.edit-provider');
+      const modelSel    = form.querySelector('.edit-model');
+      const apiKeyInp   = form.querySelector('.edit-apikey');
+      const baseUrlInp  = form.querySelector('.edit-baseurl');
+      const statusEl    = form.querySelector('.edit-discover-status');
+      const link        = form.querySelector('.edit-discover');
+      const current     = modelSel.dataset.current || '';
+      // 不覆盖用户已填的 base_url
+      baseUrlInp.dataset.autofilled = '';
+      applyProvider(providerSel, modelSel, baseUrlInp, current);
+      providerSel.addEventListener('change', () => applyProvider(providerSel, modelSel, baseUrlInp, ''));
+      link.addEventListener('click', e => {
+        e.preventDefault();
+        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp);
+      });
+    });
+  </script>
 {% endblock %}
