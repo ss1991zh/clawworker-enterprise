@@ -480,6 +480,7 @@ KPI_RULES_BY_COLNAME: dict[str, dict] = {
         "top_label": "TOP 3 周转最慢",
         "bottom_label": "TOP 3 周转最快",
         "value_kind": "number",
+        "value_decimals": 1,  # 天数只保留 1 位小数
     },
 }
 
@@ -601,10 +602,11 @@ def _fmt_currency(v: float) -> str:
 def _make_value_formatter(rule: dict, result_col_name: str):
     """根据 value_kind 决定标量怎么格式化。"""
     kind = rule.get("value_kind", "percent")
+    decimals = rule.get("value_decimals", 2)
     if kind == "currency":
-        return _fmt_currency
+        return lambda v: f"¥{v:,.{decimals}f}"
     if kind == "number":
-        return lambda v: f"{v:,.2f}"
+        return lambda v: f"{v:,.{decimals}f}"
     # 默认百分比(对应原有率类指标)
     return _fmt_pct
 
