@@ -35,6 +35,7 @@ SUPPORTED_OPS = [
     "describe",
     "div",  # 三种形态:单列/单列,列和/列和,列和/列和 × multiplier
     "turnover_days",  # 库存周转天数(docx §3.2):全 HE 算 M/N/P/Q/R
+    "forecast",  # 时间序列透传 + 预测 hint:HE 上仅返回 value 列,实际预测在 renderer 算
 ]
 
 
@@ -193,6 +194,17 @@ class PandaSeal:
                 result = result * cdf[multiplier]
 
             return result
+
+        if name == "forecast":
+            # 时间序列预测 hint op:HE 上仅返回值列(CipherSeries),
+            # 真正的预测(MA3/MA6/WMA/OLS)在 renderer 上对解密后的历史值做。
+            # params: {"value_col": str, "horizon": int(=3), "methods": [str]}
+            col = p.get("value_col") or p.get("field") or p.get("col")
+            if not col:
+                raise ValueError("forecast 需要 value_col")
+            if col not in cdf.columns:
+                raise ValueError(f"forecast value_col 不存在: {col}")
+            return cdf[col]
 
         if name == "turnover_days":
             # 库存周转天数 R = 平均库存金额 × 期间天数 / 出库金额

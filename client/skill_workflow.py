@@ -272,6 +272,7 @@ def _write_excel_node(state: AgentState) -> dict:
         scenario=plan.scenario,
         metadata_rows=state.get("metadata_rows"),
         metadata_columns=state.get("metadata_columns"),
+        ops=plan.ops,
     )
 
     # 文件路径:LLM 可能给了相对 ~/Downloads/ 的路径,统一规范化
@@ -812,6 +813,232 @@ def _build_abc_summary_sheet(*, records: list[dict], result_col_name: str) -> Op
     )
 
 
+def _extend_month_labels(dates: list[str], horizon: int) -> list[str]:
+    """从历史日期(YYYY-MM)往后延伸 horizon 个月。"""
+    parsed = []
+    for d in dates:
+        s = str(d)
+        parts = s.split("-")
+        if len(parts) >= 2:
+            try:
+                parsed.append((int(parts[0]), int(parts[1])))
+            except (TypeError, ValueError):
+                return [f"+{i+1}" for i in range(horizon)]
+        else:
+            return [f"+{i+1}" for i in range(horizon)]
+    if not parsed:
+        return [f"+{i+1}" for i in range(horizon)]
+    y, m = parsed[-1]
+    out = []
+    for _ in range(horizon):
+        m += 1
+        if m > 12:
+            m = 1
+            y += 1
+        out.append(f"{y:04d}-{m:02d}")
+    return out
+
+
+def _compute_forecasts(history: list[float], horizon: int, methods: list[str]) -> dict[str, list[float]]:
+    """
+    对历史时间序列计算多种预测方法,各延伸 horizon 步。
+
+    支持:
+    - MA3 / MA6 ... MA{N}    : 简单移动平均(last N)
+    - WMA                   : 加权移动平均(权重 0.5/0.3/0.2,最近权重最大)
+    - OLS                   : 一阶线性回归 y = a*t + b 外推
+    - EWMA                  : 指数加权移动平均(alpha=0.4)
+    """
+    import math
+
+    n = len(history)
+    if n == 0:
+        return {m: [0.0] * horizon for m in methods}
+
+    out: dict[str, list[float]] = {}
+    for m in methods:
+        if m.startswith("MA") and m[2:].isdigit():
+            k = min(int(m[2:]), n)
+            val = sum(history[-k:]) / k
+            out[m] = [val] * horizon
+        elif m == "WMA":
+            # 老→新 权重递增(最新月份权重最大)
+            w = [0.2, 0.3, 0.5]
+            k = min(len(w), n)
+            ws = w[-k:]  # 取末尾 k 个权重,对应最近 k 个月
+            vs = history[-k:]
+            tot_w = sum(ws)
+            val = sum(a * b for a, b in zip(ws, vs)) / tot_w
+            out[m] = [val] * horizon
+        elif m == "OLS":
+            # y = a*t + b 最小二乘
+            t = list(range(1, n + 1))
+            mean_t = sum(t) / n
+            mean_y = sum(history) / n
+            num = sum((ti - mean_t) * (yi - mean_y) for ti, yi in zip(t, history))
+            den = sum((ti - mean_t) ** 2 for ti in t)
+            a = num / den if den else 0.0
+            b = mean_y - a * mean_t
+            out[m] = [a * (n + i) + b for i in range(1, horizon + 1)]
+        elif m == "EWMA":
+            alpha = 0.4
+            s = history[0]
+            for v in history[1:]:
+                s = alpha * v + (1 - alpha) * s
+            out[m] = [s] * horizon
+        else:
+            # 未知方法:用整体均值兜底
+            out[m] = [sum(history) / n] * horizon
+    return out
+
+
+METHOD_LABELS_ZH = {
+    "MA3": "MA3 移动平均",
+    "MA6": "MA6 移动平均",
+    "WMA": "加权移动平均",
+    "OLS": "线性回归外推",
+    "EWMA": "指数加权",
+}
+
+METHOD_COLORS = {
+    "实际值": "1F4E79",  # 深蓝
+    "MA3": "9BBB59",  # 绿
+    "MA6": "4BACC6",  # 青
+    "WMA": "F79646",  # 橙
+    "OLS": "C0504D",  # 红
+    "EWMA": "8064A2",  # 紫
+}
+
+
+def _render_forecast_sheets(
+    *,
+    historical: list[float],
+    metadata_rows: list[dict],
+    metadata_columns: Optional[list[str]],
+    primary_spec: SheetSpec,
+    horizon: int,
+    methods: list[str],
+) -> list[SheetData]:
+    """
+    时间序列预测渲染:
+    - Sheet 1 "预测对比":历史 + 4 种方法各延伸 horizon 步,折线图同时展示
+    - Sheet 2 "预测汇总":每种方法的 horizon 期总和 / 均值 / vs 历史最近 N
+    """
+    # 找日期列(metadata 里第一个 YYYY-MM 模式的列)
+    date_col = next(
+        (c for c in (metadata_columns or []) if c in ("销售月份", "月份", "date", "month")),
+        None,
+    )
+    if not date_col:
+        date_col = (metadata_columns or [list(metadata_rows[0].keys())[0]])[0]
+
+    dates = [str(r.get(date_col)) for r in metadata_rows]
+    future_dates = _extend_month_labels(dates, horizon)
+
+    forecasts = _compute_forecasts(historical, horizon, methods)
+
+    # === Sheet 1:预测对比 ===
+    actual_label = "实际销售额"
+    method_cols = [METHOD_LABELS_ZH.get(m, m) for m in methods]
+    headers = [date_col, actual_label] + method_cols
+    rows: list[list] = []
+
+    # 历史部分:仅实际值
+    for i, d in enumerate(dates):
+        rows.append([d, historical[i]] + [None] * len(methods))
+    # 预测部分:仅各方法的预测值
+    for j, d in enumerate(future_dates):
+        row = [d, None]
+        for m in methods:
+            row.append(forecasts[m][j])
+        rows.append(row)
+
+    chart = ChartSpec(
+        type="line",
+        x=date_col,
+        y=[actual_label] + method_cols,
+        title=f"销售额历史 + {horizon} 个月多方法预测对比",
+    )
+    cell_fmt = "¥#,##0.00"
+    number_formats = {h: cell_fmt for h in headers if h != date_col}
+
+    # 折线染色(每条曲线一种颜色):series_colors_by_row 是给 bar 用的,
+    # 多 series 染色 openpyxl LineChart 默认自动配色,这里保留默认即可
+    detail_sheet = SheetData(
+        name="销售预测对比",
+        headers=headers,
+        rows=rows,
+        chart=chart,
+        number_formats=number_formats,
+    )
+
+    # === Sheet 2:预测汇总 KPI ===
+    summary_headers = ["预测方法", f"未来 {horizon} 期合计", f"未来 {horizon} 期均值", "vs 历史均值"]
+    historical_mean = sum(historical) / len(historical) if historical else 0
+    summary_rows = []
+    for m in methods:
+        future_vals = forecasts[m]
+        f_sum = sum(future_vals)
+        f_mean = f_sum / len(future_vals) if future_vals else 0
+        delta = (f_mean - historical_mean) / historical_mean if historical_mean else 0
+        summary_rows.append([METHOD_LABELS_ZH.get(m, m), f_sum, f_mean, delta])
+
+    summary_sheet = SheetData(
+        name="预测方法汇总",
+        headers=summary_headers,
+        rows=summary_rows,
+        chart=ChartSpec(
+            type="bar",
+            x="预测方法",
+            y=f"未来 {horizon} 期均值",
+            title=f"4 种方法未来 {horizon} 期均值对比",
+        ),
+        number_formats={
+            f"未来 {horizon} 期合计": "¥#,##0.00",
+            f"未来 {horizon} 期均值": "¥#,##0.00",
+            "vs 历史均值": "0.00%",
+        },
+    )
+
+    # KPI 卡(顶部 4 张):历史均值 / OLS 预测均值 / 最乐观方法 / 最保守方法
+    kpi_cards = []
+    method_means = [(m, sum(forecasts[m]) / len(forecasts[m])) for m in methods]
+    method_means_sorted = sorted(method_means, key=lambda x: x[1], reverse=True)
+    most_opt = method_means_sorted[0] if method_means_sorted else None
+    most_pess = method_means_sorted[-1] if method_means_sorted else None
+    kpi_cards = [
+        KpiCard(
+            label="历史均值",
+            value=f"¥{historical_mean:,.0f}",
+            subtitle=f"过去 {len(historical)} 个月",
+            bg_color="EAF1F8",
+        ),
+        KpiCard(
+            label="OLS 趋势预测均值",
+            value=f"¥{(sum(forecasts.get('OLS', [0])) / max(1, len(forecasts.get('OLS', [0])))):,.0f}",
+            subtitle=f"未来 {horizon} 个月线性外推",
+            bg_color="E8F5E9",
+        ),
+        KpiCard(
+            label="最乐观",
+            value=f"{METHOD_LABELS_ZH.get(most_opt[0], most_opt[0]) if most_opt else '-'}\n¥{most_opt[1]:,.0f}" if most_opt else "-",
+            subtitle="预测均值最高",
+            bg_color="E3F2FD",
+            value_size=12,
+        ),
+        KpiCard(
+            label="最保守",
+            value=f"{METHOD_LABELS_ZH.get(most_pess[0], most_pess[0]) if most_pess else '-'}\n¥{most_pess[1]:,.0f}" if most_pess else "-",
+            subtitle="预测均值最低",
+            bg_color="FFEBEE",
+            value_size=12,
+        ),
+    ]
+    detail_sheet.kpi_cards = kpi_cards
+
+    return [detail_sheet, summary_sheet]
+
+
 def _build_dormant_sheet(*, records: list[dict], result_col_name: str) -> Optional[SheetData]:
     """呆滞物料 sheet(对应 docx §6.3):R ≥ 90 的物料筛选清单。"""
     if not records:
@@ -979,19 +1206,47 @@ def _render_to_sheets(
     scenario: Scenario,
     metadata_rows: Optional[list] = None,
     metadata_columns: Optional[list[str]] = None,
+    ops: Optional[list] = None,
 ) -> list[SheetData]:
     """
     把解密后的结果按 sheet spec 渲染成可写入 Excel 的 SheetData。
 
     metadata_rows: 若提供且与 decrypted 行数对齐,自动合并到输出
-                    (用于"加密数字 + 明文标识"双通道场景,如逐人完成率)
+    ops: plan.ops 列表;含 forecast 时走时间序列预测渲染路径
     """
     if not sheet_specs:
         sheet_specs = [SheetSpec(name="Result")]
 
     primary_spec = sheet_specs[0]
 
-    # 情况 -1:row-aligned list + metadata → 合并为丰富表(每人一行)
+    # forecast op 路径:检测到 forecast → 时间序列多曲线预测 sheet
+    forecast_op = None
+    for op in ops or []:
+        op_name = op.op if hasattr(op, "op") else op.get("op") if isinstance(op, dict) else None
+        if op_name == "forecast":
+            forecast_op = op
+            break
+    if (
+        forecast_op is not None
+        and isinstance(decrypted, list)
+        and metadata_rows
+        and len(decrypted) == len(metadata_rows)
+        and decrypted
+        and isinstance(decrypted[0], (int, float))
+    ):
+        op_params = (
+            forecast_op.params if hasattr(forecast_op, "params") else forecast_op.get("params", {})
+        ) or {}
+        return _render_forecast_sheets(
+            historical=decrypted,
+            metadata_rows=metadata_rows,
+            metadata_columns=metadata_columns,
+            primary_spec=primary_spec,
+            horizon=int(op_params.get("horizon", 3)),
+            methods=op_params.get("methods") or ["MA3", "MA6", "WMA", "OLS"],
+        )
+
+    # 情况 -1:row-aligned list + metadata → 合并为丰富表
     if (
         isinstance(decrypted, list)
         and metadata_rows
