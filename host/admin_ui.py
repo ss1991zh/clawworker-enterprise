@@ -166,35 +166,37 @@ def build_admin_router(*, auth_manager, user_manager, dispatcher, get_llm_provid
         # 1) 落临时文件
         contents = await cert_file.read()
         if not contents:
-            _push_message(request, "error", "证书文件为空")
-            return RedirectResponse("/admin/users", status_code=303)
+            return _flash_redirect("/admin/users",
+                                   ("error", "证书文件为空,请重新选择"))
         with tempfile.NamedTemporaryFile(delete=False, suffix=".auth") as tmp:
             tmp.write(contents)
             tmp_path = Path(tmp.name)
 
+        result: tuple[str, str] | None = None
         try:
             # 2) 导入授权(含 fingerprint 查重)
             auth_manager.import_authorization(username=username, source=tmp_path)
             # 3) 创建账户;若失败,回滚授权
             try:
                 user_manager.create_account(username=username, password=password)
-            except Exception as e:
+            except Exception:
                 auth_manager.delete(username)
                 raise
-            _push_message(request, "success",
-                          f"已创建用户「{username}」· 证书 + 账户绑定完成")
+            result = ("success", f"已创建用户「{username}」· 证书 + 账户绑定完成")
         except FileNotFoundError as e:
-            _push_message(request, "error", f"文件读取失败:{e}")
+            result = ("error", f"文件读取失败:{e}")
         except ValueError as e:
-            _push_message(request, "error", str(e))
+            # 含证书重复 / 用户已存在 / 密码太短等
+            result = ("error", str(e))
         except Exception as e:
-            _push_message(request, "error", f"创建失败:{e}")
+            result = ("error", f"创建失败:{e}")
         finally:
             try:
                 tmp_path.unlink()
             except FileNotFoundError:
                 pass
-        return RedirectResponse("/admin/users", status_code=303)
+        return _flash_redirect("/admin/users", result) if result else \
+            RedirectResponse("/admin/users", status_code=303)
 
     @router.get("/users/{username}/edit", response_class=HTMLResponse)
     def user_edit_form(request: Request, username: str):
@@ -220,31 +222,31 @@ def build_admin_router(*, auth_manager, user_manager, dispatcher, get_llm_provid
     def user_update_password(request: Request, username: str, password: str = Form(...)):
         try:
             user_manager.update_password(username, password)
-            _push_message(request, "success",
-                          f"已更新「{username}」的密码;该用户所有现有 session 已注销")
+            return _flash_redirect(
+                "/admin/users",
+                ("success", f"已更新「{username}」的密码;该用户所有现有 session 已注销"),
+            )
         except ValueError as e:
-            _push_message(request, "error", str(e))
-        return RedirectResponse("/admin/users", status_code=303)
+            return _flash_redirect("/admin/users", ("error", str(e)))
 
     @router.post("/users/{username}/disable")
     def user_disable(request: Request, username: str):
         user_manager.disable(username)
-        _push_message(request, "success", f"用户「{username}」已禁用")
-        return RedirectResponse("/admin/users", status_code=303)
+        return _flash_redirect("/admin/users", ("success", f"用户「{username}」已禁用"))
 
     @router.post("/users/{username}/enable")
     def user_enable(request: Request, username: str):
         user_manager.enable(username)
-        _push_message(request, "success", f"用户「{username}」已启用")
-        return RedirectResponse("/admin/users", status_code=303)
+        return _flash_redirect("/admin/users", ("success", f"用户「{username}」已启用"))
 
     @router.post("/users/{username}/delete")
     def user_delete(request: Request, username: str):
         user_manager.delete_account(username)
         auth_manager.delete(username)
-        _push_message(request, "success",
-                      f"已删除用户「{username}」· 证书已释放,可重新分配")
-        return RedirectResponse("/admin/users", status_code=303)
+        return _flash_redirect(
+            "/admin/users",
+            ("success", f"已删除用户「{username}」· 证书已释放,可重新分配"),
+        )
 
     # ============================================================
     # 旧路由保留(向后兼容)
@@ -310,34 +312,57 @@ def build_admin_router(*, auth_manager, user_manager, dispatcher, get_llm_provid
     @router.post("/sessions/{token}/revoke")
     def session_revoke(request: Request, token: str):
         user_manager.logout(token)
-        _push_message(request, "success", "会话已注销")
-        return RedirectResponse("/admin/sessions", status_code=303)
+        return _flash_redirect("/admin/sessions", ("success", "会话已注销"))
 
     return router
 
 
 # ---------------------------------------------------------------------------
-# 简化版 flash messages(基于 cookie,POST 后 redirect 时携带)
+# Flash messages — 基于 URL query 跨 POST→redirect→GET 传递
 # ---------------------------------------------------------------------------
+#
+# 设计:
+# - POST handler 用 _flash_redirect(url, (cat, msg), ...) 返回 RedirectResponse
+# - 消息编码进 URL query 的 _flash 参数(支持多条),不依赖 cookie / session
+# - GET handler 用 _pop_messages(request) 解析出来传给模板
+# - URL 略带消息但用完即弃(用户刷新一下就没了),admin 页面无书签价值,可接受
 
 
+def _flash_redirect(url: str, *messages: tuple[str, str]) -> RedirectResponse:
+    """构造一个带 flash 消息的 303 redirect。
+
+    用法:
+        return _flash_redirect("/admin/users", ("error", "证书重复 ..."))
+        return _flash_redirect("/admin/users",
+                                ("success", "已创建"),
+                                ("info", "...提示"))
+    """
+    if messages:
+        from urllib.parse import quote
+        parts = [f"_flash={quote(f'{c}|{m}', safe='')}" for c, m in messages]
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}{'&'.join(parts)}"
+    return RedirectResponse(url, status_code=303)
+
+
+def _pop_messages(request: Request) -> list[tuple[str, str]]:
+    """从当前请求 URL 的 _flash 参数读取消息列表。"""
+    out: list[tuple[str, str]] = []
+    from urllib.parse import parse_qs
+
+    for val in parse_qs(request.url.query).get("_flash", []):
+        if "|" in val:
+            cat, msg = val.split("|", 1)
+            out.append((cat, msg))
+    return out
+
+
+# 兼容旧接口:某些路由还在用 _push_message(后续逐步迁移)
 def _push_message(request: Request, category: str, msg: str) -> None:
-    """通过响应 cookie 携带 flash;HTMX/SPA 场景可换 server-side store。"""
-    # 简化:暂存到 request.state(只在同请求生效)
+    """已弃用:仍保留是为了不报错。新代码请用 _flash_redirect。"""
     if not hasattr(request.state, "_pending_messages"):
         request.state._pending_messages = []
     request.state._pending_messages.append((category, msg))
-
-
-def _pop_messages(request: Request) -> list:
-    """读取 Query string 中的 msg 参数(POST→redirect 后)。"""
-    out = []
-    qs = request.url.query
-    if "msg=" in qs:
-        from urllib.parse import parse_qs
-        for cat, m in parse_qs(qs).get("msg", []):
-            out.append((cat, m))
-    return out
 
 
 # ---------------------------------------------------------------------------

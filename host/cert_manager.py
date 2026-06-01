@@ -93,8 +93,9 @@ class AuthorizationManager:
         existing = self._by_id.get(digest)
         if existing:
             raise ValueError(
-                f"该证书已被用户 '{existing.subject}' 使用"
-                f"(auth_id: {digest});一份证书只能绑给一个用户"
+                f"⚠️ 证书重复:这份证书(指纹 {digest})已经分配给用户「{existing.subject}」。"
+                f" 系统强制 1 张证书只能创建 1 个用户。"
+                f" 请换一份新证书,或先到用户列表删除「{existing.subject}」释放该证书。"
             )
 
         dst = self._storage_root / f"{username}.{digest}.auth"

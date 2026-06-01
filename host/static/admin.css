@@ -250,14 +250,23 @@ form select:focus {
 
 /* ---------- alert ---------- */
 .alert {
-  padding: 10px 16px;
+  padding: 14px 18px;
   border-radius: 4px;
   margin-bottom: 24px;
   font-size: 13px;
+  line-height: 1.6;
+  border-left: 4px solid;
 }
-.alert.success { background: #E8F5E9; color: var(--success); border-left: 3px solid var(--success); }
-.alert.error   { background: #FFEBEE; color: var(--danger); border-left: 3px solid var(--danger); }
-.alert.info    { background: var(--pill-bg); color: var(--accent); border-left: 3px solid var(--accent); }
+.alert.success { background: #E8F5E9; color: var(--success); border-left-color: var(--success); }
+.alert.error   {
+  background: #FFEBEE;
+  color: var(--danger);
+  border-left-color: var(--danger);
+  font-weight: 500;
+}
+.alert.error strong { font-weight: 600; }
+.alert.info    { background: var(--pill-bg); color: var(--accent); border-left-color: var(--accent); }
+.alert.warning { background: #FFF8E1; color: var(--warning); border-left-color: var(--warning); }
 
 /* ---------- 描述列表(LLM 配置展示)---------- */
 .dl-row {
