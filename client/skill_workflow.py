@@ -295,6 +295,7 @@ def _write_excel_node(state: AgentState) -> dict:
 
 # 常见英文 ratio 列名 → 中文对照
 EN_TO_ZH_COLUMN_NAMES: dict[str, str] = {
+    # 销售/财务
     "completion_rate": "目标完成率",
     "achievement_rate": "目标完成率",
     "target_completion_rate": "目标完成率",
@@ -304,6 +305,17 @@ EN_TO_ZH_COLUMN_NAMES: dict[str, str] = {
     "margin_rate": "边际贡献率",
     "contribution_rate": "边际贡献率",
     "commission_rate": "提成比例",
+    # 库存/成本
+    "weighted_price": "加权平均单价",
+    "weighted_avg_price": "加权平均单价",
+    "weighted_unit_price": "加权平均单价",
+    "avg_price": "加权平均单价",
+    "outbound_amount": "出库金额",
+    "out_amount": "出库金额",
+    "outbound_value": "出库金额",
+    "ending_amount": "期末金额",
+    "ending_qty": "期末数量",
+    "turnover_days": "库存周转天数",
 }
 
 # 按完成率档位涂色(对应公式说明 §2.4 阶梯提成)
@@ -342,6 +354,34 @@ REGION_COLORS: dict[str, str] = {
 }
 DEFAULT_REGION_COLOR = "BFBFBF"
 
+# 通用 7 色板(给非预定义分组维度用,如仓库 / 类别 / 供应商)
+PALETTE_7: list[str] = ["4F81BD", "C0504D", "9BBB59", "8064A2", "4BACC6", "F79646", "8C8C8C"]
+
+# 候选分组列(按优先级匹配 metadata 里第一个存在的列)
+GROUP_DIMENSION_CANDIDATES: list[str] = [
+    "销售大区",
+    "存放仓库",
+    "物料类别",
+    "主要供应商",
+    "产品线",
+]
+
+
+def _pick_group_dimension(record_keys: list[str]) -> Optional[str]:
+    for candidate in GROUP_DIMENSION_CANDIDATES:
+        if candidate in record_keys:
+            return candidate
+    return None
+
+
+def _color_for_value(value: Any, palette_index: dict[str, int]) -> str:
+    """同一 group dim 内,稳定地把每个 value 映射到一种颜色。"""
+    if value in REGION_COLORS:
+        return REGION_COLORS[value]
+    if value not in palette_index:
+        palette_index[value] = len(palette_index) % len(PALETTE_7)
+    return PALETTE_7[palette_index[value]]
+
 
 # 不同 rate 类型的 KPI 元数据(达标阈值 + 文案)
 KPI_RULES_BY_COLNAME: dict[str, dict] = {
@@ -362,6 +402,27 @@ KPI_RULES_BY_COLNAME: dict[str, dict] = {
         "threshold_subtitle_fmt": "≥85% 共 {hit} / {total} 笔",
         "top_label": "TOP 3 回款率",
         "bottom_label": "待催收 BOTTOM 3",
+    },
+    # 库存场景 —— 货币量,无固定阈值 → KPI 2 用"超均值占比"
+    "加权平均单价": {
+        "average_label": "综合加权单价",
+        "average_subtitle": "按 SKU 等权均值",
+        "threshold": None,  # None → 运行时取均值动态阈值
+        "threshold_label": "高于均价 SKU 比",
+        "threshold_subtitle_fmt": "高于均价 {hit} / {total} 项",
+        "top_label": "TOP 3 高单价 SKU",
+        "bottom_label": "BOTTOM 3 低单价 SKU",
+        "value_kind": "currency",
+    },
+    "出库金额": {
+        "average_label": "平均出库金额",
+        "average_subtitle": "按 SKU 等权均值",
+        "threshold": None,
+        "threshold_label": "高出库 SKU 比",
+        "threshold_subtitle_fmt": "高于均值 {hit} / {total} 项",
+        "top_label": "TOP 3 出库金额",
+        "bottom_label": "BOTTOM 3 出库金额",
+        "value_kind": "currency",
     },
 }
 
@@ -394,14 +455,27 @@ def _render_row_aligned_rich(
         if extras:
             result_col_name = extras[-1]
     result_col_name = EN_TO_ZH_COLUMN_NAMES.get(result_col_name.lower(), result_col_name)
-    pct_fmt = "0.00%" if _looks_like_percent_column(result_col_name) else None
+    # 数字格式自动选择:百分比 / 货币 / 默认
+    pct_fmt: Optional[str]
+    if _looks_like_percent_column(result_col_name):
+        pct_fmt = "0.00%"
+    else:
+        # 库存场景的"金额"列用货币格式
+        rule = KPI_RULES_BY_COLNAME.get(result_col_name) or {}
+        if rule.get("value_kind") == "currency" or "金额" in result_col_name or "单价" in result_col_name:
+            pct_fmt = "¥#,##0.00"
+        else:
+            pct_fmt = None
 
-    # === 2. 列顺序调整:销售大区 紧贴在 销售代表 之前 ===
+    # === 2. 列顺序调整:让"分组维度"紧贴在"主体名称"之前 ===
     cols_out = list(cols_in)
-    if "销售大区" in cols_out and "销售代表" in cols_out:
-        cols_out.remove("销售大区")
-        idx = cols_out.index("销售代表")
-        cols_out.insert(idx, "销售大区")
+    group_col = _pick_group_dimension(cols_out)
+    name_candidates = ("销售代表", "物料名称")
+    name_col = next((c for c in name_candidates if c in cols_out), None)
+    if group_col and name_col and group_col != name_col:
+        cols_out.remove(group_col)
+        idx = cols_out.index(name_col)
+        cols_out.insert(idx, group_col)
 
     # === 3. 组装 records(原始 list of dict + rate)用于后续多次使用 ===
     records: list[dict] = []
@@ -451,6 +525,22 @@ def _fmt_pct(v: float) -> str:
     return f"{v * 100:.2f}%"
 
 
+def _fmt_currency(v: float) -> str:
+    """金额格式:¥123,456.78。"""
+    return f"¥{v:,.2f}"
+
+
+def _make_value_formatter(rule: dict, result_col_name: str):
+    """根据 value_kind 决定标量怎么格式化。"""
+    kind = rule.get("value_kind", "percent")
+    if kind == "currency":
+        return _fmt_currency
+    if kind == "number":
+        return lambda v: f"{v:,.2f}"
+    # 默认百分比(对应原有率类指标)
+    return _fmt_pct
+
+
 def _build_kpi_cards(records: list[dict], result_col_name: str) -> list[KpiCard]:
     """根据 result_col_name 选 KPI 模板,从 records 计算 4 张卡片。"""
     rule = KPI_RULES_BY_COLNAME.get(result_col_name)
@@ -461,18 +551,37 @@ def _build_kpi_cards(records: list[dict], result_col_name: str) -> list[KpiCard]
     if n == 0:
         return []
     mean_v = sum(vals) / n
-    hit = sum(1 for v in vals if v >= rule["threshold"])
+    # threshold = None → 动态阈值取均值
+    threshold = rule.get("threshold")
+    if threshold is None:
+        threshold = mean_v
+    hit = sum(1 for v in vals if v >= threshold)
     sorted_recs = sorted(records, key=lambda r: r[result_col_name], reverse=True)
     top3 = sorted_recs[:3]
-    bottom3 = sorted_recs[-3:][::-1]  # 倒序展示,最差排第一
+    bottom3 = sorted_recs[-3:][::-1]  # 倒序,最差排第一
+
+    fmt_val = _make_value_formatter(rule, result_col_name)
 
     def _name(rec: dict) -> str:
-        return rec.get("销售代表") or rec.get("员工编号") or "?"
+        # 销售场景用销售代表;库存场景用物料名称/编码
+        return (
+            rec.get("销售代表")
+            or rec.get("员工编号")
+            or rec.get("物料名称")
+            or rec.get("物料编码")
+            or "?"
+        )
+
+    # KPI 2 的命中率展示(百分比指标用百分比文案,货币指标用"高于均值"文案)
+    if rule.get("value_kind") in ("currency", "number"):
+        kpi2_value = f"{hit / n * 100:.1f}%"
+    else:
+        kpi2_value = f"{hit / n * 100:.1f}%"
 
     return [
         KpiCard(
             label=rule["average_label"],
-            value=_fmt_pct(mean_v),
+            value=fmt_val(mean_v),
             subtitle=rule["average_subtitle"],
             bg_color="EAF1F8",
         ),
@@ -484,15 +593,15 @@ def _build_kpi_cards(records: list[dict], result_col_name: str) -> list[KpiCard]
         ),
         KpiCard(
             label=rule["top_label"],
-            value="\n".join(f"{_name(r)} {_fmt_pct(r[result_col_name])}" for r in top3),
-            subtitle="按完成率降序",
+            value="\n".join(f"{_name(r)} {fmt_val(r[result_col_name])}" for r in top3),
+            subtitle="按指标降序",
             bg_color="E3F2FD",
             value_size=12,
         ),
         KpiCard(
             label=rule["bottom_label"],
-            value="\n".join(f"{_name(r)} {_fmt_pct(r[result_col_name])}" for r in bottom3),
-            subtitle="按完成率升序",
+            value="\n".join(f"{_name(r)} {fmt_val(r[result_col_name])}" for r in bottom3),
+            subtitle="按指标升序",
             bg_color="FFEBEE",
             value_size=12,
         ),
@@ -509,14 +618,20 @@ def _build_detail_sheet(
 ) -> SheetData:
     """明细:KPI + 100 行表(无大图,档位涂色已经足够直观)。"""
     headers = cols_out + [result_col_name]
-    # 按 大区 + 代表 排序
-    sorted_recs = sorted(
-        records,
-        key=lambda r: (
-            str(r.get("销售大区") or ""),
-            str(r.get("销售代表") or ""),
-        ),
-    )
+    # 按 group 维度 + 主体名称 排序(若都不在则按结果列降序)
+    keys = list(records[0].keys()) if records else []
+    group_col = _pick_group_dimension(keys)
+    name_col = next((c for c in ("销售代表", "物料名称") if c in keys), None)
+    if group_col or name_col:
+        sorted_recs = sorted(
+            records,
+            key=lambda r: (
+                str(r.get(group_col) or "") if group_col else "",
+                str(r.get(name_col) or "") if name_col else "",
+            ),
+        )
+    else:
+        sorted_recs = sorted(records, key=lambda r: r[result_col_name], reverse=True)
     rows = [[r.get(c) for c in cols_out] + [r[result_col_name]] for r in sorted_recs]
 
     number_formats: dict[str, str] = {}
@@ -541,51 +656,66 @@ def _build_detail_sheet(
 def _build_region_summary_sheet(
     *, records: list[dict], result_col_name: str, pct_fmt: Optional[str]
 ) -> Optional[SheetData]:
-    """大区汇总 sheet。"""
-    if not records or "销售大区" not in records[0]:
+    """
+    分组汇总 sheet —— 通用化:
+    - 销售场景 → 按"销售大区"
+    - 库存场景 → 按"存放仓库"或"物料类别"
+    - 其他    → 按 GROUP_DIMENSION_CANDIDATES 中第一个存在的列
+    """
+    if not records:
         return None
-    regions: dict[str, list[float]] = {}
+    group_col = _pick_group_dimension(list(records[0].keys()))
+    if group_col is None:
+        return None
+
+    groups: dict[Any, list[float]] = {}
     for r in records:
-        regions.setdefault(r["销售大区"], []).append(r[result_col_name])
+        groups.setdefault(r.get(group_col), []).append(r[result_col_name])
 
     summary = []
-    for region, vals in regions.items():
+    for key, vals in groups.items():
         summary.append(
             {
-                "销售大区": region,
-                "订单数": len(vals),
+                group_col: key,
+                "条目数": len(vals),
                 f"平均{result_col_name}": sum(vals) / len(vals),
                 f"最高{result_col_name}": max(vals),
                 f"最低{result_col_name}": min(vals),
             }
         )
-    # 按平均率降序
     summary.sort(key=lambda r: r[f"平均{result_col_name}"], reverse=True)
 
-    headers = ["销售大区", "订单数", f"平均{result_col_name}", f"最高{result_col_name}", f"最低{result_col_name}"]
+    headers = [
+        group_col,
+        "条目数",
+        f"平均{result_col_name}",
+        f"最高{result_col_name}",
+        f"最低{result_col_name}",
+    ]
     rows = [[r[h] for h in headers] for r in summary]
 
     number_formats: dict[str, str] = {}
     if pct_fmt:
         for h in headers:
-            if "率" in h or "完成" in h or "回款" in h:
+            if h not in (group_col, "条目数"):
                 number_formats[h] = pct_fmt
 
     chart = ChartSpec(
         type="bar",
-        x="销售大区",
+        x=group_col,
         y=f"平均{result_col_name}",
-        title=f"各大区平均{result_col_name}",
+        title=f"按{group_col}平均{result_col_name}",
     )
-    region_colors = [REGION_COLORS.get(r["销售大区"], DEFAULT_REGION_COLOR) for r in summary]
+    palette_index: dict[str, int] = {}
+    bar_colors = [_color_for_value(r[group_col], palette_index) for r in summary]
 
     return SheetData(
-        name=f"大区汇总-{result_col_name}",
+        name=f"{group_col}汇总-{result_col_name}"[:31],
         headers=headers,
         rows=rows,
         chart=chart,
         number_formats=number_formats,
-        series_colors_by_row=region_colors,
+        series_colors_by_row=bar_colors,
     )
 
 
@@ -607,7 +737,12 @@ def _build_ranking_sheet(
         return None
 
     # 列:排名 / 员工编号 / 销售代表 / 销售大区 / 城市 / 产品线 / 销售月份 / rate
-    base_cols = [c for c in ("员工编号", "销售代表", "销售大区", "城市", "产品线", "销售月份") if c in picked[0]]
+    # 候选身份列:销售场景的 + 库存场景的
+    candidate_cols = (
+        "员工编号", "销售代表", "销售大区", "城市", "产品线", "销售月份",
+        "物料编码", "物料名称", "物料类别", "计量单位", "存放仓库", "主要供应商",
+    )
+    base_cols = [c for c in candidate_cols if c in picked[0]]
     headers = ["排名"] + base_cols + [result_col_name]
     rows = []
     for i, r in enumerate(picked, start=1):
@@ -621,14 +756,17 @@ def _build_ranking_sheet(
     if result_col_name in TIER_MAP_BY_COLNAME:
         tier_colors[result_col_name] = TIER_MAP_BY_COLNAME[result_col_name]
 
-    chart = None
-    if "销售代表" in base_cols:
-        chart = ChartSpec(type="bar", x="销售代表", y=result_col_name, title=sheet_name)
-    region_colors = (
-        [REGION_COLORS.get(r.get("销售大区"), DEFAULT_REGION_COLOR) for r in picked]
-        if "销售大区" in base_cols
-        else None
-    )
+    # X 轴: 优先用"销售代表"(销售场景)/ "物料名称"(库存场景)
+    x_candidates = ("销售代表", "物料名称", "物料编码", "员工编号")
+    x_col = next((c for c in x_candidates if c in base_cols), None)
+    chart = ChartSpec(type="bar", x=x_col, y=result_col_name, title=sheet_name) if x_col else None
+
+    # bar 染色: 按 group dim(销售大区/存放仓库/物料类别)选色
+    group_col = _pick_group_dimension(list(picked[0].keys()))
+    bar_colors = None
+    if group_col and group_col in base_cols:
+        palette_index: dict[str, int] = {}
+        bar_colors = [_color_for_value(r.get(group_col), palette_index) for r in picked]
 
     return SheetData(
         name=sheet_name[:31],
@@ -637,7 +775,7 @@ def _build_ranking_sheet(
         chart=chart,
         number_formats=number_formats,
         tier_colors=tier_colors,
-        series_colors_by_row=region_colors,
+        series_colors_by_row=bar_colors,
     )
 
 

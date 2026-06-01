@@ -151,14 +151,47 @@ class PandaSeal:
                 return cdf.shape[0]
 
         if name == "div":
-            # 列对列逐行除法 → 返回 CipherSeries,每行一个比值
-            num = p.get("numerator")
-            den = p.get("denominator")
-            if not num or not den:
-                raise ValueError("div 需要 params={'numerator': col, 'denominator': col}")
+            # 列对列逐行除法 → 返回 CipherSeries
+            # 支持三种形式:
+            # 1. 单列 / 单列    {numerator: col, denominator: col}
+            # 2. 列和 / 列和    {numerator_cols: [...], denominator_cols: [...]}
+            #    用于"加权平均率"如 (期初金额+入库金额)/(期初数量+入库数量)
+            # 3. 形式 2 + 乘子  + {multiplier: col}
+            #    用于"X × 加权率"如 出库金额 = 出库数量 × (I+K)/(H+J)
             if type(cdf).__name__ != "CipherDataFrame":
                 raise ValueError("div 当前仅支持 CipherDataFrame")
-            return cdf[num] / cdf[den]
+
+            single_num = p.get("numerator") or p.get("num")
+            single_den = p.get("denominator") or p.get("den")
+            num_cols = p.get("numerator_cols") or ([single_num] if single_num else [])
+            den_cols = p.get("denominator_cols") or ([single_den] if single_den else [])
+            if not num_cols or not den_cols:
+                raise ValueError(
+                    "div 需要 numerator(_cols) + denominator(_cols)"
+                )
+
+            missing = [c for c in num_cols + den_cols if c not in cdf.columns]
+            if missing:
+                raise ValueError(f"div 字段不存在: {missing}")
+
+            # 累加分子/分母列
+            num_series = cdf[num_cols[0]]
+            for c in num_cols[1:]:
+                num_series = num_series + cdf[c]
+            den_series = cdf[den_cols[0]]
+            for c in den_cols[1:]:
+                den_series = den_series + cdf[c]
+
+            result = num_series / den_series
+
+            # 可选乘子(用于 X × ratio 形式)
+            multiplier = p.get("multiplier")
+            if multiplier:
+                if multiplier not in cdf.columns:
+                    raise ValueError(f"multiplier 列不存在: {multiplier}")
+                result = result * cdf[multiplier]
+
+            return result
 
         if name == "filter":
             # 条件过滤:用重载比较运算符

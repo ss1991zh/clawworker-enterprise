@@ -101,6 +101,53 @@
 }
 </computation_plan>
 
+场景 1 · 加权平均(如"加权平均单价 = (期初金额+入库金额)/(期初数量+入库数量)"):
+使用 div 的 numerator_cols / denominator_cols 列表形式,一步算"列和 / 列和":
+
+<computation_plan>
+{
+  "scenario": 1,
+  "tool": "pandaseal",
+  "ops": [
+    {
+      "op": "div",
+      "params": {
+        "numerator_cols": ["begin_amount", "in_amount"],
+        "denominator_cols": ["begin_qty", "in_qty"]
+      }
+    }
+  ],
+  "output": {
+    "file": "~/Downloads/weighted_price.xlsx",
+    "sheets": [{"name": "Detail", "columns": ["物料名称", "weighted_price"]}]
+  }
+}
+</computation_plan>
+
+场景 1 · 加权乘积(如"出库金额 = 出库数量 × 加权平均单价"):
+在上面 div 的基础上加 multiplier 字段,一步算 X × (列和/列和):
+
+<computation_plan>
+{
+  "scenario": 1,
+  "tool": "pandaseal",
+  "ops": [
+    {
+      "op": "div",
+      "params": {
+        "numerator_cols": ["begin_amount", "in_amount"],
+        "denominator_cols": ["begin_qty", "in_qty"],
+        "multiplier": "out_qty"
+      }
+    }
+  ],
+  "output": {
+    "file": "~/Downloads/outbound.xlsx",
+    "sheets": [{"name": "Detail", "columns": ["物料名称", "outbound_amount"]}]
+  }
+}
+</computation_plan>
+
 ═══════════════════════════════════════
 summary 的硬约束(违反即视为严重安全事故)
 ═══════════════════════════════════════
