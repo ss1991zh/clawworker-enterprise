@@ -132,9 +132,17 @@ def _real_decrypt(ciphertext: Any) -> Any:
 
 
 def _real_encrypt_file(src: Path, dst: Path) -> Path:
-    """根据后缀选择 encrypt_csv / encrypt_excel / encrypt_json。"""
+    """根据后缀选择 encrypt_csv / encrypt_excel / encrypt_json。
+
+    ⚠️ ct.encrypt_csv 是追加模式 —— 旧文件存在会和新内容叠加导致列数错乱。
+       这里在调用前主动删除旧目标文件,确保每次产出干净的新密文。
+    """
     Runtime.get().ensure_all_initialized()
     import crypto_toolkit as ct
+
+    # 防御:删除已存在的目标(追加模式陷阱)
+    if dst.exists():
+        dst.unlink()
 
     suffix = src.suffix.lower()
     if suffix == ".csv":
