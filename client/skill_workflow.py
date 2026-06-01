@@ -316,6 +316,8 @@ EN_TO_ZH_COLUMN_NAMES: dict[str, str] = {
     "ending_amount": "期末金额",
     "ending_qty": "期末数量",
     "turnover_days": "库存周转天数",
+    "inventory_turnover_days": "库存周转天数",
+    "stock_turnover_days": "库存周转天数",
 }
 
 # 按完成率档位涂色(对应公式说明 §2.4 阶梯提成)
@@ -333,10 +335,55 @@ COLLECTION_TIERS: list[tuple[float, str]] = [
     (float("inf"), "DDFFDD"),  # 高
 ]
 
+# 库存周转天数档位(对应 docx §3.2 健康度表)—— 越低越好,所以颜色反向
+TURNOVER_DAYS_TIERS: list[tuple[float, str]] = [
+    (30.0, "AAEEAA"),   # 良好  深绿
+    (60.0, "DDFFDD"),   # 一般  浅绿
+    (90.0, "FFEECC"),   # 偏慢  橙
+    (float("inf"), "FFCCCC"),  # 滞销  红
+]
+
 TIER_MAP_BY_COLNAME: dict[str, list[tuple[float, str]]] = {
     "目标完成率": COMPLETION_TIERS,
     "回款率": COLLECTION_TIERS,
+    "库存周转天数": TURNOVER_DAYS_TIERS,
 }
+
+
+# 库存健康度(对应 docx §3.2)—— 由 R 值映射
+def _health_label_for_turnover(r: float) -> str:
+    if r < 30:
+        return "良好"
+    if r < 60:
+        return "一般"
+    if r < 90:
+        return "偏慢"
+    return "滞销"
+
+
+# ABC 分类阈值(对应 docx §4.1 帕累托法)
+ABC_THRESHOLDS = (0.80, 0.95)  # A: 0-80%, B: 80-95%, C: 95-100%
+
+
+def _assign_abc_labels(records: list[dict], value_col: str) -> list[dict]:
+    """对 records 按 value_col 降序累计百分比,打 A/B/C 标签(就地修改并返回)。"""
+    if not records or value_col not in records[0]:
+        return records
+    sorted_recs = sorted(records, key=lambda r: r.get(value_col, 0), reverse=True)
+    total = sum(r[value_col] for r in sorted_recs if isinstance(r[value_col], (int, float)))
+    if total <= 0:
+        return records
+    cumulative = 0.0
+    for r in sorted_recs:
+        cumulative += r[value_col]
+        pct = cumulative / total
+        if pct < ABC_THRESHOLDS[0]:
+            r["ABC分类"] = "A"
+        elif pct < ABC_THRESHOLDS[1]:
+            r["ABC分类"] = "B"
+        else:
+            r["ABC分类"] = "C"
+    return records
 
 # 命中其中之一 → 列应用 0.00% 百分比格式
 PERCENT_HINT_KEYWORDS = ("完成率", "回款率", "增长率", "贡献率", "_rate", "rate", "比例")
@@ -423,6 +470,16 @@ KPI_RULES_BY_COLNAME: dict[str, dict] = {
         "top_label": "TOP 3 出库金额",
         "bottom_label": "BOTTOM 3 出库金额",
         "value_kind": "currency",
+    },
+    "库存周转天数": {
+        "average_label": "平均周转天数",
+        "average_subtitle": "按 SKU 等权均值",
+        "threshold": 90.0,
+        "threshold_label": "滞销 SKU 比",
+        "threshold_subtitle_fmt": "≥90 天共 {hit} / {total} 项",
+        "top_label": "TOP 3 周转最慢",
+        "bottom_label": "TOP 3 周转最快",
+        "value_kind": "number",
     },
 }
 
@@ -517,6 +574,17 @@ def _render_row_aligned_rich(
     )
 
     sheets = [detail_sheet, region_sheet, top_sheet, bottom_sheet]
+
+    # 业务领域特定的增强 sheet
+    if result_col_name == "出库金额":
+        abc_sheet = _build_abc_summary_sheet(records=records, result_col_name=result_col_name)
+        if abc_sheet:
+            sheets.append(abc_sheet)
+    if result_col_name == "库存周转天数":
+        dormant_sheet = _build_dormant_sheet(records=records, result_col_name=result_col_name)
+        if dormant_sheet:
+            sheets.append(dormant_sheet)
+
     return [s for s in sheets if s is not None]
 
 
@@ -616,9 +684,27 @@ def _build_detail_sheet(
     pct_fmt: Optional[str],
     primary_spec: SheetSpec,
 ) -> SheetData:
-    """明细:KPI + 100 行表(无大图,档位涂色已经足够直观)。"""
-    headers = cols_out + [result_col_name]
-    # 按 group 维度 + 主体名称 排序(若都不在则按结果列降序)
+    """
+    明细 sheet:KPI + 100 行表 + 业务列(ABC 分类 / 健康度)。
+
+    业务增强:
+    - result=出库金额  → 自动加 "ABC分类" 列(按帕累托累计阈值)
+    - result=库存周转天数 → 自动加 "健康度" 列(良好/一般/偏慢/滞销)
+    """
+    # 业务领域增强:打标签(就地修改 records,影响后续 sheets 也能拿到)
+    extra_cols: list[str] = []
+    if result_col_name == "出库金额":
+        _assign_abc_labels(records, value_col=result_col_name)
+        extra_cols.append("ABC分类")
+    if result_col_name == "库存周转天数":
+        for r in records:
+            v = r.get(result_col_name)
+            if isinstance(v, (int, float)):
+                r["健康度"] = _health_label_for_turnover(v)
+        extra_cols.append("健康度")
+
+    headers = cols_out + [result_col_name] + extra_cols
+
     keys = list(records[0].keys()) if records else []
     group_col = _pick_group_dimension(keys)
     name_col = next((c for c in ("销售代表", "物料名称") if c in keys), None)
@@ -632,24 +718,111 @@ def _build_detail_sheet(
         )
     else:
         sorted_recs = sorted(records, key=lambda r: r[result_col_name], reverse=True)
-    rows = [[r.get(c) for c in cols_out] + [r[result_col_name]] for r in sorted_recs]
+    rows = [
+        [r.get(c) for c in cols_out] + [r[result_col_name]] + [r.get(c) for c in extra_cols]
+        for r in sorted_recs
+    ]
 
     number_formats: dict[str, str] = {}
     if pct_fmt:
         number_formats[result_col_name] = pct_fmt
+    # 周转天数列用整数格式
+    if result_col_name == "库存周转天数":
+        number_formats[result_col_name] = "0.0"
 
     tier_colors: dict[str, list[tuple[float, str]]] = {}
     if result_col_name in TIER_MAP_BY_COLNAME:
         tier_colors[result_col_name] = TIER_MAP_BY_COLNAME[result_col_name]
 
     return SheetData(
-        name=f"{result_col_name}明细",
+        name=f"{result_col_name}明细"[:31],
         headers=headers,
         rows=rows,
-        chart=None,  # 明细页不放大图(用 KPI + 档位涂色替代)
+        chart=None,
         number_formats=number_formats,
         tier_colors=tier_colors,
         kpi_cards=_build_kpi_cards(sorted_recs, result_col_name),
+    )
+
+
+def _build_abc_summary_sheet(*, records: list[dict], result_col_name: str) -> Optional[SheetData]:
+    """ABC 分类汇总(对应 docx §4.2)。"""
+    if not records or "ABC分类" not in records[0]:
+        return None
+    classes: dict[str, list[dict]] = {"A": [], "B": [], "C": []}
+    for r in records:
+        cls = r.get("ABC分类")
+        if cls in classes:
+            classes[cls].append(r)
+    total = sum(r[result_col_name] for r in records if isinstance(r[result_col_name], (int, float)))
+    if total <= 0:
+        return None
+
+    headers = ["分类", "SKU 数", "出库金额合计", "金额占比", "管理建议"]
+    rows = []
+    advice_map = {
+        "A": "关键品 · 严格控制 · 低安全库存按需补货",
+        "B": "次重要 · 一般控制 · 定期复盘",
+        "C": "普通品 · 放松控制 · 大批量低频补货",
+    }
+    for cls in ("A", "B", "C"):
+        items = classes[cls]
+        amount_sum = sum(r[result_col_name] for r in items)
+        rows.append([cls, len(items), amount_sum, amount_sum / total, advice_map[cls]])
+
+    number_formats = {
+        "出库金额合计": "¥#,##0.00",
+        "金额占比": "0.00%",
+    }
+    # 用 ABC 三色:A 红重点,B 橙,C 灰
+    abc_tier = {
+        "ABC分类": [],  # 不用 tier_colors 直接对分类列染色,这里跳过;留给手动 fill
+    }
+    chart = ChartSpec(type="bar", x="分类", y="出库金额合计", title="ABC 分类出库金额合计")
+    bar_colors = ["C0504D", "F79646", "9BBB59"]  # A=红 B=橙 C=绿
+
+    return SheetData(
+        name=f"ABC 分类汇总-{result_col_name}"[:31],
+        headers=headers,
+        rows=rows,
+        chart=chart,
+        number_formats=number_formats,
+        series_colors_by_row=bar_colors,
+    )
+
+
+def _build_dormant_sheet(*, records: list[dict], result_col_name: str) -> Optional[SheetData]:
+    """呆滞物料 sheet(对应 docx §6.3):R ≥ 90 的物料筛选清单。"""
+    if not records:
+        return None
+    dormant = [r for r in records if isinstance(r.get(result_col_name), (int, float)) and r[result_col_name] >= 90]
+    if not dormant:
+        return None
+    # 按周转天数降序
+    dormant.sort(key=lambda r: r[result_col_name], reverse=True)
+
+    base_cols = [
+        c
+        for c in ("物料编码", "物料名称", "物料类别", "存放仓库", "主要供应商")
+        if c in dormant[0]
+    ]
+    headers = ["排名"] + base_cols + [result_col_name, "健康度"]
+    rows = []
+    for i, r in enumerate(dormant, start=1):
+        rows.append(
+            [i] + [r.get(c) for c in base_cols] + [r[result_col_name], r.get("健康度", "滞销")]
+        )
+
+    number_formats = {result_col_name: "0.0"}
+    tier_colors = {result_col_name: TURNOVER_DAYS_TIERS}
+
+    return SheetData(
+        name=f"呆滞物料清单-{result_col_name}"[:31],
+        headers=headers,
+        rows=rows,
+        chart=None,
+        number_formats=number_formats,
+        tier_colors=tier_colors,
     )
 
 

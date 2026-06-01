@@ -22,8 +22,8 @@ from client.tools.runtime import Runtime
 from shared.contract import Operation
 
 SUPPORTED_OPS = [
-    "group_by",  # params: {"field": str}
-    "sum",  # params: {"field": str?}
+    "group_by",
+    "sum",
     "mean",
     "count",
     "min",
@@ -31,9 +31,10 @@ SUPPORTED_OPS = [
     "pivot",
     "resample",
     "filter",
-    "head",  # params: {"n": int}
+    "head",
     "describe",
-    "div",  # params: {"numerator": str, "denominator": str} 列对列逐行除法,产 CipherSeries
+    "div",  # 三种形态:单列/单列,列和/列和,列和/列和 × multiplier
+    "turnover_days",  # 库存周转天数(docx §3.2):全 HE 算 M/N/P/Q/R
 ]
 
 
@@ -192,6 +193,30 @@ class PandaSeal:
                 result = result * cdf[multiplier]
 
             return result
+
+        if name == "turnover_days":
+            # 库存周转天数 R = 平均库存金额 × 期间天数 / 出库金额
+            # 全在密文上一次性算完(对应 docx §3.2):
+            #   M = (I + K) / (H + J)        加权平均单价
+            #   N = L × M                    出库金额
+            #   P = I + K - N                期末金额
+            #   Q = (I + P) / 2              平均库存金额
+            #   R = Q × days / N             周转天数
+            H = cdf[p.get("begin_qty", "begin_qty")]
+            I = cdf[p.get("begin_amount", "begin_amount")]
+            J = cdf[p.get("in_qty", "in_qty")]
+            K = cdf[p.get("in_amount", "in_amount")]
+            L = cdf[p.get("out_qty", "out_qty")]
+            days = float(p.get("days", 30))
+
+            sum_amt = I + K
+            sum_qty = H + J
+            M = sum_amt / sum_qty
+            N = L * M
+            P = sum_amt - N  # = I + K - N
+            Q = (I + P) / 2.0
+            R = Q * days / N
+            return R
 
         if name == "filter":
             # 条件过滤:用重载比较运算符

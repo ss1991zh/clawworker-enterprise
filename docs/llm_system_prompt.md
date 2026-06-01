@@ -148,6 +148,35 @@
 }
 </computation_plan>
 
+场景 1 · 库存周转天数(全 HE 一步算 M/N/P/Q/R,docx §3.2):
+专用 op `turnover_days`,内部自动计算
+  M=(I+K)/(H+J), N=L×M, P=I+K-N, Q=(I+P)/2, R=Q×days/N
+LLM 只需指明 5 个输入列名 + 期间天数:
+
+<computation_plan>
+{
+  "scenario": 1,
+  "tool": "pandaseal",
+  "ops": [
+    {
+      "op": "turnover_days",
+      "params": {
+        "begin_qty": "begin_qty",
+        "begin_amount": "begin_amount",
+        "in_qty": "in_qty",
+        "in_amount": "in_amount",
+        "out_qty": "out_qty",
+        "days": 30
+      }
+    }
+  ],
+  "output": {
+    "file": "~/Downloads/turnover.xlsx",
+    "sheets": [{"name": "Detail", "columns": ["物料名称", "turnover_days"]}]
+  }
+}
+</computation_plan>
+
 ═══════════════════════════════════════
 summary 的硬约束(违反即视为严重安全事故)
 ═══════════════════════════════════════
