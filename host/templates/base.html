@@ -1,0 +1,34 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Admin · Clawworker Enterprise{% endblock %}</title>
+  <link rel="stylesheet" href="/admin/static/admin.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">Clawworker <span class="sub">Enterprise · Admin</span></div>
+    <nav>
+      <a href="/admin/" class="{% if active=='dashboard' %}active{% endif %}">概览</a>
+      <a href="/admin/authorizations" class="{% if active=='authorizations' %}active{% endif %}">用户授权</a>
+      <a href="/admin/accounts" class="{% if active=='accounts' %}active{% endif %}">账户</a>
+      <a href="/admin/llm" class="{% if active=='llm' %}active{% endif %}">LLM 配置</a>
+      <a href="/admin/sessions" class="{% if active=='sessions' %}active{% endif %}">会话</a>
+    </nav>
+  </header>
+
+  <main class="container">
+    {% if messages %}
+      {% for category, msg in messages %}
+        <div class="alert {{ category }}">{{ msg }}</div>
+      {% endfor %}
+    {% endif %}
+    {% block content %}{% endblock %}
+    <div class="footer">
+      Clawworker Enterprise · MVP · 主机 <code>127.0.0.1:8443</code> ·
+      <a href="/docs" target="_blank">Swagger API 文档</a>
+    </div>
+  </main>
+</body>
+</html>

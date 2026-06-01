@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}会话 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">在线会话</h1>
+  <p class="page-subtitle">用户登录后产生的 session token · 8 小时 TTL · 客户端 LLM 调用都基于这个</p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>当前活跃({{ sessions|length }})</h3></div>
+    <div class="panel-body compact">
+      {% if sessions %}
+      <table class="table">
+        <thead>
+          <tr><th>用户名</th><th>Token(脱敏)</th><th>过期时间</th><th style="width:120px;">操作</th></tr>
+        </thead>
+        <tbody>
+        {% for s in sessions %}
+          <tr>
+            <td><strong>{{ s.username }}</strong></td>
+            <td class="mono">{{ s.token_masked }}</td>
+            <td class="mono">{{ s.expires_at }}</td>
+            <td>
+              <form method="post" action="/admin/sessions/{{ s.token }}/revoke" style="display:inline;">
+                <button class="btn btn-danger" type="submit">注销</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <div class="empty">当前没有活跃会话</div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}

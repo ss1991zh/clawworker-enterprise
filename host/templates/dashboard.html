@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}概览 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">系统概览</h1>
+  <p class="page-subtitle">实时反映当前用户授权、账户、LLM 调用与会话状态</p>
+
+  <div class="kpi-grid">
+    <div class="kpi-card">
+      <div class="label">用户授权</div>
+      <div class="value">{{ stats.authorizations }}</div>
+      <div class="hint">{{ stats.active_authorizations }} 有效 · {{ stats.revoked_authorizations }} 已吊销</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">账户</div>
+      <div class="value">{{ stats.accounts }}</div>
+      <div class="hint">{{ stats.active_accounts }} 活跃 · {{ stats.disabled_accounts }} 禁用</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">在线会话</div>
+      <div class="value">{{ stats.sessions }}</div>
+      <div class="hint">8 小时 TTL · 自动续期</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">LLM 调用</div>
+      <div class="value">{{ stats.llm_calls }}</div>
+      <div class="hint">{{ stats.llm_status }}</div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h3>系统状态</h3>
+    </div>
+    <div class="panel-body">
+      <dl>
+        <div class="dl-row">
+          <dt>主机版本</dt>
+          <dd>Clawworker Enterprise · {{ system.version }}</dd>
+        </div>
+        <div class="dl-row">
+          <dt>LLM Provider</dt>
+          <dd>{{ system.llm_provider }}</dd>
+        </div>
+        <div class="dl-row">
+          <dt>HE 后端</dt>
+          <dd>crypto_toolkit + pandaseal + henumpy + helearn{% if not system.hetorch_ready %}(hetorch 待接入){% endif %}</dd>
+        </div>
+        <div class="dl-row">
+          <dt>授权剩余有效天数</dt>
+          <dd>{{ system.license_days_left }} 天</dd>
+        </div>
+      </dl>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h3>快速操作</h3>
+    </div>
+    <div class="panel-body" style="display:flex; gap:12px;">
+      <a class="btn btn-primary" href="/admin/authorizations">导入新授权</a>
+      <a class="btn btn-secondary" href="/admin/accounts">创建账户</a>
+      <a class="btn btn-secondary" href="/admin/llm">查看 LLM 配置</a>
+      <a class="btn btn-secondary" href="/docs" target="_blank">打开 Swagger</a>
+    </div>
+  </div>
+{% endblock %}

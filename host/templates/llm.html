@@ -1,0 +1,67 @@
+{% extends "base.html" %}
+{% block title %}LLM 配置 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">LLM 代理配置</h1>
+  <p class="page-subtitle">所有客户端通过本主机 /llm/chat 统一调用 · 不接触明文数据 · 不接触密钥</p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>当前配置</h3></div>
+    <div class="panel-body">
+      <dl>
+        <div class="dl-row"><dt>Provider 类型</dt><dd>{{ llm.provider_type or '— 未配置 —' }}</dd></div>
+        <div class="dl-row"><dt>模型名称</dt><dd>{{ llm.model_name or '—' }}</dd></div>
+        <div class="dl-row"><dt>API Base URL</dt><dd>{{ llm.base_url or '—' }}</dd></div>
+        <div class="dl-row"><dt>API Key</dt><dd>{{ llm.api_key_masked }}</dd></div>
+        <div class="dl-row"><dt>状态</dt>
+          <dd>
+            {% if llm.ready %}
+              <span class="pill active">已就绪</span>
+            {% else %}
+              <span class="pill warning">未配置(/llm/chat 将返回 503)</span>
+            {% endif %}
+          </dd>
+        </div>
+      </dl>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>如何切换 / 重新配置</h3></div>
+    <div class="panel-body">
+      <p style="margin-top:0; color: var(--text-muted);">
+        Provider 由主机环境变量驱动,修改后需重启 uvicorn 进程。
+      </p>
+
+<pre style="background:var(--bg); padding:16px; border-radius:4px; font-size:12px; font-family:SF Mono, Menlo, monospace; overflow-x:auto; border:1px solid var(--border);">
+# OpenRouter + DeepSeek(当前推荐)
+MODEL_TYPE=openrouter \
+OPENROUTER_API_KEY=sk-or-v1-...... \
+MODEL_NAME=deepseek/deepseek-v4-pro \
+uvicorn host.server:app --host 0.0.0.0 --port 8443
+
+# Anthropic Claude
+MODEL_TYPE=anthropic \
+ANTHROPIC_API_KEY=sk-ant-...... \
+MODEL_NAME=claude-sonnet-4-5 \
+uvicorn host.server:app ...
+
+# OpenAI 官方
+MODEL_TYPE=openai \
+OPENAI_API_KEY=sk-...... \
+MODEL_NAME=gpt-4o \
+uvicorn host.server:app ...
+</pre>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>调用统计</h3></div>
+    <div class="panel-body">
+      <dl>
+        <div class="dl-row"><dt>累计 LLM 调用</dt><dd>{{ llm.total_calls }} 次</dd></div>
+        <div class="dl-row"><dt>成功</dt><dd>{{ llm.successful_calls }} 次</dd></div>
+        <div class="dl-row"><dt>失败</dt><dd>{{ llm.failed_calls }} 次</dd></div>
+      </dl>
+    </div>
+  </div>
+{% endblock %}

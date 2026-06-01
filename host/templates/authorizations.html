@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+{% block title %}用户授权 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">用户授权管理</h1>
+  <p class="page-subtitle">每张外部 PKI 平台签发的 user_authorization 文件对应一个账户;吊销后该账户立即失效</p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>导入新授权</h3></div>
+    <div class="panel-body">
+      <form method="post" action="/admin/authorizations">
+        <div class="form-grid">
+          <div class="field">
+            <label>账户用户名</label>
+            <input type="text" name="username" placeholder="alice" required>
+          </div>
+          <div class="field">
+            <label>user_authorization 文件路径</label>
+            <input type="text" name="path" placeholder="/Users/.../Desktop/user_authorization" required>
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:8px;">导入授权</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h3>已导入授权({{ authorizations|length }})</h3>
+    </div>
+    <div class="panel-body compact">
+      {% if authorizations %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>主体</th>
+            <th>auth_id</th>
+            <th>导入时间</th>
+            <th>状态</th>
+            <th style="width:120px;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for a in authorizations %}
+          <tr>
+            <td><strong>{{ a.subject }}</strong></td>
+            <td class="mono">{{ a.auth_id }}</td>
+            <td class="mono">{{ a.imported_at }}</td>
+            <td>
+              {% if a.revoked %}
+                <span class="pill disabled">已吊销</span>
+              {% elif a.sdk_init_failed_at %}
+                <span class="pill warning">SDK 失败</span>
+              {% else %}
+                <span class="pill active">有效</span>
+              {% endif %}
+            </td>
+            <td>
+              {% if not a.revoked %}
+              <form method="post" action="/admin/authorizations/{{ a.subject }}/revoke" style="display:inline;">
+                <button class="btn btn-danger" type="submit">吊销</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <div class="empty">还没有任何授权 · 用上方表单导入第一张</div>
+      {% endif %}
+    </div>
+  </div>
+{% endblock %}

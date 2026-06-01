@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from host.admin_ui import build_admin_router
 from host.cert_manager import AuthorizationManager
 from host.dispatcher import Dispatcher
 from host.llm_proxy import LLMProvider, make_provider
@@ -87,6 +89,20 @@ def _init_llm_provider() -> Optional[LLMProvider]:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="agent-system host", version="0.1.0")
+
+# Admin UI 路由 + 静态文件
+from pathlib import Path as _P
+
+_HOST_DIR = _P(__file__).resolve().parent
+app.mount("/admin/static", StaticFiles(directory=str(_HOST_DIR / "static")), name="admin_static")
+app.include_router(
+    build_admin_router(
+        auth_manager=auth_manager,
+        user_manager=user_manager,
+        dispatcher=dispatcher,
+        get_llm_provider=lambda: llm_provider,
+    )
+)
 
 
 @app.on_event("startup")
