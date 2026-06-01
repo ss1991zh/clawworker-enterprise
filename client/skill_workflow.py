@@ -910,6 +910,104 @@ METHOD_COLORS = {
 }
 
 
+def _apply_seasonal_to_forecast(
+    forecast_values: list[float],
+    seasonal_factors: list[float],
+    horizon: int,
+    historical_dates: Optional[list[str]] = None,
+    future_dates: Optional[list[str]] = None,
+) -> list[float]:
+    """
+    将基础 OLS 预测乘以"未来月份的季节因子"。
+
+    正确策略:把历史 季节因子 按 month-of-year(YYYY-MM 末两位)建索引;
+    未来月份去查同 month-of-year 的因子;查不到用 1.0(中性)。
+    """
+    n_hist = len(seasonal_factors)
+    if n_hist == 0:
+        return forecast_values
+
+    # 构造 month-of-year → factor 映射(同月有多年取最近一次)
+    mm_to_sf: dict[str, float] = {}
+    if historical_dates and len(historical_dates) == n_hist:
+        for d, sf in zip(historical_dates, seasonal_factors):
+            mm = str(d)[-2:]
+            mm_to_sf[mm] = sf
+
+    adjusted = []
+    for j in range(horizon):
+        sf = 1.0
+        if future_dates and j < len(future_dates) and mm_to_sf:
+            mm = str(future_dates[j])[-2:]
+            sf = mm_to_sf.get(mm, 1.0)
+        else:
+            # 兜底:循环用历史最后 horizon 期
+            sf = seasonal_factors[(n_hist + j) % n_hist] if n_hist else 1.0
+        adjusted.append(forecast_values[j] * (sf or 1.0))
+    return adjusted
+
+
+def _compute_confidence_interval(
+    historical: list[float],
+    forecast_values: list[float],
+    z: float = 1.96,
+) -> tuple[list[float], list[float]]:
+    """
+    基于历史波动率给出预测的 ±z·σ 上下界。
+    返回 (upper, lower) 各 len(forecast_values)。
+    """
+    n = len(historical)
+    if n < 2:
+        return forecast_values, forecast_values
+    mean_h = sum(historical) / n
+    var_h = sum((v - mean_h) ** 2 for v in historical) / (n - 1)
+    sigma = var_h**0.5
+    upper = [f + z * sigma for f in forecast_values]
+    lower = [max(0.0, f - z * sigma) for f in forecast_values]
+    return upper, lower
+
+
+def _compute_yoy_per_row(
+    historical_with_dates: list[tuple[str, float]],
+    forecast_with_dates: list[tuple[str, float]],
+) -> list[Optional[float]]:
+    """
+    对每个 forecast 月份找去年同月(月份字符串末两位匹配)算 YoY。
+    返回与 forecast_with_dates 等长的 list[Optional[float]],无对应历史的格为 None。
+    """
+    hist_by_mm = {}
+    for d, v in historical_with_dates:
+        mm = str(d)[-2:]
+        # 同 month-of-year 取最近一次
+        hist_by_mm.setdefault(mm, []).append((d, v))
+    out = []
+    for d, f in forecast_with_dates:
+        mm = str(d)[-2:]
+        if mm in hist_by_mm and hist_by_mm[mm]:
+            base = hist_by_mm[mm][-1][1]
+            out.append((f - base) / base if base else None)
+        else:
+            out.append(None)
+    return out
+
+
+# 产品线 / 大区 列名约定:总览列 + 维度前缀
+DIM_LINE_PREFIX = "line_"
+DIM_REGION_PREFIX = "region_"
+TOTAL_COL_NAMES = ("total_sales", "total", "all_sales", "全公司销售额")
+
+# 维度列名 英 → 中(避免在 Excel 看到 line_industrial / region_east)
+LINE_EN_TO_ZH: dict[str, str] = {
+    "industrial": "工控平台", "comm": "通信", "hmi": "人机界面",
+    "spare": "备品备件", "mvision": "机器视觉", "sense": "感知设备",
+    "motion": "运动控制", "power": "电源",
+}
+REGION_EN_TO_ZH: dict[str, str] = {
+    "east": "华东大区", "central": "华中大区", "north": "华北大区",
+    "south": "华南大区", "southwest": "西南大区", "overseas": "海外",
+}
+
+
 def _render_forecast_sheets(
     *,
     historical: list[float],
@@ -937,22 +1035,57 @@ def _render_forecast_sheets(
 
     forecasts = _compute_forecasts(historical, horizon, methods)
 
-    # === Sheet 1:预测对比 ===
+    # === 增强 1:季节因子调整(若 metadata 含季节因子列)===
+    seasonal_col = next(
+        (c for c in (metadata_columns or []) if c in ("季节因子", "seasonal_factor")), None
+    )
+    seasonal_factors = (
+        [float(r.get(seasonal_col) or 1.0) for r in metadata_rows] if seasonal_col else []
+    )
+    ols_seasonal_adj = (
+        _apply_seasonal_to_forecast(
+            forecasts.get("OLS", []), seasonal_factors, horizon,
+            historical_dates=dates, future_dates=future_dates,
+        )
+        if seasonal_factors and "OLS" in forecasts
+        else []
+    )
+
+    # === 增强 2:置信区间 ±1.96σ(基于 OLS 预测)===
+    ci_upper, ci_lower = _compute_confidence_interval(historical, forecasts.get("OLS", []))
+
+    # === 增强 3:YoY 同比增长率(forecast 月 vs 同名 month-of-year 的历史)===
+    hist_with_dates = list(zip(dates, historical))
+    fcst_with_dates = list(zip(future_dates, forecasts.get("OLS", [])))
+    yoy_per_forecast = _compute_yoy_per_row(hist_with_dates, fcst_with_dates)
+
+    # === Sheet 1:预测对比(扩展)===
     actual_label = "实际销售额"
     method_cols = [METHOD_LABELS_ZH.get(m, m) for m in methods]
-    headers = [date_col, actual_label] + method_cols
+    extra_cols: list[str] = []
+    if ols_seasonal_adj:
+        extra_cols.append("OLS 季节调整")
+    extra_cols += ["OLS 上界 +1.96σ", "OLS 下界 -1.96σ", "YoY 增长率"]
+
+    headers = [date_col, actual_label] + method_cols + extra_cols
     rows: list[list] = []
 
-    # 历史部分:仅实际值
+    # 历史部分:仅实际值,extra 列空
     for i, d in enumerate(dates):
-        rows.append([d, historical[i]] + [None] * len(methods))
-    # 预测部分:仅各方法的预测值
+        rows.append([d, historical[i]] + [None] * len(methods) + [None] * len(extra_cols))
+    # 预测部分:各方法 + 增强列
     for j, d in enumerate(future_dates):
         row = [d, None]
         for m in methods:
             row.append(forecasts[m][j])
+        if ols_seasonal_adj:
+            row.append(ols_seasonal_adj[j])
+        row.append(ci_upper[j] if ci_upper else None)
+        row.append(ci_lower[j] if ci_lower else None)
+        row.append(yoy_per_forecast[j])
         rows.append(row)
 
+    # 主图:仅画核心 5 条曲线(避免太挤);上下界用单独标记
     chart = ChartSpec(
         type="line",
         x=date_col,
@@ -960,10 +1093,9 @@ def _render_forecast_sheets(
         title=f"销售额历史 + {horizon} 个月多方法预测对比",
     )
     cell_fmt = "¥#,##0.00"
-    number_formats = {h: cell_fmt for h in headers if h != date_col}
+    number_formats = {h: cell_fmt for h in headers if h not in (date_col, "YoY 增长率")}
+    number_formats["YoY 增长率"] = "0.00%"
 
-    # 折线染色(每条曲线一种颜色):series_colors_by_row 是给 bar 用的,
-    # 多 series 染色 openpyxl LineChart 默认自动配色,这里保留默认即可
     detail_sheet = SheetData(
         name="销售预测对比",
         headers=headers,
@@ -1037,6 +1169,159 @@ def _render_forecast_sheets(
     detail_sheet.kpi_cards = kpi_cards
 
     return [detail_sheet, summary_sheet]
+
+
+def _render_forecast_sheets_multi(
+    *,
+    df,  # pandas.DataFrame,各列是 total_sales / line_* / region_*
+    metadata_rows: list[dict],
+    metadata_columns: Optional[list[str]],
+    primary_spec: SheetSpec,
+    horizon: int,
+    methods: list[str],
+    value_col: Optional[str],
+) -> list[SheetData]:
+    """
+    多列时间序列预测:
+    - Sheet 1 "销售预测对比":主列(总览)+ 季节调整 + 置信带 + YoY(同 single 路径)
+    - Sheet 2 "预测方法汇总"
+    - Sheet 3 "按产品线分维度":line_* 列各自的 10 历史 + 3 OLS 预测
+    - Sheet 4 "按大区分维度":region_* 列同上
+    - Sheet 5 "季节因子分布"
+    """
+    cols = list(df.columns)
+    main_col = value_col if value_col and value_col in cols else next(
+        (c for c in cols if c in TOTAL_COL_NAMES), cols[0]
+    )
+    line_cols = [c for c in cols if str(c).startswith(DIM_LINE_PREFIX)]
+    region_cols = [c for c in cols if str(c).startswith(DIM_REGION_PREFIX)]
+
+    # 主列调用单序列路径(已含季节/CI/YoY 增强)
+    main_history = [float(v) for v in df[main_col].tolist()]
+    sheets = _render_forecast_sheets(
+        historical=main_history,
+        metadata_rows=metadata_rows,
+        metadata_columns=metadata_columns,
+        primary_spec=primary_spec,
+        horizon=horizon,
+        methods=methods,
+    )
+
+    # 找日期列 + 未来月
+    date_col = next(
+        (c for c in (metadata_columns or []) if c in ("销售月份", "月份", "date", "month")), None
+    )
+    dates = [str(r.get(date_col)) for r in metadata_rows] if date_col else [str(i) for i in range(len(df))]
+    future_dates = _extend_month_labels(dates, horizon)
+
+    # === Sheet 3:按产品线分维度并排预测 ===
+    if line_cols:
+        sheets.append(
+            _build_dimension_forecast_sheet(
+                dim_cols=line_cols,
+                df=df,
+                dates=dates,
+                future_dates=future_dates,
+                date_col=date_col or "月份",
+                horizon=horizon,
+                dim_label="产品线",
+                prefix=DIM_LINE_PREFIX,
+            )
+        )
+
+    # === Sheet 4:按大区分维度并排预测 ===
+    if region_cols:
+        sheets.append(
+            _build_dimension_forecast_sheet(
+                dim_cols=region_cols,
+                df=df,
+                dates=dates,
+                future_dates=future_dates,
+                date_col=date_col or "月份",
+                horizon=horizon,
+                dim_label="销售大区",
+                prefix=DIM_REGION_PREFIX,
+            )
+        )
+
+    # === Sheet 5:季节因子分布 ===
+    seasonal_col = next(
+        (c for c in (metadata_columns or []) if c in ("季节因子", "seasonal_factor")), None
+    )
+    if seasonal_col:
+        sf_values = [float(r.get(seasonal_col) or 1.0) for r in metadata_rows]
+        sheets.append(_build_seasonal_factor_sheet(dates=dates, factors=sf_values, date_col=date_col or "月份"))
+
+    return sheets
+
+
+def _build_dimension_forecast_sheet(
+    *,
+    dim_cols: list[str],
+    df,  # pandas.DataFrame
+    dates: list[str],
+    future_dates: list[str],
+    date_col: str,
+    horizon: int,
+    dim_label: str,
+    prefix: str,
+) -> SheetData:
+    """
+    按维度并排预测:每条产品线/大区一条曲线,X = 月份(历史+预测)。
+    每列做 OLS 外推 horizon 步。列名英→中(line_industrial → 工控平台)。
+    """
+    en_to_zh = LINE_EN_TO_ZH if prefix == DIM_LINE_PREFIX else REGION_EN_TO_ZH
+
+    def pretty(c: str) -> str:
+        en = str(c).removeprefix(prefix)
+        return en_to_zh.get(en, en)
+
+    headers = [date_col] + [pretty(c) for c in dim_cols]
+
+    # 每列对历史值算 OLS 预测
+    forecasts_by_col: dict[str, list[float]] = {}
+    for c in dim_cols:
+        hist = [float(v) for v in df[c].tolist()]
+        f = _compute_forecasts(hist, horizon, ["OLS"])["OLS"]
+        forecasts_by_col[c] = hist + f
+
+    all_dates = dates + future_dates
+    rows = []
+    for i, d in enumerate(all_dates):
+        row = [d] + [forecasts_by_col[c][i] for c in dim_cols]
+        rows.append(row)
+
+    chart = ChartSpec(
+        type="line",
+        x=date_col,
+        y=[pretty(c) for c in dim_cols],
+        title=f"按{dim_label} OLS 预测(+{horizon} 期)",
+    )
+    number_formats = {h: "¥#,##0.00" for h in headers if h != date_col}
+
+    return SheetData(
+        name=f"按{dim_label}预测",
+        headers=headers,
+        rows=rows,
+        chart=chart,
+        number_formats=number_formats,
+    )
+
+
+def _build_seasonal_factor_sheet(
+    *, dates: list[str], factors: list[float], date_col: str
+) -> SheetData:
+    """季节因子按月分布,折线图。"""
+    headers = [date_col, "季节因子"]
+    rows = [[d, f] for d, f in zip(dates, factors)]
+    chart = ChartSpec(type="line", x=date_col, y="季节因子", title="季节因子月度分布")
+    return SheetData(
+        name="季节因子分布",
+        headers=headers,
+        rows=rows,
+        chart=chart,
+        number_formats={"季节因子": "0.00"},
+    )
 
 
 def _build_dormant_sheet(*, records: list[dict], result_col_name: str) -> Optional[SheetData]:
@@ -1226,25 +1511,46 @@ def _render_to_sheets(
         if op_name == "forecast":
             forecast_op = op
             break
-    if (
-        forecast_op is not None
-        and isinstance(decrypted, list)
-        and metadata_rows
-        and len(decrypted) == len(metadata_rows)
-        and decrypted
-        and isinstance(decrypted[0], (int, float))
-    ):
+
+    if forecast_op is not None and metadata_rows:
         op_params = (
             forecast_op.params if hasattr(forecast_op, "params") else forecast_op.get("params", {})
         ) or {}
-        return _render_forecast_sheets(
-            historical=decrypted,
-            metadata_rows=metadata_rows,
-            metadata_columns=metadata_columns,
-            primary_spec=primary_spec,
-            horizon=int(op_params.get("horizon", 3)),
-            methods=op_params.get("methods") or ["MA3", "MA6", "WMA", "OLS"],
-        )
+        horizon = int(op_params.get("horizon", 3))
+        methods = op_params.get("methods") or ["MA3", "MA6", "WMA", "OLS"]
+        value_col = op_params.get("value_col")
+
+        # 形态 A:list[float] = 单列时间序列(原行为)
+        if (
+            isinstance(decrypted, list)
+            and decrypted
+            and isinstance(decrypted[0], (int, float))
+            and len(decrypted) == len(metadata_rows)
+        ):
+            return _render_forecast_sheets(
+                historical=decrypted,
+                metadata_rows=metadata_rows,
+                metadata_columns=metadata_columns,
+                primary_spec=primary_spec,
+                horizon=horizon,
+                methods=methods,
+            )
+
+        # 形态 B:DataFrame = 多列时间序列(主列 + 产品线/大区维度)
+        try:
+            import pandas as pd
+        except ImportError:
+            pd = None
+        if pd is not None and isinstance(decrypted, pd.DataFrame) and len(decrypted) == len(metadata_rows):
+            return _render_forecast_sheets_multi(
+                df=decrypted,
+                metadata_rows=metadata_rows,
+                metadata_columns=metadata_columns,
+                primary_spec=primary_spec,
+                horizon=horizon,
+                methods=methods,
+                value_col=value_col,
+            )
 
     # 情况 -1:row-aligned list + metadata → 合并为丰富表
     if (

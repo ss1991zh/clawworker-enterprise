@@ -196,15 +196,24 @@ class PandaSeal:
             return result
 
         if name == "forecast":
-            # 时间序列预测 hint op:HE 上仅返回值列(CipherSeries),
-            # 真正的预测(MA3/MA6/WMA/OLS)在 renderer 上对解密后的历史值做。
-            # params: {"value_col": str, "horizon": int(=3), "methods": [str]}
+            # 时间序列预测 hint op:HE 上仅返回值列(CipherSeries 或 CipherDataFrame),
+            # 真正的预测(MA3/MA6/WMA/OLS + 季节调整 + 置信区间 + YoY + 维度切片)
+            # 都在 renderer 上对解密后的历史值做(避免 HE 上的复杂外推)。
+            #
+            # 单列模式(原行为):params={"value_col": str} → CipherSeries
+            # 多列模式(v2)    :cdf 有多列且 value_col 在其中 → 整个 CipherDataFrame,
+            #                  decrypt 后 renderer 据列名前缀(total_sales / line_* / region_*)
+            #                  生成 5 sheet 多维预测。
             col = p.get("value_col") or p.get("field") or p.get("col")
             if not col:
                 raise ValueError("forecast 需要 value_col")
             if col not in cdf.columns:
                 raise ValueError(f"forecast value_col 不存在: {col}")
-            return cdf[col]
+            mode = p.get("return", "auto")
+            if mode == "single" or len(cdf.columns) == 1:
+                return cdf[col]
+            # auto / multi:多列时返回整个 CipherDataFrame
+            return cdf
 
         if name == "turnover_days":
             # 库存周转天数 R = 平均库存金额 × 期间天数 / 出库金额
