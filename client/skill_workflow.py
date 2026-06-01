@@ -1180,14 +1180,14 @@ def _render_forecast_sheets_multi(
     horizon: int,
     methods: list[str],
     value_col: Optional[str],
+    focus_dim: str = "all",
 ) -> list[SheetData]:
     """
-    多列时间序列预测:
-    - Sheet 1 "销售预测对比":主列(总览)+ 季节调整 + 置信带 + YoY(同 single 路径)
-    - Sheet 2 "预测方法汇总"
-    - Sheet 3 "按产品线分维度":line_* 列各自的 10 历史 + 3 OLS 预测
-    - Sheet 4 "按大区分维度":region_* 列同上
-    - Sheet 5 "季节因子分布"
+    多列时间序列预测;focus_dim 控制是否生成产品线/大区分维 sheet:
+    - "all"    : 全部出(default)—— 全公司 + 8 产品线 + 6 大区
+    - "line"   : 仅产品线维度(隐藏大区)
+    - "region" : 仅大区维度(隐藏产品线)
+    - "total"  : 仅全公司,不出任何分维 sheet
     """
     cols = list(df.columns)
     main_col = value_col if value_col and value_col in cols else next(
@@ -1195,6 +1195,14 @@ def _render_forecast_sheets_multi(
     )
     line_cols = [c for c in cols if str(c).startswith(DIM_LINE_PREFIX)]
     region_cols = [c for c in cols if str(c).startswith(DIM_REGION_PREFIX)]
+
+    # focus_dim 过滤
+    if focus_dim == "line":
+        region_cols = []
+    elif focus_dim == "region":
+        line_cols = []
+    elif focus_dim == "total":
+        line_cols, region_cols = [], []
 
     # 主列调用单序列路径(已含季节/CI/YoY 增强)
     main_history = [float(v) for v in df[main_col].tolist()]
@@ -1550,6 +1558,7 @@ def _render_to_sheets(
                 horizon=horizon,
                 methods=methods,
                 value_col=value_col,
+                focus_dim=str(op_params.get("focus_dim", "all")).lower(),
             )
 
     # 情况 -1:row-aligned list + metadata → 合并为丰富表

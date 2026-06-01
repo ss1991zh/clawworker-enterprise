@@ -148,6 +148,84 @@
 }
 </computation_plan>
 
+═══════════════════════════════════════
+forecast op 智能选配(根据用户问什么自动挑 methods + focus_dim)
+═══════════════════════════════════════
+
+forecast op 的 params 支持:
+  - value_col(必填)         主时间序列列名
+  - horizon(默认 3)         预测期数
+  - methods(默认 全 4 种)   [MA3, MA6, WMA, OLS] 子集
+  - focus_dim(默认 all)     all / line / region / total
+
+按用户措辞自动选 methods 与 focus_dim:
+
+| 用户意图关键词                  | methods 推荐           | focus_dim 推荐 |
+|-------------------------------|----------------------|----------------|
+| "全面" / "多种方法对比"          | [MA3, MA6, WMA, OLS] | all            |
+| "保守" / "下界" / "悲观" / "稳健" | [MA6, WMA]           | all            |
+| "乐观" / "趋势" / "增长" / "外推" | [OLS]                | all            |
+| "短期" / "最近 N 月"           | [MA3, WMA]           | all            |
+| "长期" / "长趋势"               | [OLS]                | all            |
+| "平滑" / "稳定"                | [MA6, WMA]           | all            |
+| "看产品线" / "按产品" / "产品维度" | [OLS]                | line           |
+| "看大区" / "按区" / "区域"      | [OLS]                | region         |
+| "只看全公司" / "不要分维度"     | 用户措辞决定          | total          |
+| "季节性" / "节假日" / "周期"   | [OLS]                | all 🌸 季节调整突出 |
+| "同比" / "vs 去年"            | [OLS]                | all 📅 YoY 突出 |
+| "不要 OLS"                  | [MA3, MA6, WMA]      | all            |
+
+horizon 推荐:
+  - "下个月"                  → 1
+  - "下个季度" / "未来 3 月" → 3
+  - "下半年"                  → 6
+  - "明年" / "未来一年"      → 12
+  - 没说 → 3(默认)
+
+示例:用户问 "预测下个季度销售额,重点看各产品线表现"
+
+<computation_plan>
+{
+  "scenario": 1,
+  "tool": "pandaseal",
+  "ops": [{
+    "op": "forecast",
+    "params": {
+      "value_col": "total_sales",
+      "horizon": 3,
+      "methods": ["OLS"],
+      "focus_dim": "line"
+    }
+  }],
+  "output": {
+    "file": "~/Downloads/forecast.xlsx",
+    "sheets": [{"name": "Forecast", "columns": ["销售月份", "total_sales"]}]
+  }
+}
+</computation_plan>
+
+示例:用户问 "做个保守的销售预测,不要太激进"
+
+<computation_plan>
+{
+  "scenario": 1,
+  "tool": "pandaseal",
+  "ops": [{
+    "op": "forecast",
+    "params": {
+      "value_col": "total_sales",
+      "horizon": 3,
+      "methods": ["MA6", "WMA"],
+      "focus_dim": "all"
+    }
+  }],
+  "output": {
+    "file": "~/Downloads/forecast.xlsx",
+    "sheets": [{"name": "Forecast", "columns": ["销售月份", "total_sales"]}]
+  }
+}
+</computation_plan>
+
 场景 1 · 库存周转天数(全 HE 一步算 M/N/P/Q/R,docx §3.2):
 专用 op `turnover_days`,内部自动计算
   M=(I+K)/(H+J), N=L×M, P=I+K-N, Q=(I+P)/2, R=Q×days/N
