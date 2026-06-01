@@ -886,6 +886,51 @@ def _compute_forecasts(history: list[float], horizon: int, methods: list[str]) -
             for v in history[1:]:
                 s = alpha * v + (1 - alpha) * s
             out[m] = [s] * horizon
+        elif m == "ETS":
+            # Holt 双指数平滑(level + trend,无季节性)
+            # L_t = α·Y_t + (1−α)·(L_{t−1} + T_{t−1})
+            # T_t = β·(L_t − L_{t−1}) + (1−β)·T_{t−1}
+            # F_{t+h} = L_t + h·T_t
+            if n < 2:
+                out[m] = [h[-1] if h else 0.0 for h in [history]] * horizon
+                continue
+            alpha, beta = 0.4, 0.2
+            L = history[0]
+            T = history[1] - history[0]
+            for t in range(1, n):
+                L_prev = L
+                L = alpha * history[t] + (1 - alpha) * (L_prev + T)
+                T = beta * (L - L_prev) + (1 - beta) * T
+            out[m] = [L + (j + 1) * T for j in range(horizon)]
+        elif m == "ARIMA":
+            # ARIMA(1,1,0):一阶差分 + AR(1)
+            # d_t = Y_t − Y_{t−1}, d_t = c + φ·d_{t−1} + ε_t
+            # 然后逆差分还原
+            if n < 3:
+                out[m] = [history[-1]] * horizon
+                continue
+            diffs = [history[i] - history[i - 1] for i in range(1, n)]
+            if len(diffs) < 2:
+                out[m] = [history[-1]] * horizon
+                continue
+            x = diffs[:-1]
+            y = diffs[1:]
+            mx = sum(x) / len(x)
+            my = sum(y) / len(y)
+            num = sum((xi - mx) * (yi - my) for xi, yi in zip(x, y))
+            den = sum((xi - mx) ** 2 for xi in x)
+            phi = num / den if den else 0.0
+            phi = max(-0.95, min(0.95, phi))  # 限制避免爆炸
+            c = my - phi * mx
+            last_diff = diffs[-1]
+            last_y = history[-1]
+            preds = []
+            for _ in range(horizon):
+                next_diff = c + phi * last_diff
+                last_y = last_y + next_diff
+                preds.append(last_y)
+                last_diff = next_diff
+            out[m] = preds
         else:
             # 未知方法:用整体均值兜底
             out[m] = [sum(history) / n] * horizon
@@ -898,6 +943,8 @@ METHOD_LABELS_ZH = {
     "WMA": "加权移动平均",
     "OLS": "线性回归外推",
     "EWMA": "指数加权",
+    "ETS": "Holt 双指数平滑",
+    "ARIMA": "ARIMA(1,1,0)",
 }
 
 METHOD_COLORS = {
@@ -907,6 +954,8 @@ METHOD_COLORS = {
     "WMA": "F79646",  # 橙
     "OLS": "C0504D",  # 红
     "EWMA": "8064A2",  # 紫
+    "ETS": "00B0F0",  # 亮蓝(自适应趋势)
+    "ARIMA": "B85FBC",  # 玫红(随机过程模型)
 }
 
 

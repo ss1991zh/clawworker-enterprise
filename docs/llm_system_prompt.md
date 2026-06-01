@@ -155,25 +155,33 @@ forecast op 智能选配(根据用户问什么自动挑 methods + focus_dim)
 forecast op 的 params 支持:
   - value_col(必填)         主时间序列列名
   - horizon(默认 3)         预测期数
-  - methods(默认 全 4 种)   [MA3, MA6, WMA, OLS] 子集
+  - methods(默认 全 4 种)   子集,可选:
+       MA3 / MA6           简单移动平均(短/长窗)
+       WMA                  加权移动平均(偏向新)
+       OLS                  一阶线性回归外推
+       EWMA                 指数加权(平滑常数 0.4)
+       ETS                  Holt 双指数(level + trend)—— 自适应趋势
+       ARIMA                ARIMA(1,1,0) —— 差分 + 自回归
   - focus_dim(默认 all)     all / line / region / total
 
 按用户措辞自动选 methods 与 focus_dim:
 
-| 用户意图关键词                  | methods 推荐           | focus_dim 推荐 |
-|-------------------------------|----------------------|----------------|
-| "全面" / "多种方法对比"          | [MA3, MA6, WMA, OLS] | all            |
-| "保守" / "下界" / "悲观" / "稳健" | [MA6, WMA]           | all            |
-| "乐观" / "趋势" / "增长" / "外推" | [OLS]                | all            |
-| "短期" / "最近 N 月"           | [MA3, WMA]           | all            |
-| "长期" / "长趋势"               | [OLS]                | all            |
-| "平滑" / "稳定"                | [MA6, WMA]           | all            |
-| "看产品线" / "按产品" / "产品维度" | [OLS]                | line           |
-| "看大区" / "按区" / "区域"      | [OLS]                | region         |
-| "只看全公司" / "不要分维度"     | 用户措辞决定          | total          |
-| "季节性" / "节假日" / "周期"   | [OLS]                | all 🌸 季节调整突出 |
-| "同比" / "vs 去年"            | [OLS]                | all 📅 YoY 突出 |
-| "不要 OLS"                  | [MA3, MA6, WMA]      | all            |
+| 用户意图关键词                       | methods 推荐                | focus_dim 推荐 |
+|-----------------------------------|---------------------------|----------------|
+| "全面" / "多种方法对比"              | [MA3, MA6, WMA, OLS, ETS] | all            |
+| "高级" / "时间序列模型" / "统计模型" | [OLS, ETS, ARIMA]         | all            |
+| "保守" / "下界" / "悲观" / "稳健"     | [MA6, WMA]                | all            |
+| "乐观" / "趋势" / "增长" / "外推"     | [OLS, ETS]                | all            |
+| "短期" / "最近 N 月"               | [MA3, WMA]                | all            |
+| "长期" / "长趋势"                   | [OLS, ETS]                | all            |
+| "平滑" / "稳定" / "Holt"           | [ETS, EWMA, MA6]          | all            |
+| "ARIMA" / "差分模型" / "AR/MA"     | [ARIMA]                   | all            |
+| "看产品线" / "按产品" / "产品维度"   | [OLS]                     | line           |
+| "看大区" / "按区" / "区域"          | [OLS]                     | region         |
+| "只看全公司" / "不要分维度"         | 用户措辞决定                | total          |
+| "季节性" / "节假日" / "周期"       | [OLS, ETS]                | all 🌸 季节调整突出 |
+| "同比" / "vs 去年"                | [OLS]                     | all 📅 YoY 突出 |
+| "不要 OLS"                      | [MA3, MA6, WMA]           | all            |
 
 horizon 推荐:
   - "下个月"                  → 1
