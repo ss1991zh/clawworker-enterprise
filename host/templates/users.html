@@ -1,0 +1,166 @@
+{% extends "base.html" %}
+{% block title %}用户 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">用户管理</h1>
+  <p class="page-subtitle">
+    一个证书绑定一个用户 · 双因子(证书激活 + 账户密码登录) ·
+    同一证书反复上传也只能绑给一个用户
+  </p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>创建用户</h3></div>
+    <div class="panel-body">
+      <form method="post" action="/admin/users" enctype="multipart/form-data">
+        <div class="field">
+          <label>user_authorization 证书文件</label>
+          <div class="drop-zone" id="drop-zone">
+            <input type="file" name="cert_file" id="cert-file" required>
+            <div class="drop-hint">
+              <div class="drop-icon">📄</div>
+              <div class="drop-text"><strong>点击选择</strong>或拖入证书文件</div>
+              <div class="drop-subtext" id="filename">还未选择文件</div>
+            </div>
+          </div>
+        </div>
+        <div class="form-grid">
+          <div class="field">
+            <label>用户名</label>
+            <input type="text" name="username" placeholder="alice" required pattern="[a-zA-Z0-9_-]+" title="字母/数字/-/_">
+          </div>
+          <div class="field">
+            <label>密码</label>
+            <input type="password" name="password" placeholder="至少 6 位" required minlength="6">
+          </div>
+        </div>
+        <button type="submit" class="btn btn-primary" style="margin-top:8px;">创建用户</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header">
+      <h3>用户列表({{ users|length }})</h3>
+    </div>
+    <div class="panel-body compact">
+      {% if users %}
+      <table class="table">
+        <thead>
+          <tr>
+            <th>用户名</th>
+            <th>证书指纹</th>
+            <th>状态</th>
+            <th>创建时间</th>
+            <th style="width:280px;">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+        {% for u in users %}
+          <tr>
+            <td><strong>{{ u.username }}</strong></td>
+            <td class="mono">{{ u.auth_id }}</td>
+            <td>
+              {% if u.status == 'active' %}
+                <span class="pill active">活跃</span>
+              {% else %}
+                <span class="pill disabled">禁用</span>
+              {% endif %}
+              {% if not u.auth_valid %}
+                <span class="pill warning">证书失效</span>
+              {% endif %}
+            </td>
+            <td class="mono">{{ u.created_at }}</td>
+            <td>
+              <a class="btn btn-secondary btn-sm" href="/admin/users/{{ u.username }}/edit">修改密码</a>
+              {% if u.status == 'active' %}
+                <form method="post" action="/admin/users/{{ u.username }}/disable" style="display:inline;">
+                  <button class="btn btn-secondary btn-sm" type="submit">禁用</button>
+                </form>
+              {% else %}
+                <form method="post" action="/admin/users/{{ u.username }}/enable" style="display:inline;">
+                  <button class="btn btn-secondary btn-sm" type="submit">启用</button>
+                </form>
+              {% endif %}
+              <form method="post" action="/admin/users/{{ u.username }}/delete"
+                    style="display:inline;"
+                    onsubmit="return confirm('确认删除用户【{{ u.username }}】?\n所有会话将被注销,证书将被释放(之后可重新分配给新用户)。');">
+                <button class="btn btn-danger" type="submit">删除</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+        <div class="empty">还没有任何用户 · 用上方表单创建第一个</div>
+      {% endif %}
+    </div>
+  </div>
+
+  {% if orphan_auths %}
+  <div class="panel">
+    <div class="panel-header">
+      <h3>孤立证书({{ orphan_auths|length }})</h3>
+    </div>
+    <div class="panel-body">
+      <p style="color: var(--text-muted); font-size:13px; margin-top:0;">
+        已导入但未绑定到账户的证书 — 通常发生在创建账户失败时,可单独删除回收。
+      </p>
+      <table class="table">
+        <thead>
+          <tr><th>预期用户名</th><th>auth_id</th><th>导入时间</th><th></th></tr>
+        </thead>
+        <tbody>
+        {% for a in orphan_auths %}
+          <tr>
+            <td>{{ a.username }}</td>
+            <td class="mono">{{ a.auth_id }}</td>
+            <td class="mono">{{ a.imported_at }}</td>
+            <td>
+              <form method="post" action="/admin/users/{{ a.username }}/delete" style="display:inline;">
+                <button class="btn btn-danger btn-sm" type="submit">删除证书</button>
+              </form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+  {% endif %}
+
+  <script>
+    (function() {
+      const drop = document.getElementById('drop-zone');
+      const fileInput = document.getElementById('cert-file');
+      const filename = document.getElementById('filename');
+
+      function update() {
+        if (fileInput.files && fileInput.files[0]) {
+          filename.textContent = '已选:' + fileInput.files[0].name +
+            ' (' + (fileInput.files[0].size / 1024).toFixed(1) + ' KB)';
+          filename.classList.add('has-file');
+        } else {
+          filename.textContent = '还未选择文件';
+          filename.classList.remove('has-file');
+        }
+      }
+
+      fileInput.addEventListener('change', update);
+
+      ['dragover', 'dragenter'].forEach(ev =>
+        drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('drop-over'); })
+      );
+      ['dragleave', 'dragend'].forEach(ev =>
+        drop.addEventListener(ev, () => drop.classList.remove('drop-over'))
+      );
+      drop.addEventListener('drop', e => {
+        e.preventDefault();
+        drop.classList.remove('drop-over');
+        if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+          fileInput.files = e.dataTransfer.files;
+          update();
+        }
+      });
+    })();
+  </script>
+{% endblock %}

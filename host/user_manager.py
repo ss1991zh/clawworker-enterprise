@@ -111,6 +111,29 @@ class UserManager:
         if username in self._accounts:
             self._accounts[username].status = AccountStatus.ACTIVE
 
+    def update_password(self, username: str, new_password: str) -> None:
+        """改密;旧 session 全部失效,用户必须重新登录。"""
+        if username not in self._accounts:
+            raise ValueError(f"账户 {username} 不存在")
+        if not new_password or len(new_password) < 6:
+            raise ValueError("密码至少 6 位")
+        acct = self._accounts[username]
+        salt = secrets.token_hex(16)
+        acct.password_salt = salt
+        acct.password_hash = _hash_password(new_password, salt)
+        # 注销该用户所有现有 session
+        for tok in [t for t, s in self._sessions.items() if s.username == username]:
+            self._sessions.pop(tok, None)
+
+    def delete_account(self, username: str) -> bool:
+        """删除账户 + 注销所有 session。"""
+        if username not in self._accounts:
+            return False
+        for tok in [t for t, s in self._sessions.items() if s.username == username]:
+            self._sessions.pop(tok, None)
+        self._accounts.pop(username, None)
+        return True
+
     # ----- 登录与会话 -----
     def login(self, *, username: str, password: str) -> Session:
         acct = self._accounts.get(username)

@@ -19,7 +19,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Form, HTTPException, Request
+import tempfile
+
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
@@ -109,100 +111,152 @@ def build_admin_router(*, auth_manager, user_manager, dispatcher, get_llm_provid
             },
         )
 
-    # ----- 授权 -----
-    @router.get("/authorizations", response_class=HTMLResponse)
-    def auth_list(request: Request):
-        auths = [
-            {
-                "auth_id": a.auth_id,
-                "subject": a.subject,
-                "imported_at": a.imported_at.strftime("%Y-%m-%d %H:%M:%S"),
-                "revoked": a.revoked,
-                "sdk_init_failed_at": a.sdk_init_failed_at,
-            }
-            for a in auth_manager._auths.values()
-        ]
-        return templates.TemplateResponse(
-            request,
-            "authorizations.html",
-            {
-                "active": "authorizations",
-                "authorizations": auths,
-                "messages": _pop_messages(request),
-            },
-        )
+    # ============================================================
+    # 用户(合并:证书 + 账户 → 1 个实体)
+    # ============================================================
 
-    @router.post("/authorizations")
-    def auth_import(request: Request, username: str = Form(...), path: str = Form(...)):
-        try:
-            auth_manager.import_authorization(username=username, source=Path(path))
-            _push_message(request, "success", f"已导入授权:{username}")
-        except FileNotFoundError as e:
-            _push_message(request, "error", f"导入失败:文件不存在 {path}")
-        except Exception as e:
-            _push_message(request, "error", f"导入失败:{e}")
-        return RedirectResponse("/admin/authorizations", status_code=303)
-
-    @router.post("/authorizations/{username}/revoke")
-    def auth_revoke(request: Request, username: str):
-        auth_manager.revoke(username)
-        _push_message(request, "success", f"已吊销 {username} 的授权")
-        return RedirectResponse("/admin/authorizations", status_code=303)
-
-    # ----- 账户 -----
-    @router.get("/accounts", response_class=HTMLResponse)
-    def account_list(request: Request):
-        auths = [
-            {"auth_id": a.auth_id, "subject": a.subject, "revoked": a.revoked}
-            for a in auth_manager._auths.values()
-        ]
-        accounts = [
-            {
+    @router.get("/users", response_class=HTMLResponse)
+    def user_list(request: Request):
+        """合并视图:每行 = (证书 + 账户)。"""
+        users = []
+        # 优先按账户视角(每个账户必须有授权)
+        for u in user_manager._accounts.values():
+            auth = auth_manager._auths.get(u.username) if hasattr(auth_manager, "_auths") else None
+            users.append({
                 "username": u.username,
                 "auth_id": u.auth_id,
                 "status": u.status,
                 "created_at": u.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            for u in user_manager._accounts.values()
-        ]
+                "imported_at": auth.imported_at.strftime("%Y-%m-%d %H:%M:%S") if auth else "—",
+                "auth_valid": auth.is_valid() if auth else False,
+                "revoked": auth.revoked if auth else False,
+            })
+        # 孤立授权(导入证书但没建账户)
+        orphans = []
+        for un, a in auth_manager._auths.items():
+            if un not in user_manager._accounts:
+                orphans.append({
+                    "username": un,
+                    "auth_id": a.auth_id,
+                    "imported_at": a.imported_at.strftime("%Y-%m-%d %H:%M:%S"),
+                    "revoked": a.revoked,
+                })
         return templates.TemplateResponse(
-            request,
-            "accounts.html",
+            request, "users.html",
             {
-                "active": "accounts",
-                "authorizations": auths,
-                "accounts": accounts,
+                "active": "users",
+                "users": users,
+                "orphan_auths": orphans,
                 "messages": _pop_messages(request),
             },
         )
 
-    @router.post("/accounts")
-    def account_create(
+    @router.post("/users")
+    async def user_create(
         request: Request,
         username: str = Form(...),
         password: str = Form(...),
-        auth_id: str = Form(""),
+        cert_file: UploadFile = File(...),
     ):
+        """
+        合并创建:同时导入证书 + 建账户(原子操作,失败回滚)。
+        - 拖拽上传得到 cert_file
+        - 强制 1 证书 1 用户(cert_manager 内部 fingerprint 查重)
+        """
+        # 1) 落临时文件
+        contents = await cert_file.read()
+        if not contents:
+            _push_message(request, "error", "证书文件为空")
+            return RedirectResponse("/admin/users", status_code=303)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".auth") as tmp:
+            tmp.write(contents)
+            tmp_path = Path(tmp.name)
+
         try:
-            user_manager.create_account(
-                username=username, password=password, auth_id=auth_id or None
-            )
-            _push_message(request, "success", f"账户已创建:{username}")
+            # 2) 导入授权(含 fingerprint 查重)
+            auth_manager.import_authorization(username=username, source=tmp_path)
+            # 3) 创建账户;若失败,回滚授权
+            try:
+                user_manager.create_account(username=username, password=password)
+            except Exception as e:
+                auth_manager.delete(username)
+                raise
+            _push_message(request, "success",
+                          f"已创建用户「{username}」· 证书 + 账户绑定完成")
+        except FileNotFoundError as e:
+            _push_message(request, "error", f"文件读取失败:{e}")
         except ValueError as e:
+            _push_message(request, "error", str(e))
+        except Exception as e:
             _push_message(request, "error", f"创建失败:{e}")
-        return RedirectResponse("/admin/accounts", status_code=303)
+        finally:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+        return RedirectResponse("/admin/users", status_code=303)
 
-    @router.post("/accounts/{username}/disable")
-    def account_disable(request: Request, username: str):
+    @router.get("/users/{username}/edit", response_class=HTMLResponse)
+    def user_edit_form(request: Request, username: str):
+        acct = user_manager._accounts.get(username)
+        if not acct:
+            _push_message(request, "error", f"用户 {username} 不存在")
+            return RedirectResponse("/admin/users", status_code=303)
+        return templates.TemplateResponse(
+            request, "user_edit.html",
+            {
+                "active": "users",
+                "user": {
+                    "username": username,
+                    "status": acct.status,
+                    "auth_id": acct.auth_id,
+                    "created_at": acct.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+                },
+                "messages": _pop_messages(request),
+            },
+        )
+
+    @router.post("/users/{username}/password")
+    def user_update_password(request: Request, username: str, password: str = Form(...)):
+        try:
+            user_manager.update_password(username, password)
+            _push_message(request, "success",
+                          f"已更新「{username}」的密码;该用户所有现有 session 已注销")
+        except ValueError as e:
+            _push_message(request, "error", str(e))
+        return RedirectResponse("/admin/users", status_code=303)
+
+    @router.post("/users/{username}/disable")
+    def user_disable(request: Request, username: str):
         user_manager.disable(username)
-        _push_message(request, "success", f"账户 {username} 已禁用")
-        return RedirectResponse("/admin/accounts", status_code=303)
+        _push_message(request, "success", f"用户「{username}」已禁用")
+        return RedirectResponse("/admin/users", status_code=303)
 
-    @router.post("/accounts/{username}/enable")
-    def account_enable(request: Request, username: str):
+    @router.post("/users/{username}/enable")
+    def user_enable(request: Request, username: str):
         user_manager.enable(username)
-        _push_message(request, "success", f"账户 {username} 已启用")
-        return RedirectResponse("/admin/accounts", status_code=303)
+        _push_message(request, "success", f"用户「{username}」已启用")
+        return RedirectResponse("/admin/users", status_code=303)
+
+    @router.post("/users/{username}/delete")
+    def user_delete(request: Request, username: str):
+        user_manager.delete_account(username)
+        auth_manager.delete(username)
+        _push_message(request, "success",
+                      f"已删除用户「{username}」· 证书已释放,可重新分配")
+        return RedirectResponse("/admin/users", status_code=303)
+
+    # ============================================================
+    # 旧路由保留(向后兼容)
+    # ============================================================
+    @router.get("/authorizations", response_class=HTMLResponse)
+    def auth_list_compat(request: Request):
+        # 旧链接重定向到合并页
+        return RedirectResponse("/admin/users", status_code=301)
+
+    @router.get("/accounts", response_class=HTMLResponse)
+    def account_list_compat(request: Request):
+        return RedirectResponse("/admin/users", status_code=301)
 
     # ----- LLM -----
     @router.get("/llm", response_class=HTMLResponse)

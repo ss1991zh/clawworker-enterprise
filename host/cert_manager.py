@@ -67,27 +67,36 @@ class AuthorizationManager:
         # 旧的 cert_id → cert 索引,保留兼容
         self._by_id: dict[str, UserAuthorization] = {}
 
-    # ----- 导入 -----
+    # ----- 导入(强制 1 证书 1 用户)-----
     def import_authorization(self, *, username: str, source: Path) -> UserAuthorization:
         """
         把外部平台签发的 user_authorization 文件导入主机存储,绑定给指定用户。
 
-        Args:
-            username: 账户标识
-            source: 外部 user_authorization 文件路径
-
-        Returns:
-            UserAuthorization 实例
+        1:1 强制规则:
+        - 同一 username 不能重复导入(必须先删除旧用户)
+        - 同一证书(SHA-256 指纹相同)不能被绑给不同用户
+          (无论上传时换不换文件名,内容指纹一致即拒绝)
         """
         if not source.exists():
             raise FileNotFoundError(f"user_authorization 源文件不存在: {source}")
 
-        # 计算文件指纹作为 auth_id
+        if username in self._auths:
+            raise ValueError(
+                f"用户 {username} 已有授权;请先删除旧用户,或换一个用户名"
+            )
+
         import hashlib
 
         digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
 
-        # 复制到主机存储,文件名按用户名 + 指纹
+        # 关键校验:证书指纹查重(防止把同一份证书反复上传给多个用户)
+        existing = self._by_id.get(digest)
+        if existing:
+            raise ValueError(
+                f"该证书已被用户 '{existing.subject}' 使用"
+                f"(auth_id: {digest});一份证书只能绑给一个用户"
+            )
+
         dst = self._storage_root / f"{username}.{digest}.auth"
         dst.write_bytes(source.read_bytes())
 
@@ -100,6 +109,22 @@ class AuthorizationManager:
         self._auths[username] = auth
         self._by_id[digest] = auth
         return auth
+
+    # ----- 删除 -----
+    def delete(self, username: str) -> bool:
+        """
+        彻底删除指定用户的授权(及主机侧存储副本)。
+        删除后,同一证书可以再被导入(给新用户)。
+        """
+        auth = self._auths.pop(username, None)
+        if not auth:
+            return False
+        self._by_id.pop(auth.auth_id, None)
+        try:
+            auth.file_path.unlink()
+        except FileNotFoundError:
+            pass
+        return True
 
     # ----- 查询 -----
     def get_by_username(self, username: str) -> Optional[UserAuthorization]:

@@ -6,14 +6,14 @@
 
   <div class="kpi-grid">
     <div class="kpi-card">
-      <div class="label">用户授权</div>
-      <div class="value">{{ stats.authorizations }}</div>
-      <div class="hint">{{ stats.active_authorizations }} 有效 · {{ stats.revoked_authorizations }} 已吊销</div>
-    </div>
-    <div class="kpi-card">
-      <div class="label">账户</div>
+      <div class="label">用户</div>
       <div class="value">{{ stats.accounts }}</div>
       <div class="hint">{{ stats.active_accounts }} 活跃 · {{ stats.disabled_accounts }} 禁用</div>
+    </div>
+    <div class="kpi-card">
+      <div class="label">证书</div>
+      <div class="value">{{ stats.authorizations }}</div>
+      <div class="hint">{{ stats.active_authorizations }} 有效 · {{ stats.revoked_authorizations }} 已吊销</div>
     </div>
     <div class="kpi-card">
       <div class="label">在线会话</div>
@@ -58,9 +58,9 @@
       <h3>快速操作</h3>
     </div>
     <div class="panel-body" style="display:flex; gap:12px;">
-      <a class="btn btn-primary" href="/admin/authorizations">导入新授权</a>
-      <a class="btn btn-secondary" href="/admin/accounts">创建账户</a>
+      <a class="btn btn-primary" href="/admin/users">创建用户</a>
       <a class="btn btn-secondary" href="/admin/llm">查看 LLM 配置</a>
+      <a class="btn btn-secondary" href="/admin/sessions">查看在线会话</a>
       <a class="btn btn-secondary" href="/docs" target="_blank">打开 Swagger</a>
     </div>
   </div>
