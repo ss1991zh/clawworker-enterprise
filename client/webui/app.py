@@ -907,13 +907,26 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
     has_cipher = bool(sess.context_ciphertext and Path(sess.context_ciphertext).exists())
     has_schema = bool(sess.context_schema)
 
+    # 兜底:schema 缺失但密文在,尝试从旁挂 *.schema.json 重新加载
+    # (历史文件在 auto-sidecar 功能上线前上传,没生成 sidecar)
+    if has_cipher and not has_schema:
+        cipher_path = Path(sess.context_ciphertext)
+        sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
+        if sidecar.exists():
+            try:
+                txt = sidecar.read_text(encoding="utf-8")
+                _sessions.set_context(sid, schema=txt)
+                sess = _sessions.get(sid) or sess
+                has_schema = True
+            except Exception:
+                pass
+
     # ----- 自由聊天模式:无密文 + 无 schema -----
     if not has_cipher and not has_schema:
         _run_freechat(sid, asst_mid, user_query, t0)
         return
 
     # ----- 数据分析模式 -----
-    # 部分绑定 → 给提示,但不再用 emoji,文案改友好
     if not has_cipher:
         _sessions.update_message(
             sid, asst_mid,
@@ -924,11 +937,15 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
         )
         return
     if not has_schema:
+        # 旁挂 sidecar 不存在 = 该密文是早期版本上传的,没自动生成 schema
+        # 让用户删掉重传(新流程会自动识别)
+        cipher_name = Path(sess.context_ciphertext).name
         _sessions.update_message(
             sid, asst_mid,
             status="failed",
-            error="已绑定密文文件,但还没设置 schema · "
-                  "打开设置 → 会话 schema 粘一份 JSON,描述字段名 / 哪些是加密列",
+            error=f"密文文件「{cipher_name}」是旧版本上传的,缺失自动识别的字段信息。"
+                  f"请到设置 → 密文文件,删除这份旧文件并重新拖入原始 CSV/XLSX,"
+                  f"新版本会自动识别表头、加密数字列、保留身份标识列。",
             duration_sec=round(time.time() - t0, 2),
         )
         return
