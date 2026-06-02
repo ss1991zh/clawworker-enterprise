@@ -483,22 +483,27 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         tmp.write(raw_bytes); tmp_path = Path(tmp.name)
 
     try:
-        # ----- 1) 用 pandas 读全表,做列类型识别 -----
+        # ----- 1) 智能读表:挑数据最丰满的 sheet + 自动找表头行 -----
         import pandas as pd
         try:
-            if raw_suffix == ".csv":
-                df = pd.read_csv(tmp_path)
-            else:
-                df = pd.read_excel(tmp_path)
+            df, sheet_name, header_row = _smart_read_tabular(tmp_path, raw_suffix)
         except Exception as e:
             raise HTTPException(400, f"无法解析文件:{type(e).__name__}: {e}")
 
-        if df.empty or df.shape[1] == 0:
+        if df is None or df.empty or df.shape[1] == 0:
             raise HTTPException(400, "文件没有任何列")
 
         string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
         numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
         all_cols = df.columns.tolist()
+
+        # 列名仍然全是 Unnamed → 警告(尽量别让 LLM 看到 Unnamed 列名)
+        if all(str(c).startswith("Unnamed:") for c in all_cols):
+            raise HTTPException(
+                400,
+                "无法识别表头(所有列都是 Unnamed)· 请确认文件第一行是字段名,"
+                "或第一行 / 第二行是不是被合并单元格 / 标题占了",
+            )
 
         # ----- 2) 加密入库:仅数字列(字符串无法 HE 编码)-----
         # 先把数字列单独存成纯数字 CSV,送给 ZFHE
@@ -556,9 +561,84 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
             "encrypted_columns": numeric_cols,
             "plaintext_columns": string_cols,
             "row_count": len(df),
+            # 解析出处:让前端 / 日志能看到我们到底从哪个 sheet、哪行起识别
+            "sheet_name": sheet_name,
+            "header_row": header_row,
+            "column_preview": all_cols[:8],
         }
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# 智能读表(挑数据最丰满的 sheet + 找真实表头行)
+# ---------------------------------------------------------------------------
+
+
+def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
+    """
+    返回 (DataFrame, sheet_name, header_row_index)。
+
+    CSV: 只有一张表,但仍要找表头(可能前几行是标题/空行)
+    XLSX:
+      1. 把所有 sheet 都读出来,选"信息量最大"的(行数 × 数字列数)
+      2. 在那个 sheet 上找出第一行真正的列名(非 Unnamed)
+    """
+    import pandas as pd
+
+    def _is_bad_header(cols: list) -> bool:
+        if not cols:
+            return True
+        cols_s = [str(c) for c in cols]
+        bad = sum(1 for c in cols_s if c.startswith("Unnamed:") or c.strip() == "" or c.startswith("nan"))
+        return bad >= max(1, len(cols_s) // 2)  # 至少一半是 Unnamed 即认为坏
+
+    def _find_header_row(raw_no_header) -> int:
+        """从前 10 行里找第一行 ≥2 个非空字符串单元格的,作为表头行。"""
+        for i in range(min(10, len(raw_no_header))):
+            row = raw_no_header.iloc[i].tolist()
+            string_count = sum(1 for v in row if isinstance(v, str) and v.strip())
+            if string_count >= 2:
+                return i
+        return 0  # 兜底:默认第 0 行
+
+    if suffix == ".csv":
+        # CSV: 第一次先按默认 header=0 试
+        df = pd.read_csv(path)
+        if _is_bad_header(df.columns.tolist()):
+            raw = pd.read_csv(path, header=None)
+            h = _find_header_row(raw)
+            if h > 0:
+                df = pd.read_csv(path, header=h)
+        return df, "csv", 0
+
+    # XLSX: 多 sheet,挑最像数据的
+    all_sheets = pd.read_excel(path, sheet_name=None)
+    best_sheet_name = None
+    best_score = -1
+    for name, sheet in all_sheets.items():
+        if sheet is None or sheet.empty:
+            continue
+        nrows, ncols = sheet.shape
+        num_cols = sheet.select_dtypes(include=["number"]).shape[1]
+        # 优先选数据多 + 数字列多的
+        score = nrows * (num_cols + 1) + ncols
+        if score > best_score:
+            best_sheet_name = name
+            best_score = score
+    if best_sheet_name is None:
+        # 全是空 sheet?返回第一个让上层报错
+        first = next(iter(all_sheets), "Sheet1")
+        return all_sheets.get(first), first, 0
+
+    df = all_sheets[best_sheet_name]
+    header_row = 0
+    if _is_bad_header(df.columns.tolist()):
+        raw = pd.read_excel(path, sheet_name=best_sheet_name, header=None)
+        header_row = _find_header_row(raw)
+        if header_row > 0:
+            df = pd.read_excel(path, sheet_name=best_sheet_name, header=header_row)
+    return df, str(best_sheet_name), header_row
 
 
 @app.delete("/api/files/{name}")

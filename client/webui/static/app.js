@@ -506,11 +506,15 @@ async function renderFilesTab() {
     fd.append("raw_file", file);
     try {
       const res = await api("POST", "/api/files/upload", fd, true);
-      const enc = (res.encrypted_columns || []).length;
-      const pt = (res.plaintext_columns || []).length;
+      const enc = res.encrypted_columns || [];
+      const pt  = res.plaintext_columns || [];
+      const cols = res.column_preview || [];
+      const sheet = res.sheet_name && res.sheet_name !== "csv" ? `sheet「${esc(res.sheet_name)}」` : "";
+      const headerHint = (res.header_row || 0) > 0 ? `(从第 ${res.header_row + 1} 行开始识别表头)` : "";
       $("fileUpStatus").innerHTML =
         `<div class="alert-box success">✓ 已加密入库:<strong>${esc(res.name)}</strong>` +
-        `<br>📊 ${enc} 列加密 · ${pt} 列身份标识 · ${res.row_count || "?"} 行</div>`;
+        `<br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行 · ${sheet} ${headerHint}` +
+        `<br>识别到的列:<span class="mono" style="font-size:11px;">${cols.map(esc).join(", ")}</span></div>`;
       setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
       inp.value = "";
       await loadFiles(); renderFilesList();
