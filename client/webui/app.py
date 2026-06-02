@@ -74,6 +74,21 @@ from client.webui.sessions import ChatSession, Message, SessionStore
 _WEBUI_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_WEBUI_DIR / "templates"))
 
+
+def _asset_version() -> str:
+    """
+    用 static/app.js + app.css 的最大 mtime 当版本号,
+    每次代码变动后浏览器自动拉新版,无需用户清缓存。
+    """
+    try:
+        mtimes = [
+            (_WEBUI_DIR / "static" / "app.js").stat().st_mtime,
+            (_WEBUI_DIR / "static" / "app.css").stat().st_mtime,
+        ]
+        return str(int(max(mtimes)))
+    except OSError:
+        return "0"
+
 APP_DATA_DIR = Path.home() / ".agent-system"
 CLIENT_CONFIG_FILE = APP_DATA_DIR / "client-config.json"
 
@@ -164,7 +179,10 @@ def index(request: Request):
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
         request, "index.html",
-        {"username": _session_state["username"]},
+        {
+            "username": _session_state["username"],
+            "asset_ver": _asset_version(),
+        },
     )
 
 
@@ -177,6 +195,7 @@ def login_form(request: Request):
         {
             "default_host": _config.get("host_url", ""),
             "messages": _pop_messages(request),
+            "asset_ver": _asset_version(),
         },
     )
 
