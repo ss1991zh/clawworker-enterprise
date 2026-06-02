@@ -630,13 +630,23 @@ def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
 
     def _retry_with_header(reader, df_default):
         """通用重试:先 header=None 读 raw,找到表头行,重读。"""
-        raw = reader(header=None)
+        try:
+            raw = reader(header=None)
+        except Exception:
+            # C engine 不接受列数不一致;换 python engine 兜底
+            raw = reader(header=None, engine="python")
         h = _find_header_row(raw, prev_cols_count=len(df_default.columns) + 1)
-        return reader(header=h), h
+        try:
+            return reader(header=h), h
+        except Exception:
+            return reader(header=h, engine="python"), h
 
     if suffix == ".csv":
         df = pd.read_csv(path)
-        if _looks_bad(df):
+        # CSV 检测加一个简单 sanity:列数=1 但文件里有逗号 → 多半 header 不对
+        if _looks_bad(df) or (
+            len(df.columns) == 1 and "," in path.read_text(encoding="utf-8", errors="replace")[:500]
+        ):
             df, hr = _retry_with_header(lambda **kw: pd.read_csv(path, **kw), df)
             return df, "csv", hr
         return df, "csv", 0
