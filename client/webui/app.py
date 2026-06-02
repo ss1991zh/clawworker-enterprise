@@ -914,11 +914,19 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
         return
 
     has_cipher = bool(sess.context_ciphertext and Path(sess.context_ciphertext).exists())
-    has_schema = bool(sess.context_schema)
 
-    # 兜底:schema 缺失但密文在,尝试从旁挂 *.schema.json 重新加载
-    # (历史文件在 auto-sidecar 功能上线前上传,没生成 sidecar)
-    if has_cipher and not has_schema:
+    # ----- 自由聊天分支:没绑密文(包括"绑了但文件被删")就走 LLM 闲聊 -----
+    #   schema 是会话级残留状态,密文都没了 schema 就没意义,顺手清掉
+    if not has_cipher:
+        if sess.context_ciphertext or sess.context_schema:
+            _sessions.set_context(sid, ciphertext="", schema="")
+        _run_freechat(sid, asst_mid, user_query, t0)
+        return
+
+    # ----- 数据分析分支(以下都是 has_cipher = True)-----
+    has_schema = bool(sess.context_schema)
+    # 兜底:schema 缺失,从旁挂 *.schema.json 重新加载
+    if not has_schema:
         cipher_path = Path(sess.context_ciphertext)
         sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
         if sidecar.exists():
@@ -930,24 +938,8 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
             except Exception:
                 pass
 
-    # ----- 自由聊天模式:无密文 + 无 schema -----
-    if not has_cipher and not has_schema:
-        _run_freechat(sid, asst_mid, user_query, t0)
-        return
-
-    # ----- 数据分析模式 -----
-    if not has_cipher:
-        _sessions.update_message(
-            sid, asst_mid,
-            status="failed",
-            error="本会话已设置 schema,但还差一份密文数据 · "
-                  "把 CSV / XLSX 拖到对话框、或用左下角附件按钮上传即可",
-            duration_sec=round(time.time() - t0, 2),
-        )
-        return
     if not has_schema:
-        # 旁挂 sidecar 不存在 = 该密文是早期版本上传的,没自动生成 schema
-        # 让用户删掉重传(新流程会自动识别)
+        # 旁挂 sidecar 也没有 → 旧版本上传的密文 → 提示用户删了重传
         cipher_name = Path(sess.context_ciphertext).name
         _sessions.update_message(
             sid, asst_mid,
@@ -1068,6 +1060,11 @@ def _friendly_workflow_error(raw: str) -> str:
         return (
             "LLM 这次没按格式输出 computation_plan(可能跑神了)· "
             "稍后再试 / 换个模型 / 把问题写得更具体些"
+        )
+    if "timed out" in low or "timeout" in low or "readtimeout" in low or "connecttimeout" in low:
+        return (
+            "LLM 响应超时(> 3 分钟)· 可能是模型推理慢 / 网络抖动 / OpenRouter 排队 · "
+            "稍后重试 / 换个推理快的模型(如 deepseek-chat、gpt-4o-mini)"
         )
     return raw  # 兜底:原样显示
 
