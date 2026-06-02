@@ -579,66 +579,95 @@ def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
     """
     返回 (DataFrame, sheet_name, header_row_index)。
 
-    CSV: 只有一张表,但仍要找表头(可能前几行是标题/空行)
+    CSV: 只有一张表,但仍要找表头(可能前几行是标题/空行/合并单元格)
     XLSX:
       1. 把所有 sheet 都读出来,选"信息量最大"的(行数 × 数字列数)
-      2. 在那个 sheet 上找出第一行真正的列名(非 Unnamed)
+      2. 在那个 sheet 上找出第一行真正的列名
     """
     import pandas as pd
 
-    def _is_bad_header(cols: list) -> bool:
-        if not cols:
+    def _looks_bad(df_) -> bool:
+        """
+        坏表头判定:
+        a) 一半以上的列名是 'Unnamed:' / 空 / 'nan'
+        b) 后续行的非空单元格数明显多于列数(说明 header 行选错了 → pandas 用单列容纳了一整行标题)
+        """
+        cols_s = [str(c) for c in df_.columns.tolist()]
+        if not cols_s:
             return True
-        cols_s = [str(c) for c in cols]
-        bad = sum(1 for c in cols_s if c.startswith("Unnamed:") or c.strip() == "" or c.startswith("nan"))
-        return bad >= max(1, len(cols_s) // 2)  # 至少一半是 Unnamed 即认为坏
+        bad_count = sum(
+            1 for c in cols_s
+            if c.startswith("Unnamed:") or c.strip() == "" or c.startswith("nan")
+        )
+        if bad_count >= max(1, len(cols_s) // 2):
+            return True
+        # b) 看前 5 行有效行的最大列数 vs 当前列数
+        try:
+            sample = df_.head(5).fillna("")
+            max_filled = max(
+                sum(1 for v in row if str(v).strip()) for _, row in sample.iterrows()
+            ) if len(sample) > 0 else 0
+            if max_filled > len(cols_s) * 1.5:
+                return True
+        except Exception:
+            pass
+        return False
 
-    def _find_header_row(raw_no_header) -> int:
-        """从前 10 行里找第一行 ≥2 个非空字符串单元格的,作为表头行。"""
+    def _find_header_row(raw_no_header, prev_cols_count: int = 1) -> int:
+        """
+        从前 10 行里找最像表头的:
+        优先选 字符串单元格数最多、且 ≥ prev_cols_count 的那一行
+        """
+        best_i = 0
+        best_score = -1
         for i in range(min(10, len(raw_no_header))):
             row = raw_no_header.iloc[i].tolist()
-            string_count = sum(1 for v in row if isinstance(v, str) and v.strip())
-            if string_count >= 2:
-                return i
-        return 0  # 兜底:默认第 0 行
+            sc = sum(1 for v in row if isinstance(v, str) and v.strip())
+            if sc >= max(2, prev_cols_count) and sc > best_score:
+                best_score = sc
+                best_i = i
+        return best_i
+
+    def _retry_with_header(reader, df_default):
+        """通用重试:先 header=None 读 raw,找到表头行,重读。"""
+        raw = reader(header=None)
+        h = _find_header_row(raw, prev_cols_count=len(df_default.columns) + 1)
+        return reader(header=h), h
 
     if suffix == ".csv":
-        # CSV: 第一次先按默认 header=0 试
         df = pd.read_csv(path)
-        if _is_bad_header(df.columns.tolist()):
-            raw = pd.read_csv(path, header=None)
-            h = _find_header_row(raw)
-            if h > 0:
-                df = pd.read_csv(path, header=h)
+        if _looks_bad(df):
+            df, hr = _retry_with_header(lambda **kw: pd.read_csv(path, **kw), df)
+            return df, "csv", hr
         return df, "csv", 0
 
-    # XLSX: 多 sheet,挑最像数据的
+    # XLSX: 选最像数据的 sheet
     all_sheets = pd.read_excel(path, sheet_name=None)
-    best_sheet_name = None
+    if not all_sheets:
+        raise ValueError("xlsx 文件没有任何 sheet")
+    best_name = None
     best_score = -1
     for name, sheet in all_sheets.items():
         if sheet is None or sheet.empty:
             continue
         nrows, ncols = sheet.shape
         num_cols = sheet.select_dtypes(include=["number"]).shape[1]
-        # 优先选数据多 + 数字列多的
         score = nrows * (num_cols + 1) + ncols
         if score > best_score:
-            best_sheet_name = name
+            best_name = name
             best_score = score
-    if best_sheet_name is None:
-        # 全是空 sheet?返回第一个让上层报错
-        first = next(iter(all_sheets), "Sheet1")
-        return all_sheets.get(first), first, 0
+    if best_name is None:
+        # 全是空 sheet,返回第一个让上层判定
+        first = next(iter(all_sheets))
+        return all_sheets[first], str(first), 0
 
-    df = all_sheets[best_sheet_name]
+    df = all_sheets[best_name]
     header_row = 0
-    if _is_bad_header(df.columns.tolist()):
-        raw = pd.read_excel(path, sheet_name=best_sheet_name, header=None)
-        header_row = _find_header_row(raw)
-        if header_row > 0:
-            df = pd.read_excel(path, sheet_name=best_sheet_name, header=header_row)
-    return df, str(best_sheet_name), header_row
+    if _looks_bad(df):
+        df, header_row = _retry_with_header(
+            lambda **kw: pd.read_excel(path, sheet_name=best_name, **kw), df,
+        )
+    return df, str(best_name), header_row
 
 
 @app.delete("/api/files/{name}")
