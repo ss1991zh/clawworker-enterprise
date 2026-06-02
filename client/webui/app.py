@@ -151,6 +151,15 @@ def _need_login() -> JSONResponse:
     return JSONResponse({"error": "not_logged_in"}, status_code=401)
 
 
+def _clear_local_session() -> None:
+    """主机告诉我们 session 失效时,清掉本机 state,
+    下次前端调任何 /api/* 都会收到 401 not_logged_in → JS 跳 /login。"""
+    with _lock:
+        _session_state.update({
+            "host_url": "", "username": "", "token": "", "expires_at": "",
+        })
+
+
 def _flash_redirect(url: str, *messages: tuple[str, str]) -> RedirectResponse:
     if messages:
         parts = [f"_flash={quote(f'{c}|{m}', safe='')}" for c, m in messages]
@@ -1001,10 +1010,13 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
                 pass
 
         if final.get("error"):
+            raw_err = str(final["error"])
+            # 把 host session 失效翻译成中文,顺手清本机 state
+            friendly_err = _friendly_workflow_error(raw_err)
             _sessions.update_message(
                 sid, asst_mid,
                 status="failed",
-                error=str(final["error"]),
+                error=friendly_err,
                 summary=summary,
                 excel_path=str(excel_path) if excel_path else "",
                 excel_name=excel_name,
@@ -1024,12 +1036,40 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
                 duration_sec=round(time.time() - t0, 2),
             )
     except Exception as e:
+        raw_err = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
+        friendly_err = _friendly_workflow_error(raw_err)
         _sessions.update_message(
             sid, asst_mid,
             status="failed",
-            error=f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}",
+            error=friendly_err,
             duration_sec=round(time.time() - t0, 2),
         )
+
+
+def _friendly_workflow_error(raw: str) -> str:
+    """
+    把工作流冒出来的英文 / 栈错误翻译成给用户看的中文。
+    顺便对"session 失效"做副作用:清掉本机 _session_state,
+    这样用户下次任何 /api/* 调用就被 JS 重定向到 /login。
+    """
+    low = raw.lower()
+    if "401" in raw or "unauthorized" in low or "无效的 authorization" in raw or "session 无效" in raw:
+        _clear_local_session()
+        return (
+            "登录已过期或主机重启过 · 请点右上角用户名 → 退出登录,"
+            "或直接刷新页面重新登录。"
+        )
+    if "503" in raw and ("未绑定" in raw or "llm 配置" in low or "provider" in low):
+        return (
+            "用户没绑定 LLM 配置 / 配置不可用 · "
+            "请联系管理员到 admin 端 → 用户 → 修改 → 选 LLM 配置"
+        )
+    if "500" in raw and ("computation_plan" in low or "输出不符合规范" in raw):
+        return (
+            "LLM 这次没按格式输出 computation_plan(可能跑神了)· "
+            "稍后再试 / 换个模型 / 把问题写得更具体些"
+        )
+    return raw  # 兜底:原样显示
 
 
 def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
@@ -1047,6 +1087,14 @@ def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
         _sessions.update_message(
             sid, asst_mid, status="failed",
             error=f"无法连接主机:{type(e).__name__}: {e}",
+            duration_sec=round(time.time() - t0, 2),
+        )
+        return
+    if r.status_code == 401:
+        _clear_local_session()
+        _sessions.update_message(
+            sid, asst_mid, status="failed",
+            error="登录已过期或主机被重启 · 请点右上角用户名 → 退出登录 → 重新登录",
             duration_sec=round(time.time() - t0, 2),
         )
         return
