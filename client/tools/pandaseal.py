@@ -316,6 +316,80 @@ class PandaSeal:
                 raise ValueError(f"未知 filter op: {op_kind}")
             return cdf[mask]
 
+        if name in ("select", "project", "columns"):
+            # 选若干列 → 返回子 CipherDataFrame(或单列时返回 CipherSeries)
+            # LLM 常用:{op: "select", fields: ["a","b","c"]} 或 {op:"select", field:"a"}
+            cols = []
+            if op.fields:
+                cols.extend(op.fields)
+            elif op.field:
+                cols.append(op.field)
+            elif p.get("columns"):
+                v = p["columns"]
+                cols.extend(v if isinstance(v, list) else [v])
+            elif p.get("cols"):
+                v = p["cols"]
+                cols.extend(v if isinstance(v, list) else [v])
+            if not cols:
+                # 没指定 fields → no-op 直接返回
+                return cdf
+            missing = [c for c in cols if c not in cdf.columns]
+            if missing:
+                raise ValueError(f"select 字段不存在: {missing}")
+            if len(cols) == 1:
+                return cdf[cols[0]]
+            return cdf[cols]
+
+        if name in ("drop", "drop_columns"):
+            # 删若干列
+            cols = list(op.fields) if op.fields else ([op.field] if op.field else [])
+            if not cols and p.get("columns"):
+                v = p["columns"]
+                cols = list(v) if isinstance(v, list) else [v]
+            kept = [c for c in cdf.columns if c not in cols]
+            return cdf[kept]
+
+        if name in ("rename", "alias"):
+            # rename 列名 — pandaseal 可能不支持原生 rename,做 best-effort
+            mapping = p.get("columns") or p.get("mapping") or {}
+            if not mapping:
+                return cdf
+            try:
+                return cdf.rename(columns=mapping)
+            except Exception:
+                # 不支持 rename 就返回原样(不阻断后续 op)
+                return cdf
+
+        if name in ("sort", "sort_values", "order_by"):
+            by = op.field or p.get("by") or p.get("field")
+            ascending = bool(p.get("ascending", False))
+            if not by:
+                return cdf
+            try:
+                return cdf.sort_values(by=by, ascending=ascending)
+            except Exception:
+                return cdf  # 不支持就不动
+
+        if name in ("limit", "top", "top_n", "nlargest"):
+            n = int(p.get("n", p.get("limit", p.get("top", 10))))
+            by = op.field or p.get("by")
+            try:
+                if by:
+                    return cdf.nlargest(n, by) if hasattr(cdf, "nlargest") else cdf.sort_values(by, ascending=False).head(n)
+                return cdf.head(n)
+            except Exception:
+                return cdf.head(n)
+
+        if name in ("bottom", "bottom_n", "nsmallest"):
+            n = int(p.get("n", p.get("limit", 10)))
+            by = op.field or p.get("by")
+            try:
+                if by:
+                    return cdf.nsmallest(n, by) if hasattr(cdf, "nsmallest") else cdf.sort_values(by, ascending=True).head(n)
+                return cdf.head(n)
+            except Exception:
+                return cdf.head(n)
+
         if name == "pivot":
             raise NotImplementedError(
                 "pandaseal real backend 的 pivot 需要根据真实 API 适配,MVP 后续支持"
@@ -325,7 +399,10 @@ class PandaSeal:
                 "pandaseal real backend 的 resample 需要根据真实 API 适配,MVP 后续支持"
             )
 
-        raise NotImplementedError(f"pandaseal real backend 暂不支持 op: {name}")
+        # 兜底:不识别的 op 直接 passthrough(返回 cdf),不打断工作流
+        # 这样 LLM 哪怕给了奇怪 op 也能继续跑下游 op + 渲染
+        print(f"[pandaseal] 警告:未识别 op «{name}»,passthrough(参数 {p})")
+        return cdf
 
     # ===========================================================================
     # Stub 实现(沿用)
