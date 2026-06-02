@@ -78,7 +78,7 @@ class StubLLMProvider(LLMProvider):
 class AnthropicLLMProvider(LLMProvider):
     """对接 Anthropic Claude API。需要 api_key + model。"""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", max_tokens: int = 4096):
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", max_tokens: int = 16000):
         try:
             import anthropic  # type: ignore
         except ImportError as e:
@@ -137,7 +137,7 @@ class OpenAICompatibleProvider(LLMProvider):
         api_key: str,
         model: str,
         base_url: str = "https://api.openai.com/v1",
-        max_tokens: int = 4096,
+        max_tokens: int = 16000,
         temperature: float = 0.2,
     ):
         try:
@@ -317,7 +317,7 @@ def make_provider(model_type: str, **kwargs: Any) -> LLMProvider:
             api_key=kwargs["api_key"],
             model=kwargs["model"],
             base_url=kwargs.get("base_url") or _DEFAULT_BASE_URLS[model_type],
-            max_tokens=kwargs.get("max_tokens", 4096),
+            max_tokens=kwargs.get("max_tokens", 16000),
             temperature=kwargs.get("temperature", 0.2),
         )
     raise ValueError(f"暂不支持的 model_type: {model_type}")
