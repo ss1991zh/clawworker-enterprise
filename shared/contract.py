@@ -109,7 +109,9 @@ class ExcelOutput(BaseModel):
     """
 
     file: str  # 形如 ~/Downloads/analysis_<timestamp>.xlsx
-    sheets: list[SheetSpec]
+    # v3:新 SkillCall 路径下 sheets 不需要(每个 SkillCall 自带 sheet_name)。
+    # 老 ops 路径下仍可传 SheetSpec 列表。
+    sheets: list[SheetSpec] = Field(default_factory=list)
 
     @field_validator("file")
     @classmethod
