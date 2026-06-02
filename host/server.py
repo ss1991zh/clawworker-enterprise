@@ -111,6 +111,10 @@ app.include_router(
 @app.on_event("startup")
 def startup():
     _bootstrap_legacy_env_config()
+    # 1 张证书 ↔ 1 个账户:清理任何"无对应账户"的证书,以及磁盘上残留的孤儿 .auth
+    released = auth_manager.cleanup_unbound(set(user_manager._accounts.keys()))
+    if released:
+        print(f"[startup] 释放 {len(released)} 张无主证书: {released}")
 
 
 # ----- 鉴权依赖 -----

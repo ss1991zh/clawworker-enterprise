@@ -76,7 +76,6 @@ class AuthorizationManager:
         # 旧的 cert_id → cert 索引,保留兼容
         self._by_id: dict[str, UserAuthorization] = {}
         self._load_index()
-        self._adopt_orphans()
 
     # ----- 持久化 -----
     def _load_index(self) -> None:
@@ -106,35 +105,31 @@ class AuthorizationManager:
             except (KeyError, ValueError, TypeError):
                 continue
 
-    def _adopt_orphans(self) -> None:
+    def cleanup_unbound(self, valid_usernames: set[str]) -> list[str]:
         """
-        启动期一次性迁移:扫描 storage_root 下所有 `<username>.<digest>.auth`,
-        若不在内存索引里就回填一条(为旧版本无持久化时残留的文件兜底)。
-        密码/账户无法恢复,这些会显示为"孤立证书",管理页可单独删除或重建账户。
+        启动期清理:删除"没有对应账户"的证书,确保 1 张证书 ↔ 1 个账户严格成立。
+        证书副本文件 + 索引条目都会被清掉。
+        返回被释放的 username 列表。
+
+        Args:
+            valid_usernames: 当前仍存在的账户名集合
         """
-        adopted = 0
+        released = []
+        for un in list(self._auths.keys()):
+            if un not in valid_usernames:
+                if self.delete(un):
+                    released.append(un)
+        # 同时清理:磁盘上没在索引里的 `*.auth` 残留文件
+        # (旧版本无持久化时留下的、或上一行删除中途崩溃留下的孤儿)
+        in_use = {auth.file_path.resolve() for auth in self._auths.values()}
         for p in self._storage_root.glob("*.auth"):
-            stem = p.name[:-5]  # 去掉 .auth
-            if "." not in stem:
-                continue
-            username, digest = stem.rsplit(".", 1)
-            if username in self._auths or digest in self._by_id:
-                continue
             try:
-                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+                if p.resolve() not in in_use:
+                    p.unlink()
+                    released.append(p.name)
             except OSError:
-                continue
-            auth = UserAuthorization(
-                auth_id=digest,
-                subject=username,
-                file_path=p,
-                imported_at=mtime,
-            )
-            self._auths[username] = auth
-            self._by_id[digest] = auth
-            adopted += 1
-        if adopted:
-            self._save_index()
+                pass
+        return released
 
     def _save_index(self) -> None:
         data: list[dict[str, Any]] = []

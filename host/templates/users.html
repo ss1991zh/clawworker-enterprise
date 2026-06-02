@@ -121,38 +121,6 @@
     </div>
   </div>
 
-  {% if orphan_auths %}
-  <div class="panel">
-    <div class="panel-header">
-      <h3>孤立证书({{ orphan_auths|length }})</h3>
-    </div>
-    <div class="panel-body">
-      <p style="color: var(--text-muted); font-size:13px; margin-top:0;">
-        已导入但未绑定到账户的证书 — 通常发生在创建账户失败时,可单独删除回收。
-      </p>
-      <table class="table">
-        <thead>
-          <tr><th>预期用户名</th><th>auth_id</th><th>导入时间</th><th></th></tr>
-        </thead>
-        <tbody>
-        {% for a in orphan_auths %}
-          <tr>
-            <td>{{ a.username }}</td>
-            <td class="mono">{{ a.auth_id }}</td>
-            <td class="mono">{{ a.imported_at }}</td>
-            <td>
-              <form method="post" action="/admin/users/{{ a.username }}/delete" style="display:inline;">
-                <button class="btn btn-danger btn-sm" type="submit">删除证书</button>
-              </form>
-            </td>
-          </tr>
-        {% endfor %}
-        </tbody>
-      </table>
-    </div>
-  </div>
-  {% endif %}
-
   <script>
     (function() {
       const drop = document.getElementById('drop-zone');

@@ -140,9 +140,12 @@ def build_admin_router(
 
     @router.get("/users", response_class=HTMLResponse)
     def user_list(request: Request):
-        """合并视图:每行 = (证书 + 账户 + LLM 配置)。"""
+        """每行 = (证书 + 账户 + LLM 配置)。证书生命周期跟随账户。"""
         configs = llm_config_store.list_all()
         cfg_index = {c.id: c for c in configs}
+        # 防御性:每次进页面也再做一次清理(双保险)
+        auth_manager.cleanup_unbound(set(user_manager._accounts.keys()))
+
         users = []
         for u in user_manager._accounts.values():
             auth = (
@@ -163,22 +166,11 @@ def build_admin_router(
                 "llm_config_name": cfg.name if cfg else "",
                 "llm_model_name": cfg.model_name if cfg else "",
             })
-        # 孤立授权(导入证书但没建账户)
-        orphans = []
-        for un, a in auth_manager._auths.items():
-            if un not in user_manager._accounts:
-                orphans.append({
-                    "username": un,
-                    "auth_id": a.auth_id,
-                    "imported_at": a.imported_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    "revoked": a.revoked,
-                })
         return templates.TemplateResponse(
             request, "users.html",
             {
                 "active": "users",
                 "users": users,
-                "orphan_auths": orphans,
                 "llm_configs": configs,
                 "messages": _pop_messages(request),
             },
