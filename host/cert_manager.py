@@ -8,14 +8,21 @@ A1 用户授权管理(architecture.md §A1)。
 - 主机侧只跟踪"每个用户的 user_authorization 文件路径 + 账户状态",
   真正的有效期校验在客户端调 hp.initDict 时由 SDK 完成
 - 客户端 init 失败 → 上报主机 → 主机把对应账户标记为 DISABLED
+
+⚠️ 持久化:
+- 证书副本文件本来就在 storage_root 下落盘
+- 索引(username → 元数据)JSON 落到 storage_root / "index.json"
+- 进程重启后 _load_index() 自动恢复
 """
 
 from __future__ import annotations
 
+import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -63,9 +70,90 @@ class AuthorizationManager:
     def __init__(self, storage_root: Optional[Path] = None):
         self._storage_root = storage_root or (Path.home() / ".agent-system" / "host-auth")
         self._storage_root.mkdir(parents=True, exist_ok=True)
+        self._index_path = self._storage_root / "index.json"
+        self._lock = threading.Lock()
         self._auths: dict[str, UserAuthorization] = {}  # username → auth
         # 旧的 cert_id → cert 索引,保留兼容
         self._by_id: dict[str, UserAuthorization] = {}
+        self._load_index()
+        self._adopt_orphans()
+
+    # ----- 持久化 -----
+    def _load_index(self) -> None:
+        """从磁盘恢复索引。索引损坏则忽略(空启动)。"""
+        if not self._index_path.exists():
+            return
+        try:
+            data = json.loads(self._index_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for item in data:
+            try:
+                auth = UserAuthorization(
+                    auth_id=item["auth_id"],
+                    subject=item["subject"],
+                    file_path=Path(item["file_path"]),
+                    imported_at=datetime.fromisoformat(item["imported_at"]),
+                    revoked=bool(item.get("revoked", False)),
+                    sdk_init_failed_at=(
+                        datetime.fromisoformat(item["sdk_init_failed_at"])
+                        if item.get("sdk_init_failed_at") else None
+                    ),
+                )
+                # 文件不在了:仍然恢复索引,但 is_valid() 会自动失败
+                self._auths[auth.subject] = auth
+                self._by_id[auth.auth_id] = auth
+            except (KeyError, ValueError, TypeError):
+                continue
+
+    def _adopt_orphans(self) -> None:
+        """
+        启动期一次性迁移:扫描 storage_root 下所有 `<username>.<digest>.auth`,
+        若不在内存索引里就回填一条(为旧版本无持久化时残留的文件兜底)。
+        密码/账户无法恢复,这些会显示为"孤立证书",管理页可单独删除或重建账户。
+        """
+        adopted = 0
+        for p in self._storage_root.glob("*.auth"):
+            stem = p.name[:-5]  # 去掉 .auth
+            if "." not in stem:
+                continue
+            username, digest = stem.rsplit(".", 1)
+            if username in self._auths or digest in self._by_id:
+                continue
+            try:
+                mtime = datetime.fromtimestamp(p.stat().st_mtime)
+            except OSError:
+                continue
+            auth = UserAuthorization(
+                auth_id=digest,
+                subject=username,
+                file_path=p,
+                imported_at=mtime,
+            )
+            self._auths[username] = auth
+            self._by_id[digest] = auth
+            adopted += 1
+        if adopted:
+            self._save_index()
+
+    def _save_index(self) -> None:
+        data: list[dict[str, Any]] = []
+        for auth in self._auths.values():
+            data.append({
+                "auth_id": auth.auth_id,
+                "subject": auth.subject,
+                "file_path": str(auth.file_path),
+                "imported_at": auth.imported_at.isoformat(),
+                "revoked": auth.revoked,
+                "sdk_init_failed_at": (
+                    auth.sdk_init_failed_at.isoformat()
+                    if auth.sdk_init_failed_at else None
+                ),
+            })
+        # 原子写入:先写 .tmp 再 rename
+        tmp = self._index_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self._index_path)
 
     # ----- 导入(强制 1 证书 1 用户)-----
     def import_authorization(self, *, username: str, source: Path) -> UserAuthorization:
@@ -101,15 +189,17 @@ class AuthorizationManager:
         dst = self._storage_root / f"{username}.{digest}.auth"
         dst.write_bytes(source.read_bytes())
 
-        auth = UserAuthorization(
-            auth_id=digest,
-            subject=username,
-            file_path=dst,
-            imported_at=datetime.now(),
-        )
-        self._auths[username] = auth
-        self._by_id[digest] = auth
-        return auth
+        with self._lock:
+            auth = UserAuthorization(
+                auth_id=digest,
+                subject=username,
+                file_path=dst,
+                imported_at=datetime.now(),
+            )
+            self._auths[username] = auth
+            self._by_id[digest] = auth
+            self._save_index()
+            return auth
 
     # ----- 删除 -----
     def delete(self, username: str) -> bool:
@@ -117,15 +207,17 @@ class AuthorizationManager:
         彻底删除指定用户的授权(及主机侧存储副本)。
         删除后,同一证书可以再被导入(给新用户)。
         """
-        auth = self._auths.pop(username, None)
-        if not auth:
-            return False
-        self._by_id.pop(auth.auth_id, None)
-        try:
-            auth.file_path.unlink()
-        except FileNotFoundError:
-            pass
-        return True
+        with self._lock:
+            auth = self._auths.pop(username, None)
+            if not auth:
+                return False
+            self._by_id.pop(auth.auth_id, None)
+            try:
+                auth.file_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._save_index()
+            return True
 
     # ----- 查询 -----
     def get_by_username(self, username: str) -> Optional[UserAuthorization]:
@@ -139,17 +231,21 @@ class AuthorizationManager:
 
     # ----- 状态变更 -----
     def revoke(self, username: str) -> None:
-        if username in self._auths:
-            self._auths[username].revoked = True
+        with self._lock:
+            if username in self._auths:
+                self._auths[username].revoked = True
+                self._save_index()
 
     def report_init_failed(self, username: str) -> None:
         """
         客户端调 hp.initDict 失败时上报。
         主机标记授权失效,后续登录会被拒绝。
         """
-        auth = self._auths.get(username)
-        if auth and auth.sdk_init_failed_at is None:
-            auth.sdk_init_failed_at = datetime.now()
+        with self._lock:
+            auth = self._auths.get(username)
+            if auth and auth.sdk_init_failed_at is None:
+                auth.sdk_init_failed_at = datetime.now()
+                self._save_index()
 
 
 # 向后兼容:CertificateManager 名字仍可用

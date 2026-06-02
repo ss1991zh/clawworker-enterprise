@@ -9,12 +9,14 @@ A2 用户管理(architecture.md §A2)。
 from __future__ import annotations
 
 import hashlib
+import json
 import secrets
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 
 class AccountStatus(str, Enum):
@@ -58,14 +60,65 @@ class UserManager:
 
     SESSION_TTL = timedelta(hours=8)
 
-    def __init__(self, auth_manager):
+    def __init__(self, auth_manager, accounts_path: Optional[Path] = None):
         """
         Args:
             auth_manager: AuthorizationManager(原 CertificateManager,术语统一)
+            accounts_path: 账户索引 JSON 路径;默认跟随 auth_manager 的
+                storage_root,确保测试时 tmp_path 自动隔离,生产时落在
+                ~/.agent-system/host-auth/accounts.json
         """
         self._auth_manager = auth_manager
-        self._accounts: dict[str, Account] = {}  # username -> account
-        self._sessions: dict[str, Session] = {}  # token -> session
+        self._accounts: dict[str, Account] = {}   # username -> account
+        self._sessions: dict[str, Session] = {}   # token -> session(仅内存,8h TTL)
+        self._lock = threading.Lock()
+        if accounts_path is None:
+            base = getattr(auth_manager, "_storage_root", None)
+            if base is None:
+                base = Path.home() / ".agent-system" / "host-auth"
+            accounts_path = Path(base) / "accounts.json"
+        self._accounts_path = accounts_path
+        self._accounts_path.parent.mkdir(parents=True, exist_ok=True)
+        self._load_accounts()
+
+    # ----- 持久化(账户)-----
+    def _load_accounts(self) -> None:
+        if not self._accounts_path.exists():
+            return
+        try:
+            data = json.loads(self._accounts_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for item in data:
+            try:
+                acct = Account(
+                    username=item["username"],
+                    auth_id=item["auth_id"],
+                    password_hash=item["password_hash"],
+                    password_salt=item["password_salt"],
+                    status=AccountStatus(item.get("status", "active")),
+                    created_at=datetime.fromisoformat(item["created_at"]),
+                    llm_config_id=item.get("llm_config_id") or None,
+                )
+                self._accounts[acct.username] = acct
+            except (KeyError, ValueError, TypeError):
+                continue
+
+    def _save_accounts(self) -> None:
+        data: list[dict[str, Any]] = []
+        for acct in self._accounts.values():
+            data.append({
+                "username": acct.username,
+                "auth_id": acct.auth_id,
+                "password_hash": acct.password_hash,
+                "password_salt": acct.password_salt,
+                "status": str(acct.status.value) if hasattr(acct.status, "value") else str(acct.status),
+                "created_at": acct.created_at.isoformat(),
+                "llm_config_id": acct.llm_config_id or "",
+            })
+        tmp = self._accounts_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self._accounts_path)
 
     # 兼容旧名
     @property
@@ -105,53 +158,64 @@ class UserManager:
         if not auth or not auth.is_valid():
             raise ValueError("user_authorization 不存在或已失效")
 
-        salt = secrets.token_hex(16)
-        acct = Account(
-            username=username,
-            auth_id=auth.auth_id,
-            password_hash=_hash_password(password, salt),
-            password_salt=salt,
-            llm_config_id=llm_config_id,
-        )
-        self._accounts[username] = acct
-        return acct
+        with self._lock:
+            salt = secrets.token_hex(16)
+            acct = Account(
+                username=username,
+                auth_id=auth.auth_id,
+                password_hash=_hash_password(password, salt),
+                password_salt=salt,
+                llm_config_id=llm_config_id,
+            )
+            self._accounts[username] = acct
+            self._save_accounts()
+            return acct
 
     def set_llm_config(self, username: str, llm_config_id: Optional[str]) -> None:
         """绑定 / 解绑用户的 LLM 配置;传 None 表示清空(稍后补选)。"""
-        if username not in self._accounts:
-            raise ValueError(f"账户 {username} 不存在")
-        self._accounts[username].llm_config_id = llm_config_id or None
+        with self._lock:
+            if username not in self._accounts:
+                raise ValueError(f"账户 {username} 不存在")
+            self._accounts[username].llm_config_id = llm_config_id or None
+            self._save_accounts()
 
     def disable(self, username: str) -> None:
-        if username in self._accounts:
-            self._accounts[username].status = AccountStatus.DISABLED
+        with self._lock:
+            if username in self._accounts:
+                self._accounts[username].status = AccountStatus.DISABLED
+                self._save_accounts()
 
     def enable(self, username: str) -> None:
-        if username in self._accounts:
-            self._accounts[username].status = AccountStatus.ACTIVE
+        with self._lock:
+            if username in self._accounts:
+                self._accounts[username].status = AccountStatus.ACTIVE
+                self._save_accounts()
 
     def update_password(self, username: str, new_password: str) -> None:
         """改密;旧 session 全部失效,用户必须重新登录。"""
-        if username not in self._accounts:
-            raise ValueError(f"账户 {username} 不存在")
-        if not new_password or len(new_password) < 6:
-            raise ValueError("密码至少 6 位")
-        acct = self._accounts[username]
-        salt = secrets.token_hex(16)
-        acct.password_salt = salt
-        acct.password_hash = _hash_password(new_password, salt)
-        # 注销该用户所有现有 session
-        for tok in [t for t, s in self._sessions.items() if s.username == username]:
-            self._sessions.pop(tok, None)
+        with self._lock:
+            if username not in self._accounts:
+                raise ValueError(f"账户 {username} 不存在")
+            if not new_password or len(new_password) < 6:
+                raise ValueError("密码至少 6 位")
+            acct = self._accounts[username]
+            salt = secrets.token_hex(16)
+            acct.password_salt = salt
+            acct.password_hash = _hash_password(new_password, salt)
+            for tok in [t for t, s in self._sessions.items() if s.username == username]:
+                self._sessions.pop(tok, None)
+            self._save_accounts()
 
     def delete_account(self, username: str) -> bool:
         """删除账户 + 注销所有 session。"""
-        if username not in self._accounts:
-            return False
-        for tok in [t for t, s in self._sessions.items() if s.username == username]:
-            self._sessions.pop(tok, None)
-        self._accounts.pop(username, None)
-        return True
+        with self._lock:
+            if username not in self._accounts:
+                return False
+            for tok in [t for t, s in self._sessions.items() if s.username == username]:
+                self._sessions.pop(tok, None)
+            self._accounts.pop(username, None)
+            self._save_accounts()
+            return True
 
     # ----- 登录与会话 -----
     def login(self, *, username: str, password: str) -> Session:
