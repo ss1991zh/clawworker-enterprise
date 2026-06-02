@@ -647,8 +647,30 @@ def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
         if _looks_bad(df) or (
             len(df.columns) == 1 and "," in path.read_text(encoding="utf-8", errors="replace")[:500]
         ):
-            df, hr = _retry_with_header(lambda **kw: pd.read_csv(path, **kw), df)
-            return df, "csv", hr
+            # 用标准库 csv 绕开 pandas 的"列数不一致就抛 ParserError",
+            # 自己找 header 行,再 skiprows= 让 pandas 从那一行起读
+            import csv as _csv
+            try:
+                with path.open("r", encoding="utf-8", newline="") as f:
+                    raw_rows = list(_csv.reader(f))
+            except UnicodeDecodeError:
+                with path.open("r", encoding="gbk", newline="", errors="replace") as f:
+                    raw_rows = list(_csv.reader(f))
+            header_idx = 0
+            best_score = -1
+            for i in range(min(10, len(raw_rows))):
+                row = raw_rows[i]
+                # 非空字符串单元格数,且总单元格数 ≥ 2(防止单列文件)
+                str_cnt = sum(1 for v in row if v and v.strip())
+                if str_cnt >= 2 and str_cnt > best_score:
+                    best_score = str_cnt
+                    header_idx = i
+            try:
+                df2 = pd.read_csv(path, skiprows=header_idx)
+                return df2, "csv", header_idx
+            except Exception:
+                # 实在解析不了,把发现的列数 / 行数告诉用户
+                pass
         return df, "csv", 0
 
     # XLSX: 选最像数据的 sheet
