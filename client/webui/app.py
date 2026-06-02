@@ -743,6 +743,57 @@ def api_files_delete(name: str):
     return {"ok": True}
 
 
+@app.get("/api/files/{name}/preview")
+def api_files_preview(name: str):
+    """
+    展示密文文件的"可见内容":
+    - meta sidecar 的前 N 行(身份列明文)
+    - schema 推断结果(列名 + 加密/明文标记)
+    - 文件大小 / 行数 / 列数等元信息
+    密文 cipher 本身是二进制,不可读;这里只展示 sidecar 内容。
+    """
+    if not _is_logged_in():
+        return _need_login()
+    target = _storage.ciphertext_dir / name
+    if not target.exists() or not target.is_relative_to(_storage.ciphertext_dir):
+        raise HTTPException(404, "文件不存在或路径非法")
+
+    info: dict[str, Any] = {
+        "name": target.name,
+        "path": str(target),
+        "size_kb": round(target.stat().st_size / 1024, 1),
+    }
+
+    # meta sidecar
+    meta_p = target.with_suffix(target.suffix + ".meta.csv")
+    if meta_p.exists():
+        try:
+            import pandas as pd
+            meta_df = pd.read_csv(meta_p)
+            info["meta_columns"] = list(meta_df.columns)
+            info["meta_row_count"] = len(meta_df)
+            # 前 8 行预览,转 str 让 JSON 安全
+            preview_rows = meta_df.head(8).fillna("").astype(str).values.tolist()
+            info["meta_preview"] = preview_rows
+        except Exception as e:
+            info["meta_error"] = str(e)
+    else:
+        info["meta_columns"] = []
+        info["meta_preview"] = []
+        info["meta_row_count"] = 0
+
+    # schema sidecar
+    schema_p = target.with_suffix(target.suffix + ".schema.json")
+    if schema_p.exists():
+        try:
+            info["schema"] = json.loads(schema_p.read_text(encoding="utf-8"))
+        except Exception as e:
+            info["schema_error"] = str(e)
+    else:
+        info["schema"] = None
+    return info
+
+
 # ---------------------------------------------------------------------------
 # JSON API:会话 + 消息
 # ---------------------------------------------------------------------------
@@ -809,19 +860,56 @@ async def api_sessions_set_context(sid: str, request: Request):
     _sess_for_user(sid)
     data = await request.json()
     ciphertext = data.get("ciphertext")
+    ciphertexts = data.get("ciphertexts")
+    action = data.get("action") or "set"     # set | add | remove
     schema = data.get("schema")
 
-    # 切换密文时,默认从旁挂 schema.json 自动加载
-    if ciphertext and schema is None:
-        cipher_path = Path(ciphertext)
-        sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
-        if sidecar.exists():
-            try:
-                schema = sidecar.read_text(encoding="utf-8")
-            except Exception:
-                schema = None
+    # 决定主路径:批量 ciphertexts > 单 ciphertext + action
+    if ciphertexts is not None:
+        # 批量替换
+        # 自动从第一个的旁挂 schema.json 加载
+        if ciphertexts and schema is None:
+            first = Path(ciphertexts[0])
+            sidecar = first.with_suffix(first.suffix + ".schema.json")
+            if sidecar.exists():
+                try:
+                    schema = sidecar.read_text(encoding="utf-8")
+                except Exception:
+                    schema = None
+        _sessions.set_context(sid, ciphertexts=ciphertexts, schema=schema)
+        return {"ok": True}
 
-    _sessions.set_context(sid, ciphertext=ciphertext, schema=schema)
+    if ciphertext is not None:
+        if action == "add":
+            _sessions.add_ciphertext(sid, ciphertext)
+            # 第一次添加时同步 schema
+            sess = _sessions.get(sid)
+            if sess and not sess.context_schema:
+                first = Path(ciphertext)
+                sidecar = first.with_suffix(first.suffix + ".schema.json")
+                if sidecar.exists():
+                    try:
+                        _sessions.set_context(sid, schema=sidecar.read_text(encoding="utf-8"))
+                    except Exception:
+                        pass
+            return {"ok": True}
+        if action == "remove":
+            _sessions.remove_ciphertext(sid, ciphertext)
+            return {"ok": True}
+        # set:替换单文件(老接口语义)
+        if schema is None:
+            sidecar = Path(ciphertext).with_suffix(Path(ciphertext).suffix + ".schema.json")
+            if sidecar.exists():
+                try:
+                    schema = sidecar.read_text(encoding="utf-8")
+                except Exception:
+                    schema = None
+        _sessions.set_context(sid, ciphertext=ciphertext, schema=schema)
+        return {"ok": True}
+
+    # 只改 schema
+    if schema is not None:
+        _sessions.set_context(sid, schema=schema)
     return {"ok": True}
 
 
@@ -830,11 +918,18 @@ def api_messages_list(sid: str):
     if not _is_logged_in():
         return _need_login()
     sess = _sess_for_user(sid)
+    cts = sess.context_ciphertexts or ([sess.context_ciphertext] if sess.context_ciphertext else [])
     return {
         "session": {
             "id": sess.id, "title": sess.title,
+            # 兼容老前端 — 主密文
             "context_ciphertext": sess.context_ciphertext,
             "context_ciphertext_name": Path(sess.context_ciphertext).name if sess.context_ciphertext else "",
+            # 新接口 — 多密文
+            "context_ciphertexts": cts,
+            "context_ciphertexts_named": [
+                {"path": p, "name": Path(p).name} for p in cts
+            ],
             "context_schema": sess.context_schema,
         },
         "messages": [m.to_dict() for m in sess.messages],
@@ -930,21 +1025,27 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
     if not sess:
         return
 
-    has_cipher = bool(sess.context_ciphertext and Path(sess.context_ciphertext).exists())
+    # 取所有有效密文(list 优先,fallback 到老的单文件字段)
+    cipher_paths = [Path(p) for p in (sess.context_ciphertexts or [])
+                    if p and Path(p).exists()]
+    if not cipher_paths and sess.context_ciphertext and Path(sess.context_ciphertext).exists():
+        cipher_paths = [Path(sess.context_ciphertext)]
+    has_cipher = bool(cipher_paths)
 
-    # ----- 自由聊天分支:没绑密文(包括"绑了但文件被删")就走 LLM 闲聊 -----
-    #   schema 是会话级残留状态,密文都没了 schema 就没意义,顺手清掉
+    # ----- 自由聊天分支 -----
     if not has_cipher:
-        if sess.context_ciphertext or sess.context_schema:
-            _sessions.set_context(sid, ciphertext="", schema="")
+        if sess.context_ciphertext or sess.context_ciphertexts or sess.context_schema:
+            _sessions.set_context(sid, ciphertexts=[], ciphertext="", schema="")
         _run_freechat(sid, asst_mid, user_query, t0)
         return
+
+    # workflow 入口取第一份(workflow 自身只支持单 cipher,多文件后续扩展)
+    cipher_path = cipher_paths[0]
 
     # ----- 数据分析分支(以下都是 has_cipher = True)-----
     has_schema = bool(sess.context_schema)
     # 兜底:schema 缺失,从旁挂 *.schema.json 重新加载
     if not has_schema:
-        cipher_path = Path(sess.context_ciphertext)
         sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
         if sidecar.exists():
             try:
@@ -978,7 +1079,7 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
         )
         return
 
-    cipher_path = Path(sess.context_ciphertext)
+    # cipher_path 已在上面取自 cipher_paths[0]
     username = _session_state["username"]
     host_url = _session_state["host_url"]
     token = _session_state["token"]

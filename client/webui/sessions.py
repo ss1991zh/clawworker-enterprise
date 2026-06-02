@@ -71,8 +71,11 @@ class ChatSession:
     username: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-    # 会话上下文:绑定的密文 + schema(用户切换就更新)
+    # 会话上下文:绑定的密文(支持多个)+ schema
+    # context_ciphertext: 主密文(向后兼容,等于 context_ciphertexts[0])
+    # context_ciphertexts: 全部绑定密文(允许多文件)
     context_ciphertext: str = ""
+    context_ciphertexts: list[str] = field(default_factory=list)
     context_schema: str = ""
     messages: list[Message] = field(default_factory=list)
 
@@ -83,13 +86,22 @@ class ChatSession:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatSession":
+        ciphertext = d.get("context_ciphertext", "")
+        ciphertexts = list(d.get("context_ciphertexts") or [])
+        # 老会话只有 context_ciphertext → 自动迁到 list
+        if ciphertext and not ciphertexts:
+            ciphertexts = [ciphertext]
+        # 反过来:list 有但 str 没,补 str 字段
+        elif ciphertexts and not ciphertext:
+            ciphertext = ciphertexts[0]
         sess = cls(
             id=d["id"],
             title=d.get("title", "新会话"),
             username=d.get("username", ""),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
             updated_at=d.get("updated_at", datetime.now().isoformat(timespec="seconds")),
-            context_ciphertext=d.get("context_ciphertext", ""),
+            context_ciphertext=ciphertext,
+            context_ciphertexts=ciphertexts,
             context_schema=d.get("context_schema", ""),
         )
         sess.messages = [Message.from_dict(m) for m in d.get("messages", []) or []]
@@ -188,16 +200,50 @@ class SessionStore:
                     return m
         return None
 
-    def set_context(self, sid: str, *, ciphertext: Optional[str] = None,
+    def set_context(self, sid: str, *,
+                    ciphertext: Optional[str] = None,
+                    ciphertexts: Optional[list[str]] = None,
                     schema: Optional[str] = None) -> None:
         sess = self._sessions.get(sid)
         if not sess:
             return
         with self._lock:
-            if ciphertext is not None:
+            if ciphertexts is not None:
+                # 完整替换列表
+                sess.context_ciphertexts = list(ciphertexts)
+                sess.context_ciphertext = ciphertexts[0] if ciphertexts else ""
+            elif ciphertext is not None:
+                # 兼容老接口:单文件设置 → 同时同步 list
                 sess.context_ciphertext = ciphertext
+                sess.context_ciphertexts = [ciphertext] if ciphertext else []
             if schema is not None:
                 sess.context_schema = schema
+            self._save(sess)
+
+    def add_ciphertext(self, sid: str, path: str) -> None:
+        """往会话已绑定的密文 list 里追加(去重)"""
+        sess = self._sessions.get(sid)
+        if not sess:
+            return
+        with self._lock:
+            if path not in sess.context_ciphertexts:
+                sess.context_ciphertexts.append(path)
+                if not sess.context_ciphertext:
+                    sess.context_ciphertext = path
+                self._save(sess)
+
+    def remove_ciphertext(self, sid: str, path: str) -> None:
+        """从会话密文 list 里移除一项"""
+        sess = self._sessions.get(sid)
+        if not sess:
+            return
+        with self._lock:
+            if path in sess.context_ciphertexts:
+                sess.context_ciphertexts.remove(path)
+            if sess.context_ciphertext == path:
+                sess.context_ciphertext = (
+                    sess.context_ciphertexts[0] if sess.context_ciphertexts else ""
+                )
             self._save(sess)
 
     def rename(self, sid: str, title: str) -> None:

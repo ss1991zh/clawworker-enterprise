@@ -64,12 +64,15 @@
 
     <footer>
       <div class="composer" id="composer">
-        <!-- 上下文条:当前会话绑定的密文(schema 自动从旁挂 .schema.json 加载,不需要展示)-->
+        <!-- 上下文条:当前会话绑定的多份密文 -->
         <div class="ctx-bar" id="ctxBar" style="display:none;">
-          <div class="ctx-chip" id="ctxCipher">
-            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
-            <span class="ctx-name">未绑定密文</span>
-          </div>
+          <!-- 动态生成已绑定 chip -->
+          <div id="ctxChips" style="display:flex; gap:8px; flex-wrap:wrap; flex:1;"></div>
+          <!-- 添加按钮 -->
+          <button class="ctx-chip ctx-add-btn" id="ctxAddBtn" type="button" title="选择已加密文件加入会话">
+            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+            <span>添加</span>
+          </button>
         </div>
 
         <div class="attach-chips" id="attachChips"></div>

@@ -422,16 +422,36 @@ async function handleFileAttach(files) {
   }
 }
 
-// ============ 上下文条(仅密文 · schema 自动从旁挂加载)============
+// ============ 上下文条:多密文绑定 · schema 自动 ============
 function updateCtxBar() {
   const bar = $("ctxBar");
   if (!state.currentSession) { bar.style.display = "none"; return; }
   bar.style.display = "flex";
 
-  const cipher = state.currentSession.context_ciphertext_name || "";
-  const cChip = $("ctxCipher");
-  cChip.classList.toggle("set", !!cipher);
-  cChip.querySelector(".ctx-name").textContent = cipher || "未绑定密文 · 点击选择";
+  const list = state.currentSession.context_ciphertexts_named
+    || (state.currentSession.context_ciphertext
+        ? [{path: state.currentSession.context_ciphertext,
+            name: state.currentSession.context_ciphertext_name
+                  || state.currentSession.context_ciphertext.split("/").pop()}]
+        : []);
+  const chipsBox = $("ctxChips");
+  if (!list.length) {
+    chipsBox.innerHTML = `<span style="color:var(--text-muted); font-size:12px; padding:5px 8px;">未绑定密文 · 点击右侧「添加」选择已加密文件</span>`;
+    return;
+  }
+  chipsBox.innerHTML = list.map(item => `
+    <div class="ctx-chip set">
+      <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+      <span class="ctx-name">${esc(item.name)}</span>
+      <button class="ctx-chip-x" data-detach="${esc(item.path)}" title="从会话移除">×</button>
+    </div>
+  `).join("");
+  chipsBox.querySelectorAll("[data-detach]").forEach(b => {
+    b.addEventListener("click", async e => {
+      e.stopPropagation();
+      await detachCipherFromSession(b.dataset.detach);
+    });
+  });
 }
 
 // ============ 设置 Modal ============
@@ -581,18 +601,34 @@ function renderFilesList() {
     box.innerHTML = '<div class="alert-box info">本机还没有加密文件</div>';
     return;
   }
-  box.innerHTML = state.files.map(f => `
+  // 当前会话已绑定哪些密文
+  const boundPaths = new Set(
+    (state.currentSession?.context_ciphertexts || []).map(c => c.path || c)
+  );
+  box.innerHTML = state.files.map(f => {
+    const isBound = boundPaths.has(f.path);
+    return `
     <div class="list-item">
       <div class="grow">
-        <div class="t">${esc(f.name)}</div>
+        <div class="t">${esc(f.name)}${isBound ? ' <span class="badge use">已在当前会话</span>' : ""}</div>
         <div class="d">${f.size_kb} KB · ${esc(f.mtime.slice(0, 19))}${f.has_meta ? ' · <span class="badge ok">meta</span>' : ""}</div>
       </div>
-      <button class="btn-ghost btn-sm" data-use="${esc(f.path)}">用于当前会话</button>
+      <button class="btn-ghost btn-sm" data-view="${esc(f.name)}">查看内容</button>
+      ${isBound
+        ? `<button class="btn-ghost btn-sm" data-detach="${esc(f.path)}">从会话移除</button>`
+        : `<button class="btn-ghost btn-sm" data-attach="${esc(f.path)}">加入会话</button>`}
       <button class="btn-danger" data-del="${esc(f.name)}">删除</button>
     </div>
-  `).join("");
-  box.querySelectorAll("[data-use]").forEach(b => b.addEventListener("click", () => {
-    pickCipherForSession(b.dataset.use);
+    `;
+  }).join("");
+  box.querySelectorAll("[data-view]").forEach(b => b.addEventListener("click", () => {
+    showFilePreview(b.dataset.view);
+  }));
+  box.querySelectorAll("[data-attach]").forEach(b => b.addEventListener("click", async () => {
+    await attachCipherToSession(b.dataset.attach);
+  }));
+  box.querySelectorAll("[data-detach]").forEach(b => b.addEventListener("click", async () => {
+    await detachCipherFromSession(b.dataset.detach);
   }));
   box.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
     if (!confirm(`删除 ${b.dataset.del}?`)) return;
@@ -601,13 +637,110 @@ function renderFilesList() {
   }));
 }
 
-async function pickCipherForSession(path) {
+async function attachCipherToSession(path) {
   if (!state.currentSid) { await createSession(); }
-  await api("POST", `/api/sessions/${state.currentSid}/context`, { ciphertext: path });
-  state.currentSession.context_ciphertext = path;
-  state.currentSession.context_ciphertext_name = path.split("/").pop();
+  await api("POST", `/api/sessions/${state.currentSid}/context`,
+            { ciphertext: path, action: "add" });
+  // refresh session
+  const data = await api("GET", `/api/sessions/${state.currentSid}/messages`);
+  state.currentSession = data.session;
+  state.currentSession.messages = data.messages;
   updateCtxBar();
-  closeModal();
+  renderFilesList();
+}
+
+async function detachCipherFromSession(path) {
+  if (!state.currentSid) return;
+  await api("POST", `/api/sessions/${state.currentSid}/context`,
+            { ciphertext: path, action: "remove" });
+  const data = await api("GET", `/api/sessions/${state.currentSid}/messages`);
+  state.currentSession = data.session;
+  state.currentSession.messages = data.messages;
+  updateCtxBar();
+  renderFilesList();
+}
+
+// 查看密文文件内容(meta sidecar 明文 + schema 推断)
+async function showFilePreview(name) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-mask open";
+  wrap.style.zIndex = 30;
+  wrap.innerHTML = `
+    <div class="modal" style="position:relative; max-width:840px; height:auto; max-height:80vh;">
+      <button class="modal__close" id="prevClose">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <div class="modal__body" style="padding:24px 30px;">
+        <h2>${esc(name)}</h2>
+        <p class="sub">密文文件不可读 · 这里展示同目录的 meta sidecar(明文身份列)+ 自动推断 schema</p>
+        <div id="prevBody"><div class="alert-box info">加载中…</div></div>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#prevClose").addEventListener("click", () => wrap.remove());
+  wrap.addEventListener("click", e => { if (e.target === wrap) wrap.remove(); });
+
+  try {
+    const info = await api("GET", `/api/files/${encodeURIComponent(name)}/preview`);
+    const body = wrap.querySelector("#prevBody");
+    let html = `
+      <div class="list-item">
+        <div class="grow">
+          <div class="t">文件信息</div>
+          <div class="d">${esc(info.path)} · ${info.size_kb} KB</div>
+        </div>
+      </div>
+    `;
+
+    // schema 概览
+    if (info.schema && info.schema.columns) {
+      const cols = info.schema.columns;
+      const enc = cols.filter(c => c.encrypted).map(c => c.name);
+      const pt  = cols.filter(c => !c.encrypted).map(c => c.name);
+      html += `
+        <h3 style="font-size:14px; margin:18px 0 8px;">字段结构(共 ${cols.length} 列)</h3>
+        <div class="list-item">
+          <div class="grow">
+            <div class="t">加密列(${enc.length})</div>
+            <div class="d mono" style="white-space:normal;">${enc.map(esc).join(" · ")}</div>
+          </div>
+        </div>
+        <div class="list-item">
+          <div class="grow">
+            <div class="t">身份列(${pt.length} · 明文)</div>
+            <div class="d mono" style="white-space:normal;">${pt.map(esc).join(" · ")}</div>
+          </div>
+        </div>
+      `;
+    } else {
+      html += `<div class="alert-box info">没有 schema sidecar(可能是早期上传的文件,建议重传)</div>`;
+    }
+
+    // meta 预览表
+    if (info.meta_preview && info.meta_preview.length) {
+      const cols = info.meta_columns || [];
+      html += `
+        <h3 style="font-size:14px; margin:18px 0 8px;">身份列预览(共 ${info.meta_row_count} 行,展示前 ${info.meta_preview.length} 行)</h3>
+        <div style="overflow-x:auto; border:1px solid var(--border); border-radius:10px;">
+          <table class="usage-tbl" style="font-size:12px; margin:0;">
+            <thead><tr>${cols.map(c => `<th>${esc(c)}</th>`).join("")}</tr></thead>
+            <tbody>
+              ${info.meta_preview.map(row =>
+                `<tr>${row.map(v => `<td>${esc(v)}</td>`).join("")}</tr>`
+              ).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    } else {
+      html += `<div class="alert-box info" style="margin-top:14px;">没有 meta sidecar(全数据都是加密列,身份信息为空)</div>`;
+    }
+    body.innerHTML = html;
+  } catch (e) {
+    wrap.querySelector("#prevBody").innerHTML =
+      `<div class="alert-box">加载失败:${esc(e.message)}</div>`;
+  }
 }
 
 async function renderKeysTab() {
@@ -871,8 +1004,8 @@ function bindEvents() {
     }
   });
 
-  // ctx chip (只有 cipher,schema 自动)
-  $("ctxCipher").addEventListener("click", () => openModal("files"));
+  // ctx 添加按钮(打开 files modal)
+  $("ctxAddBtn").addEventListener("click", () => openModal("files"));
 
   // settings
   $("settingsBtn").addEventListener("click", () => openModal("general"));
