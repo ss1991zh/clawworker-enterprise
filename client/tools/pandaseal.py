@@ -88,22 +88,22 @@ class PandaSeal:
         if isinstance(cipher_in, (str, Path)):
             p = Path(cipher_in)
             suffix = p.suffix.lower()
-            # SKILL.md(pandaseal §快速参考):
-            #   "读取加密文件: cdf = ps.read_excel('cipher.xlsx', index_col=0)"
-            # 必须传 index_col=0,让 ps 把 _P / _L marker 行当索引,不当数据列;
-            # 否则 ps.read_excel 会试图把字符串 "_P" 转 float 报错。
-            # csv 也加(虽然 csv 默认能识别,但显式更安全)。
+            # 当前 ps 版本的实测行为(对照 zionskill SKILL.md):
+            # - ps.read_csv(p):自动识别 _P/_L 为 index,列名正确 → 用这个
+            # - ps.read_csv(p, index_col=0):TypeError(此版本不接受参数)
+            # - ps.read_excel(p):试图把字符串 _P 转 float → ValueError
+            # - ps.read_excel(p, index_col=0):把第一数据列也当 index → 数据丢
+            #
+            # 结论:仅用不传参数的形式,让 ps 自己按 _P/_L 约定处理。
+            # 客户端 webui 上传时我们已强制走 CSV 加密,xlsx 路径基本不命中。
             if suffix == ".csv":
-                try:
-                    return ps.read_csv(str(p), index_col=0)
-                except TypeError:
-                    # 老版本 ps 可能不支持 index_col 参数
-                    return ps.read_csv(str(p))
+                return ps.read_csv(str(p))
             if suffix in (".xlsx", ".xls"):
+                # xlsx 路径已知有问题,但仍兜底尝试
                 try:
-                    return ps.read_excel(str(p), index_col=0)
-                except TypeError:
                     return ps.read_excel(str(p))
+                except Exception:
+                    return ps.read_excel(str(p), index_col=0)
             if suffix == ".json":
                 return ps.read_json(str(p))
             raise ValueError(f"pandaseal 不支持文件类型: {suffix}")
