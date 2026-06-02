@@ -287,6 +287,18 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     dispatcher.mark_running(task_id)
     try:
         resp = provider.chat(system=req.system, user=req.user)
+    except ValueError as e:
+        # parse_llm_text 失败:LLM 输出没按格式给。打出最后一次 raw 文本前 500 字符
+        import traceback as _tb
+        print(f"[/llm/chat] parse fail · user={sess.username} · "
+              f"cfg={cfg.name} · err={e}\n{_tb.format_exc()[-1000:]}")
+        dispatcher.fail(task_id, str(e))
+        call_stats.record(
+            config=cfg, username=sess.username,
+            prompt_tokens=0, completion_tokens=0,
+            success=False, cost_usd=0.0,
+        )
+        raise HTTPException(500, f"LLM 输出格式不符:{e}") from e
     except Exception as e:
         dispatcher.fail(task_id, str(e))
         call_stats.record(

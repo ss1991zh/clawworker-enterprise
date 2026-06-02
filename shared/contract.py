@@ -135,6 +135,31 @@ class Operation(BaseModel):
     fields: Optional[list[str]] = None
     params: dict[str, Any] = Field(default_factory=dict)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_field_fields(cls, data: Any) -> Any:
+        """
+        LLM 兼容:经常会把多列名当成 list 塞到 `field`,或反过来。
+        这里统一规范化:
+        - field 是 list/tuple → 自动迁到 fields
+        - fields 只有一个元素 → 同步落到 field
+        - 都给了:fields 优先,field 取 fields[0]
+        """
+        if not isinstance(data, dict):
+            return data
+        f = data.get("field")
+        fs = data.get("fields")
+        # field 是列表 → 迁
+        if isinstance(f, (list, tuple)):
+            if not fs:
+                fs = list(f)
+            data["fields"] = list(fs)
+            data["field"] = fs[0] if fs else None
+        # 有 fields 但没 field → 用第一项做 field(老 op 实现按 field 拿单列时有 fallback)
+        if isinstance(fs, list) and fs and not data.get("field"):
+            data["field"] = fs[0]
+        return data
+
 
 class PipelineStep(BaseModel):
     """复合场景中的一个流水线步骤。"""
