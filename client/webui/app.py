@@ -449,7 +449,8 @@ def api_files_list():
         all_paths = []
     meta_names = {p.name for p in all_paths if p.name.endswith(".meta.csv")}
     for p in all_paths:
-        if p.name.endswith(".meta.csv"):
+        # sidecar 不显示在列表里(meta / schema 是同 cipher 的辅助)
+        if p.name.endswith(".meta.csv") or p.name.endswith(".schema.json"):
             continue
         size = p.stat().st_size if p.exists() else 0
         out.append({
