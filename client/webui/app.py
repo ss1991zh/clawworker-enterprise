@@ -995,11 +995,43 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
             hetorch=HETorch(backend="stub", evk_path=evk_path),
             authorizer=AutoApproveAuthorizer(),
         )
-        final = wf.invoke({
+
+        # 流式执行:每个 node 完成立即把对应 step 持久化到 message
+        # 前端 polling /api/sessions/{sid}/messages/{mid} 时拿到最新 steps,实时展示
+        accumulated: dict[str, Any] = {
             "user_query": user_query,
             "schema": schema,
             "ciphertext_paths": [str(cipher_path)],
-        })
+        }
+        steps: list[dict[str, Any]] = []
+        # 首步:识别意图(prepare 节点跑之前先 push)
+        meta_path = (cipher_path.with_suffix(cipher_path.suffix + ".meta.csv"))
+        meta_n = 0
+        if meta_path.exists():
+            try:
+                meta_n = sum(1 for _ in meta_path.open("r", encoding="utf-8")) - 1
+            except Exception:
+                meta_n = 0
+        detail = f"密文「{cipher_path.name}」· backend={backend}"
+        if meta_n > 0:
+            detail += f" · meta sidecar({meta_n} 行身份列)"
+        steps.append({"kind": "think", "label": "识别意图 · 数据分析模式",
+                      "detail": detail})
+        _sessions.update_message(sid, asst_mid, steps=list(steps))
+
+        # 跑 stream
+        for chunk in wf.stream(accumulated, stream_mode="updates"):
+            for node_name, delta in chunk.items():
+                if not isinstance(delta, dict):
+                    continue
+                accumulated.update(delta)
+                new_steps = _node_to_steps(node_name, delta, accumulated)
+                if new_steps:
+                    steps.extend(new_steps)
+                    # 实时推送,前端 polling 看得到
+                    _sessions.update_message(sid, asst_mid, steps=list(steps))
+
+        final = accumulated
         summary = (final.get("summary_filtered") or final.get("summary") or "").strip()
         excel_path = final.get("excel_path") or ""
         excel_name = Path(excel_path).name if excel_path else ""
@@ -1014,9 +1046,6 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
                 plan_summary = " → ".join(getattr(o, "op", str(o)) for o in ops)[:200]
             except Exception:
                 pass
-
-        # 从 final state 重建每一步 trace
-        steps = _build_workflow_steps(final, cipher_path, backend, scenario)
 
         if final.get("error"):
             raw_err = str(final["error"])
@@ -1091,137 +1120,155 @@ def _friendly_workflow_error(raw: str) -> str:
     return raw  # 兜底:原样显示
 
 
-def _build_workflow_steps(final: dict, cipher_path: Path, backend: str, scenario: str) -> list[dict[str, Any]]:
+def _node_to_steps(node_name: str, delta: dict, acc: dict) -> list[dict[str, Any]]:
     """
-    从 wf.invoke 的 final state 重建每一步追踪。
-    workflow 节点链:prepare → call_llm → validate_plan →
-        compute_(pandaseal|henumpy|helearn|hetorch|pipeline) →
-        authorize → [write_excel_encrypted | decrypt] → write_excel → filter_summary
+    把 workflow 一个 node 的 state delta 转成一到几个展示用 step。
+    在每个 node 完成时调用,实时 push 到 message。
     """
-    steps: list[dict[str, Any]] = []
-    cipher_name = cipher_path.name
-    meta_path = final.get("metadata_path")
-    meta_rows = final.get("metadata_rows") or []
+    out: list[dict[str, Any]] = []
 
-    # 1) prepare(意图识别 + 加载 sidecar)
-    detail_parts = [f"密文「{cipher_name}」", f"backend={backend}"]
-    if meta_path:
-        detail_parts.append(f"meta sidecar({len(meta_rows)} 行身份列)")
-    steps.append({
-        "kind": "think",
-        "label": "识别意图 · 数据分析模式",
-        "detail": " · ".join(detail_parts),
-    })
+    if node_name == "prepare":
+        meta_rows = delta.get("metadata_rows") or []
+        if meta_rows:
+            out.append({
+                "kind": "think",
+                "label": "加载元数据 sidecar",
+                "detail": f"读到 {len(meta_rows)} 行身份列(姓名/大区/月份等)",
+            })
+        return out
 
-    # 2) call_llm → validate_plan
-    plan = final.get("plan")
-    if plan is not None:
-        steps.append({
-            "kind": "call",
-            "label": "POST /llm/chat",
-            "detail": f"system prompt + 用户问题 + schema",
-        })
-        try:
-            ops = getattr(plan, "ops", []) or []
-            tool = getattr(plan, "tool", "") or ""
-            op_names = [getattr(o, "op", str(o)) for o in ops]
-            steps.append({
-                "kind": "result",
-                "label": f"plan 解析 OK",
-                "detail": f"scenario={scenario} · tool={tool} · {len(ops)} 个 op: {' → '.join(op_names) if op_names else '(无)'}",
-            })
-        except Exception:
-            steps.append({"kind": "result", "label": "plan 解析 OK"})
-    else:
-        # LLM 没返回合法 plan
-        retry = final.get("retry_count", 0)
-        if retry > 0:
-            steps.append({"kind": "error", "label": f"LLM 返回不合法 · 重试 {retry} 次"})
+    if node_name == "call_llm":
+        out.append({"kind": "call", "label": "POST /llm/chat",
+                    "detail": "system + user → 返回 computation_plan + summary"})
+        raw = delta.get("summary_raw") or delta.get("computation_plan")
+        if raw is not None:
+            out.append({"kind": "result", "label": "LLM 响应已收到"})
+        return out
 
-    # 3) 计算节点
-    enc_result = final.get("encrypted_result")
-    if enc_result is not None and plan is not None:
-        try:
-            ops = getattr(plan, "ops", []) or []
-            tool = getattr(plan, "tool", "pandaseal")
-            steps.append({
-                "kind": "call",
-                "label": f"密态计算 · {tool}",
-                "detail": f"{len(ops)} 步密文操作(全程不解密)",
-            })
-            steps.append({
-                "kind": "result",
-                "label": "密文结果就绪",
-                "detail": f"type={type(enc_result).__name__}",
-            })
-        except Exception:
-            pass
+    if node_name == "validate_plan":
+        if delta.get("error"):
+            out.append({"kind": "error", "label": "plan 校验失败",
+                        "detail": str(delta["error"])[:160]})
+            return out
+        plan = delta.get("plan") or acc.get("plan")
+        if plan is not None:
+            try:
+                ops = getattr(plan, "ops", []) or []
+                tool = getattr(plan, "tool", "") or ""
+                sc = str(getattr(plan, "scenario", "?")).replace("Scenario.", "")
+                op_names = [getattr(o, "op", str(o)) for o in ops]
+                out.append({
+                    "kind": "result",
+                    "label": "plan 解析 OK",
+                    "detail": f"scenario={sc} · tool={tool} · {len(ops)} 个 op: "
+                              + (" → ".join(op_names) if op_names else "(无)"),
+                })
+            except Exception:
+                out.append({"kind": "result", "label": "plan 解析 OK"})
+        return out
 
-    # 4) 解密授权(B6-1)
-    if final.get("needs_authorization") is not None:
-        if final.get("authorized"):
-            steps.append({
-                "kind": "call",
-                "label": "解密授权检查(B6-1)",
-                "detail": "auto-approve 通过",
-            })
+    if node_name.startswith("compute_"):
+        tool = node_name.removeprefix("compute_")
+        plan = acc.get("plan")
+        ops_count = "?"
+        if plan is not None:
+            try:
+                ops_count = len(getattr(plan, "ops", []) or [])
+            except Exception:
+                pass
+        out.append({"kind": "call", "label": f"密态计算 · {tool}",
+                    "detail": f"{ops_count} 步密文操作(全程不解密 · backend HE)"})
+        if delta.get("error"):
+            out.append({"kind": "error", "label": f"{tool} 执行失败",
+                        "detail": str(delta["error"])[:200]})
         else:
-            steps.append({
-                "kind": "error",
-                "label": "授权拒绝",
-                "detail": "用户未批准解密 · 仅产出包含密文版的 Excel",
-            })
+            res = delta.get("encrypted_result")
+            out.append({"kind": "result", "label": "密文结果就绪",
+                        "detail": f"type={type(res).__name__}" if res is not None else ""})
+        return out
 
-    # 5) 解密
-    dr = final.get("decrypted_rows") or final.get("decrypted_result")
-    if dr is not None:
-        try:
-            n = len(dr) if hasattr(dr, "__len__") else 1
-            steps.append({
-                "kind": "call",
-                "label": "ct.decrypt 解密最终结果",
-            })
-            steps.append({
+    if node_name == "authorize":
+        if delta.get("authorized"):
+            out.append({"kind": "call", "label": "解密授权检查 (B6-1)",
+                        "detail": "auto-approve 通过"})
+        else:
+            out.append({"kind": "error", "label": "未授权解密",
+                        "detail": "将产出含密文版 Excel"})
+        return out
+
+    if node_name == "decrypt":
+        res = delta.get("decrypted_result")
+        n = "?"
+        if res is not None and hasattr(res, "__len__"):
+            try:
+                n = len(res)
+            except Exception:
+                pass
+        out.append({"kind": "call", "label": "ct.decrypt 解密最终结果"})
+        out.append({"kind": "result",
+                    "label": f"已解密 {n} 行" if n != "?" else "解密完成"})
+        return out
+
+    if node_name in ("write_excel", "write_excel_encrypted"):
+        excel_path = delta.get("excel_path")
+        label_prefix = "写 Excel(密文)" if node_name == "write_excel_encrypted" else "写 Excel(明文标识 + 计算结果)"
+        out.append({"kind": "call", "label": label_prefix})
+        if excel_path:
+            # 试着也带 sheet 数量
+            sheet_n = "?"
+            try:
+                import openpyxl
+                wb = openpyxl.load_workbook(excel_path, read_only=True)
+                sheet_n = len(wb.sheetnames)
+            except Exception:
+                pass
+            out.append({
                 "kind": "result",
-                "label": f"已解密 {n} 行",
+                "label": Path(excel_path).name,
+                "detail": (f"{sheet_n} 个 sheet · " if sheet_n != "?" else "")
+                          + excel_path,
             })
-        except Exception:
-            pass
+        elif delta.get("error"):
+            out.append({"kind": "error", "label": "Excel 写入失败",
+                        "detail": str(delta["error"])[:160]})
+        return out
 
-    # 6) 写 Excel
-    excel_path = final.get("excel_path")
-    if excel_path:
-        steps.append({
-            "kind": "call",
-            "label": "写 Excel(明文标识 + 计算结果)",
-        })
-        steps.append({
-            "kind": "result",
-            "label": Path(excel_path).name,
-            "detail": f"{excel_path}",
-        })
+    if node_name == "filter_summary":
+        if delta.get("summary_filter_hit"):
+            out.append({
+                "kind": "think",
+                "label": "summary 零明文过滤 (B6-3 命中)",
+                "detail": "模型 summary 含数字 / 日期 / 长串 → 已替换为占位符",
+            })
+        # 没命中时不输出 step(不打扰主流程)
+        return out
 
-    # 7) summary 过滤(B6-3 零明文)
-    if final.get("summary_filter_hit"):
-        steps.append({
-            "kind": "think",
-            "label": "summary 零明文过滤(B6-3 命中)",
-            "detail": "模型 summary 含数字 / 日期 / 长串数字 → 已替换为占位符",
-        })
+    if node_name == "retry_llm":
+        retry = delta.get("retry_count", 0) or acc.get("retry_count", 0)
+        out.append({"kind": "think", "label": f"LLM 重试(第 {retry} 次)"})
+        return out
 
-    return steps
+    if node_name == "fallback_summary":
+        out.append({"kind": "think", "label": "fallback summary 兜底",
+                    "detail": "多次重试仍不合规 · 用 fallback 简要总结"})
+        return out
+
+    return out
 
 
 def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
     """自由聊天 —— 直接走主机 /llm/freechat,纯文本进 / 纯文本出。"""
     host_url = _session_state["host_url"]
     token = _session_state["token"]
-    steps: list[dict[str, Any]] = [
-        {"kind": "think", "label": "识别意图",
-         "detail": "未绑定密文 → 进入自由对话模式(不走 HE 工作流)"},
-        {"kind": "call", "label": "POST /llm/freechat",
-         "detail": f"system={len(FREECHAT_SYSTEM_PROMPT)} 字 · user={len(user_query)} 字"},
-    ]
+    steps: list[dict[str, Any]] = []
+    # think 立即 push
+    steps.append({"kind": "think", "label": "识别意图",
+                  "detail": "未绑定密文 → 进入自由对话模式(不走 HE 工作流)"})
+    _sessions.update_message(sid, asst_mid, steps=list(steps))
+    # call 也立即 push(在发起 httpx 之前)
+    steps.append({"kind": "call", "label": "POST /llm/freechat",
+                  "detail": f"system={len(FREECHAT_SYSTEM_PROMPT)} 字 · user={len(user_query)} 字"})
+    _sessions.update_message(sid, asst_mid, steps=list(steps))
     try:
         r = httpx.post(
             f"{host_url}/llm/freechat",
