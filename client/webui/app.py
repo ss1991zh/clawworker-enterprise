@@ -1117,6 +1117,18 @@ def _friendly_workflow_error(raw: str) -> str:
             "LLM 响应超时(> 3 分钟)· 可能是模型推理慢 / 网络抖动 / OpenRouter 排队 · "
             "稍后重试 / 换个推理快的模型(如 deepseek-chat、gpt-4o-mini)"
         )
+    if "plan op 顺序问题" in raw or "div 不能" in raw or "div 暂不支持" in raw:
+        return (
+            "LLM 给的 plan op 顺序不对 · 应该先 div(行级率)再 group_by/聚合,"
+            "而不是反过来。你可以重新提问:"
+            "「按 region 分组,先算每行的 actual/target 比率,再算每组平均」"
+            "原始错误:" + raw[:120]
+        )
+    if "could not convert string to float" in low:
+        return (
+            "数据里有非数字字符(空字符串 / 文本)· 可能上传时 NaN 处理失败 · "
+            "请去设置 → 密文文件,删掉这份密文,重新拖原文件上传(新流程会自动 fillna)"
+        )
     return raw  # 兜底:原样显示
 
 

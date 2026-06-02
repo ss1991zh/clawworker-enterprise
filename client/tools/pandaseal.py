@@ -172,8 +172,27 @@ class PandaSeal:
             #    用于"加权平均率"如 (期初金额+入库金额)/(期初数量+入库数量)
             # 3. 形式 2 + 乘子  + {multiplier: col}
             #    用于"X × 加权率"如 出库金额 = 出库数量 × (I+K)/(H+J)
-            if type(cdf).__name__ != "CipherDataFrame":
-                raise ValueError("div 当前仅支持 CipherDataFrame")
+            type_name = type(cdf).__name__
+            # 智能兜底:LLM 常出 [group_by, div] 这种乱序 → 取 GroupBy.obj 做行级 div
+            # 后续 renderer 再用 metadata 做组级聚合,语义等价于"行级率 + 组内 mean"
+            if "GroupBy" in type_name:
+                underlying = getattr(cdf, "obj", None)
+                if underlying is None:
+                    raise ValueError(
+                        "div 收到 GroupBy 对象但拿不到 underlying DataFrame · "
+                        "请让 plan 把 div 放在 group_by 之前"
+                    )
+                cdf = underlying
+                type_name = type(cdf).__name__
+            if type_name == "CipherSeries":
+                raise ValueError(
+                    "div 不能作用在 CipherSeries 上 · plan op 顺序问题:"
+                    "应先 div(actual / target) 得到行级率,再聚合(mean/sum)"
+                )
+            if type_name != "CipherDataFrame":
+                raise ValueError(
+                    f"div 暂不支持 {type_name} · 请把 div 放到 op 序列最前面"
+                )
 
             single_num = p.get("numerator") or p.get("num")
             single_den = p.get("denominator") or p.get("den")
