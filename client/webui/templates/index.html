@@ -64,25 +64,15 @@
 
     <footer>
       <div class="composer" id="composer">
-        <!-- 上下文条:当前会话绑定的多份密文 -->
-        <div class="ctx-bar" id="ctxBar" style="display:none;">
-          <!-- 动态生成已绑定 chip -->
-          <div id="ctxChips" style="display:flex; gap:8px; flex-wrap:wrap; flex:1;"></div>
-          <!-- 添加按钮 -->
-          <button class="ctx-chip ctx-add-btn" id="ctxAddBtn" type="button" title="选择已加密文件加入会话">
-            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-            <span>添加</span>
-          </button>
-        </div>
-
+        <!-- 已选密文 chip(本条消息附带的) -->
         <div class="attach-chips" id="attachChips"></div>
 
         <div class="composer-row">
-          <button class="attach-btn" id="attachBtn" type="button" title="附件:数据文件 / schema JSON">
+          <button class="attach-btn" id="attachBtn" type="button" title="选择 / 上传密文文件附给本条消息">
             <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
                  stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>
           </button>
-          <input type="file" id="fileInput" hidden multiple>
+          <input type="file" id="fileInput" hidden>
           <textarea id="input" rows="1" placeholder="问问看 · 回车发送 · Shift+回车换行" disabled></textarea>
           <button class="send" id="sendBtn" disabled>发送</button>
         </div>
@@ -94,7 +84,7 @@
         <svg class="ic-up" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/>
         </svg>
-        <span>松开鼠标 · 数据(CSV/XLSX)自动加密 · JSON 文件作为 schema</span>
+        <span>松开鼠标 · 自动加密并作为本条消息的密文附件</span>
       </div>
     </div>
   </div>

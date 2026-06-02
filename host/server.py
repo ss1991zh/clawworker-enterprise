@@ -302,6 +302,27 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
         raise HTTPException(500, f"LLM 调用失败: {e}") from e
 
     # 2b) 再 parse — 失败时把原文留日志,前端给简洁提示
+    # 空字符串特判:推理模型可能 reasoning_tokens 把 max_tokens 吃光,visible content 是空
+    if not raw_text or not raw_text.strip():
+        usage = getattr(provider, "last_usage", {}) or {}
+        print(
+            f"[/llm/chat] EMPTY response · user={sess.username} · cfg={cfg.name}\n"
+            f"  usage: {usage}\n"
+            f"  提示:推理型模型(deepseek-v4-pro / o1)的 reasoning_tokens 可能用光 max_tokens"
+        )
+        call_stats.record(
+            config=cfg, username=sess.username,
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+            success=False,
+            cost_usd=float(usage.get("cost_usd", 0.0) or 0.0),
+        )
+        raise HTTPException(
+            500,
+            "LLM 没返回任何文本(推理型模型可能 reasoning_tokens 用光 max_tokens 配额)· "
+            "解决方案:① 在 admin LLM 配置里把 max_tokens 调高(已默认 16000);"
+            "② 换非推理模型(deepseek-chat、gpt-4o-mini);③ 把 system prompt 写短一点",
+        )
     try:
         resp = parse_llm_text(raw_text)
     except ValueError as e:

@@ -1,10 +1,8 @@
 """
-会话(Chat Session)持久化 —— ChatGPT 风格客户端 UI 的状态层。
+v4 会话持久化 — 简化:不绑密文。
 
-每个 ChatSession:
-- 多轮消息(user / assistant)
-- 绑定一份"密文文件 + schema"作为会话上下文
-- JSON 落盘到 ~/.agent-system/sessions/{id}.json,重启后还在
+用户每条消息可以带 attached_cipher,会被记到 message.attached_cipher。
+新建会话不需要预先选密文,LLM 在 schema 缺失时会追问。
 """
 
 from __future__ import annotations
@@ -26,19 +24,18 @@ class Message:
     id: str
     role: str                                 # user / assistant
     content: str = ""
-    attachments: list[dict[str, Any]] = field(default_factory=list)
+    # user-only:用户在这条消息附带的密文文件(可为空,自动沿用上一条 user 消息的)
+    attached_cipher: str = ""
     # assistant-only:
-    summary: str = ""                          # workflow 总结(已过滤)
-    excel_path: str = ""                       # 生成的 Excel 路径
-    excel_name: str = ""                       # Excel 文件名
+    summary: str = ""
+    excel_path: str = ""
+    excel_name: str = ""
     error: str = ""
-    scenario: str = ""
-    plan_summary: str = ""
-    # 每一步执行追踪 — 给"计算追踪"折叠面板用
-    # [{kind: think|call|result|error, label: str, detail: str(optional)}]
+    skill_calls: list[str] = field(default_factory=list)   # 跑了哪些 skill 名
     steps: list[dict[str, Any]] = field(default_factory=list)
-    status: str = "done"                       # pending / running / done / failed
+    status: str = "done"                       # pending / running / done / failed / needs_cipher
     duration_sec: float = 0.0
+    used_cipher: str = ""                      # assistant 实际用了哪份 cipher
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -50,16 +47,16 @@ class Message:
             id=d.get("id", secrets.token_hex(6)),
             role=d.get("role", "user"),
             content=d.get("content", ""),
-            attachments=list(d.get("attachments", []) or []),
+            attached_cipher=d.get("attached_cipher", "") or d.get("attached_cipher_path", ""),
             summary=d.get("summary", ""),
             excel_path=d.get("excel_path", ""),
             excel_name=d.get("excel_name", ""),
             error=d.get("error", ""),
-            scenario=d.get("scenario", ""),
-            plan_summary=d.get("plan_summary", ""),
+            skill_calls=list(d.get("skill_calls", []) or []),
             steps=list(d.get("steps", []) or []),
             status=d.get("status", "done"),
             duration_sec=float(d.get("duration_sec", 0.0) or 0.0),
+            used_cipher=d.get("used_cipher", ""),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
         )
 
@@ -71,12 +68,6 @@ class ChatSession:
     username: str
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
-    # 会话上下文:绑定的密文(支持多个)+ schema
-    # context_ciphertext: 主密文(向后兼容,等于 context_ciphertexts[0])
-    # context_ciphertexts: 全部绑定密文(允许多文件)
-    context_ciphertext: str = ""
-    context_ciphertexts: list[str] = field(default_factory=list)
-    context_schema: str = ""
     messages: list[Message] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -86,31 +77,25 @@ class ChatSession:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> "ChatSession":
-        ciphertext = d.get("context_ciphertext", "")
-        ciphertexts = list(d.get("context_ciphertexts") or [])
-        # 老会话只有 context_ciphertext → 自动迁到 list
-        if ciphertext and not ciphertexts:
-            ciphertexts = [ciphertext]
-        # 反过来:list 有但 str 没,补 str 字段
-        elif ciphertexts and not ciphertext:
-            ciphertext = ciphertexts[0]
         sess = cls(
             id=d["id"],
             title=d.get("title", "新会话"),
             username=d.get("username", ""),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
             updated_at=d.get("updated_at", datetime.now().isoformat(timespec="seconds")),
-            context_ciphertext=ciphertext,
-            context_ciphertexts=ciphertexts,
-            context_schema=d.get("context_schema", ""),
         )
         sess.messages = [Message.from_dict(m) for m in d.get("messages", []) or []]
         return sess
 
+    def last_attached_cipher(self) -> str:
+        """从消息历史里找最近一次 user 消息附带的密文(用于"追问沿用")。"""
+        for m in reversed(self.messages):
+            if m.role == "user" and m.attached_cipher:
+                return m.attached_cipher
+        return ""
+
 
 class SessionStore:
-    """ChatSession 持久化(每会话 1 个 JSON 文件)。"""
-
     def __init__(self, root: Optional[Path] = None):
         self._root = root or SESSIONS_DIR
         self._root.mkdir(parents=True, exist_ok=True)
@@ -125,7 +110,6 @@ class SessionStore:
         for p in sorted(self._root.glob("*.json")):
             try:
                 sess = ChatSession.from_dict(json.loads(p.read_text(encoding="utf-8")))
-                # 运行中的 assistant 消息在进程重启后视为失败
                 for m in sess.messages:
                     if m.role == "assistant" and m.status in ("pending", "running"):
                         m.status = "failed"
@@ -143,7 +127,6 @@ class SessionStore:
         except Exception:
             pass
 
-    # ----- CRUD -----
     def list_for(self, username: str) -> list[ChatSession]:
         out = [s for s in self._sessions.values() if s.username == username]
         out.sort(key=lambda s: s.updated_at, reverse=True)
@@ -180,7 +163,6 @@ class SessionStore:
         with self._lock:
             sess.messages.append(message)
             sess.updated_at = datetime.now().isoformat(timespec="seconds")
-            # 用首条用户消息做标题(若仍是"新会话")
             if sess.title in ("新会话", "") and message.role == "user" and message.content:
                 sess.title = message.content[:40]
             self._save(sess)
@@ -199,52 +181,6 @@ class SessionStore:
                     self._save(sess)
                     return m
         return None
-
-    def set_context(self, sid: str, *,
-                    ciphertext: Optional[str] = None,
-                    ciphertexts: Optional[list[str]] = None,
-                    schema: Optional[str] = None) -> None:
-        sess = self._sessions.get(sid)
-        if not sess:
-            return
-        with self._lock:
-            if ciphertexts is not None:
-                # 完整替换列表
-                sess.context_ciphertexts = list(ciphertexts)
-                sess.context_ciphertext = ciphertexts[0] if ciphertexts else ""
-            elif ciphertext is not None:
-                # 兼容老接口:单文件设置 → 同时同步 list
-                sess.context_ciphertext = ciphertext
-                sess.context_ciphertexts = [ciphertext] if ciphertext else []
-            if schema is not None:
-                sess.context_schema = schema
-            self._save(sess)
-
-    def add_ciphertext(self, sid: str, path: str) -> None:
-        """往会话已绑定的密文 list 里追加(去重)"""
-        sess = self._sessions.get(sid)
-        if not sess:
-            return
-        with self._lock:
-            if path not in sess.context_ciphertexts:
-                sess.context_ciphertexts.append(path)
-                if not sess.context_ciphertext:
-                    sess.context_ciphertext = path
-                self._save(sess)
-
-    def remove_ciphertext(self, sid: str, path: str) -> None:
-        """从会话密文 list 里移除一项"""
-        sess = self._sessions.get(sid)
-        if not sess:
-            return
-        with self._lock:
-            if path in sess.context_ciphertexts:
-                sess.context_ciphertexts.remove(path)
-            if sess.context_ciphertext == path:
-                sess.context_ciphertext = (
-                    sess.context_ciphertexts[0] if sess.context_ciphertexts else ""
-                )
-            self._save(sess)
 
     def rename(self, sid: str, title: str) -> None:
         sess = self._sessions.get(sid)

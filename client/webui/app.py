@@ -1,48 +1,25 @@
 """
-客户端 Web UI(ChatGPT 风格,单页应用)。
+v4 客户端 Web UI 主入口 — skill-only 架构,无 LangGraph。
 
-启动:uvicorn client.webui:app --host 127.0.0.1 --port 8444
-
-设计:
-- 单用户桌面应用 → 进程内 session(假设本机访问)
-- 配置(host_url / backend)持久化到 ~/.agent-system/client-config.json
-- 多会话(ChatSession)持久化到 ~/.agent-system/sessions/{id}.json
-- 每次提问 → 后台线程跑 workflow → 前端 polling assistant message status
-
-主路由:
-- GET  /              单页 chat UI(未登录跳 /login)
-- GET  /login         登录页
-- POST /login         登录提交
-- POST /logout
-
-JSON API(给前端 JS 调):
-- GET    /api/me                     当前会话信息(用户名 / token 过期)
-- GET    /api/config                 本地配置(host_url / backend / auto_approve)
-- POST   /api/config                 保存本地配置
-- GET    /api/keys                   密钥状态
-- POST   /api/keys                   上传 sk / evk / user_auth(multipart)
-
-- GET    /api/files                  本地密文文件列表
-- POST   /api/files/upload           上传原始数据 → 加密入库(可附 meta)
-- DELETE /api/files/{name}           删除密文 + meta sidecar
-
-- GET    /api/sessions               会话列表
-- POST   /api/sessions               新建空会话
-- DELETE /api/sessions/{sid}         删除会话
-- POST   /api/sessions/{sid}/title   重命名会话
-- POST   /api/sessions/{sid}/context 设置会话上下文(ciphertext / schema)
-
-- GET    /api/sessions/{sid}/messages          所有消息
-- POST   /api/sessions/{sid}/messages          发送一条用户消息 → 起后台 job
-- GET    /api/sessions/{sid}/messages/{mid}    单条消息(给前端 polling 用)
-
-- GET    /api/excel/{filename}/download       下载某次任务产出的 Excel
+路由极简:
+  /login              登录页
+  /                   chat 主页(需要登录)
+  /api/me             当前用户信息
+  /api/config         本地配置 get/set
+  /api/keys           密钥状态 + 上传
+  /api/keys/fetch_auth  从主机拉证书副本
+  /api/files          密文文件列表 / 上传 / 删除 / preview
+  /api/sessions       会话 CRUD
+  /api/sessions/{sid}/messages         发送消息(走 pipeline.ask)+ 拉历史
+  /api/sessions/{sid}/messages/{mid}   轮询单条 assistant 消息
+  /api/excel/download                  下载 ~/Downloads/ 下的 xlsx
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import tempfile
 import threading
@@ -60,63 +37,34 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from client.keystore import Keystore
-from client.llm_client import HTTPLLMClient
 from client.local_storage import LocalStorage
-from client.permissions import AutoApproveAuthorizer
-from client.skill_workflow import build_workflow
-from client.tools import HELearn, HENumpy, HETorch, PandaSeal, ZFHE
+from client.tools.crypto import ZFHE
+from client.webui import pipeline as pipeline_mod
 from client.webui.sessions import ChatSession, Message, SessionStore
+from shared.prompts import load_system_prompt
 
-# ---------------------------------------------------------------------------
-# 路径
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 路径 / 配置
+# ----------------------------------------------------------------------------
 
 _WEBUI_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_WEBUI_DIR / "templates"))
 
-
-def _asset_version() -> str:
-    """
-    用 static/app.js + app.css 的最大 mtime 当版本号,
-    每次代码变动后浏览器自动拉新版,无需用户清缓存。
-    """
-    try:
-        mtimes = [
-            (_WEBUI_DIR / "static" / "app.js").stat().st_mtime,
-            (_WEBUI_DIR / "static" / "app.css").stat().st_mtime,
-        ]
-        return str(int(max(mtimes)))
-    except OSError:
-        return "0"
-
 APP_DATA_DIR = Path.home() / ".agent-system"
 CLIENT_CONFIG_FILE = APP_DATA_DIR / "client-config.json"
 
-
-# ---------------------------------------------------------------------------
-# 进程内状态(单用户桌面应用)
-# ---------------------------------------------------------------------------
-
 _lock = threading.Lock()
-
-_session_state: dict[str, Any] = {
-    "host_url": "",
-    "username": "",
-    "token": "",
-    "expires_at": "",
-}
+_session_state: dict[str, Any] = {"host_url": "", "username": "", "token": "", "expires_at": ""}
 
 
 def _load_config() -> dict[str, Any]:
     defaults = {
         "host_url": "http://127.0.0.1:8443",
-        "backend": "stub",
-        "auto_approve": True,    # Web UI 模式默认自动通过(没有 stdin 交互)
+        "backend": "real",
     }
     if CLIENT_CONFIG_FILE.exists():
         try:
-            data = json.loads(CLIENT_CONFIG_FILE.read_text(encoding="utf-8"))
-            return {**defaults, **data}
+            return {**defaults, **json.loads(CLIENT_CONFIG_FILE.read_text(encoding="utf-8"))}
         except Exception:
             pass
     return defaults
@@ -135,11 +83,11 @@ _keystore = Keystore()
 _sessions = SessionStore()
 
 
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # FastAPI app
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
-app = FastAPI(title="agent-system client", version="0.2.0")
+app = FastAPI(title="agent-system client", version="0.4.0")
 app.mount("/static", StaticFiles(directory=str(_WEBUI_DIR / "static")), name="static")
 
 
@@ -152,19 +100,14 @@ def _need_login() -> JSONResponse:
 
 
 def _clear_local_session() -> None:
-    """主机告诉我们 session 失效时,清掉本机 state,
-    下次前端调任何 /api/* 都会收到 401 not_logged_in → JS 跳 /login。"""
     with _lock:
-        _session_state.update({
-            "host_url": "", "username": "", "token": "", "expires_at": "",
-        })
+        _session_state.update({"host_url": "", "username": "", "token": "", "expires_at": ""})
 
 
 def _flash_redirect(url: str, *messages: tuple[str, str]) -> RedirectResponse:
     if messages:
         parts = [f"_flash={quote(f'{c}|{m}', safe='')}" for c, m in messages]
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}{'&'.join(parts)}"
+        url = f"{url}{'&' if '?' in url else '?'}{'&'.join(parts)}"
     return RedirectResponse(url, status_code=303)
 
 
@@ -177,9 +120,20 @@ def _pop_messages(request: Request) -> list[tuple[str, str]]:
     return out
 
 
-# ---------------------------------------------------------------------------
-# 登录 / 登出 / 主页
-# ---------------------------------------------------------------------------
+def _asset_version() -> str:
+    try:
+        mtimes = [
+            (_WEBUI_DIR / "static" / "app.js").stat().st_mtime,
+            (_WEBUI_DIR / "static" / "app.css").stat().st_mtime,
+        ]
+        return str(int(max(mtimes)))
+    except OSError:
+        return "0"
+
+
+# ----------------------------------------------------------------------------
+# 登录 / 主页
+# ----------------------------------------------------------------------------
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -188,10 +142,7 @@ def index(request: Request):
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
         request, "index.html",
-        {
-            "username": _session_state["username"],
-            "asset_ver": _asset_version(),
-        },
+        {"username": _session_state["username"], "asset_ver": _asset_version()},
     )
 
 
@@ -235,10 +186,8 @@ def login_submit(
     body = r.json()
     with _lock:
         _session_state.update({
-            "host_url": host_url,
-            "username": username,
-            "token": body["token"],
-            "expires_at": body["expires_at"],
+            "host_url": host_url, "username": username,
+            "token": body["token"], "expires_at": body["expires_at"],
         })
         _config["host_url"] = host_url
         _save_config(_config)
@@ -247,14 +196,13 @@ def login_submit(
 
 @app.post("/logout")
 def logout():
-    with _lock:
-        _session_state.update({"host_url": "", "username": "", "token": "", "expires_at": ""})
+    _clear_local_session()
     return JSONResponse({"ok": True})
 
 
-# ---------------------------------------------------------------------------
-# JSON API:用户 / 配置 / 密钥
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# /api/me /api/config /api/keys
+# ----------------------------------------------------------------------------
 
 
 @app.get("/api/me")
@@ -285,8 +233,6 @@ async def api_config_set(request: Request):
             _config["host_url"] = str(data["host_url"]).rstrip("/")
         if "backend" in data and data["backend"] in ("stub", "real"):
             _config["backend"] = data["backend"]
-        if "auto_approve" in data:
-            _config["auto_approve"] = bool(data["auto_approve"])
         _save_config(_config)
     return _config
 
@@ -295,32 +241,19 @@ async def api_config_set(request: Request):
 def api_keys_get():
     if not _is_logged_in():
         return _need_login()
-    username = _session_state["username"]
-    keys = _keystore.get_paths(username)
-    # 即便没全套密钥,也能返回沙盒目录(给 UI 提示)
-    vault = _keystore.vault_path(username)
-    audit = _keystore.sandbox_audit(username)
-    sk_p = vault / "sk.bin"
-    evk_p = vault / "evk.bin"
-    auth_p = vault / "user_authorization"
+    keys = _keystore.get_paths(_session_state["username"])
     return {
-        "sk_present": sk_p.exists(),
-        "sk_path": str(sk_p),
-        "sk_size": sk_p.stat().st_size if sk_p.exists() else 0,
-        "evk_present": evk_p.exists(),
-        "evk_path": str(evk_p),
-        "evk_size": evk_p.stat().st_size if evk_p.exists() else 0,
-        "user_auth_present": auth_p.exists(),
-        "user_auth_path": str(auth_p),
-        "user_auth_size": auth_p.stat().st_size if auth_p.exists() else 0,
-        "vault_path": str(vault),
-        "sandbox": audit,
+        "sk_present": bool(keys and keys.sk_path.exists()),
+        "sk_path": str(keys.sk_path) if keys else "",
+        "evk_present": bool(keys and keys.evk_path.exists()),
+        "evk_path": str(keys.evk_path) if keys else "",
+        "user_auth_present": bool(keys and keys.user_auth_path and keys.user_auth_path.exists()),
+        "user_auth_path": str(keys.user_auth_path) if keys and keys.user_auth_path else "",
     }
 
 
 @app.post("/api/keys/sk")
 async def api_keys_upload_sk(file: UploadFile = File(...)):
-    """单独上传 sk(解密密钥)→ 沙盒。"""
     if not _is_logged_in():
         return _need_login()
     data = await file.read()
@@ -337,7 +270,6 @@ async def api_keys_upload_sk(file: UploadFile = File(...)):
 
 @app.post("/api/keys/evk")
 async def api_keys_upload_evk(file: UploadFile = File(...)):
-    """单独上传 evk(计算密钥)→ 沙盒。"""
     if not _is_logged_in():
         return _need_login()
     data = await file.read()
@@ -354,22 +286,10 @@ async def api_keys_upload_evk(file: UploadFile = File(...)):
 
 @app.post("/api/keys/fetch_auth")
 def api_keys_fetch_auth():
-    """
-    从主机 admin 端拉取当前用户绑定的 user_authorization 文件,
-    存到本地沙盒。这是证书的唯一来源(用户不能上传)。
-
-    错误处理:
-    - 客户端自己没登录 → 401(JS 会重定向到 /login,正常)
-    - 主机端任何非 200(包括 401 / 404 / 502)→ 统一返回 502 + 中文 message
-      这样浏览器看到的是"下游错误",不会被 JS 误认为"客户端 session 过期"
-      而触发自动 /login 跳转(否则点一次按钮设置页就被踢出)
-    """
     if not _is_logged_in():
         return _need_login()
-    username = _session_state["username"]
     host_url = _session_state["host_url"]
     token = _session_state["token"]
-
     try:
         r = httpx.get(
             f"{host_url}/auth/user_authorization",
@@ -377,65 +297,24 @@ def api_keys_fetch_auth():
             timeout=30,
         )
     except httpx.HTTPError as e:
-        raise HTTPException(502, f"无法连接主机({host_url}):{type(e).__name__}: {e}")
-
+        raise HTTPException(502, f"无法连接主机:{type(e).__name__}: {e}")
+    if r.status_code == 401:
+        _clear_local_session()
+        raise HTTPException(502, "主机拒绝(session 已过期)· 请退出后重新登录")
     if r.status_code != 200:
-        try:
-            detail = r.json().get("detail", "")
-        except Exception:
-            detail = r.text[:200]
-        # 主机告诉我们 session 失效 → 顺手清掉本地 session,告知用户重新登录
-        if r.status_code == 401:
-            with _lock:
-                _session_state.update({"host_url": "", "username": "", "token": "", "expires_at": ""})
-            raise HTTPException(
-                502,
-                f"主机拒绝(401):{detail or 'session 已过期'}。"
-                f"请退出登录后用新密码 / 新 token 重新登录。",
-            )
-        if r.status_code == 404:
-            raise HTTPException(
-                502,
-                f"主机找不到此用户的授权(404):{detail or 'admin 端可能已删除或吊销证书'}。"
-                f"请联系管理员重新颁发。",
-            )
-        # 其他 4xx/5xx 一律包装成 502,绝不原样把 401/403 透到浏览器,以免 JS 误判
-        raise HTTPException(502, f"主机拒绝({r.status_code}):{detail or r.reason_phrase}")
-
-    if not r.content:
-        raise HTTPException(502, "主机返回空文件")
-
+        raise HTTPException(502, f"主机拒绝({r.status_code}):{r.text[:200]}")
     with tempfile.NamedTemporaryFile(delete=False) as t:
         t.write(r.content); tmp = Path(t.name)
     try:
-        dst = _keystore.import_user_authorization(username=username, source=tmp)
-        return {
-            "ok": True,
-            "path": str(dst),
-            "size_bytes": dst.stat().st_size,
-            "source": "host",
-        }
+        dst = _keystore.import_user_authorization(username=_session_state["username"], source=tmp)
+        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
     finally:
         tmp.unlink(missing_ok=True)
 
 
-@app.delete("/api/keys/{name}")
-def api_keys_delete(name: str):
-    """删除某把密钥(sk / evk / user_authorization),重新从源处拉。"""
-    if not _is_logged_in():
-        return _need_login()
-    if name not in ("sk", "evk", "user_authorization"):
-        raise HTTPException(400, f"未知密钥名:{name}")
-    vault = _keystore.vault_path(_session_state["username"])
-    target = vault / ("sk.bin" if name == "sk" else "evk.bin" if name == "evk" else "user_authorization")
-    if target.exists():
-        target.unlink()
-    return {"ok": True}
-
-
-# ---------------------------------------------------------------------------
-# JSON API:密文文件
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# /api/files
+# ----------------------------------------------------------------------------
 
 
 @app.get("/api/files")
@@ -447,40 +326,88 @@ def api_files_list():
         all_paths = _storage.list_ciphertexts()
     except Exception:
         all_paths = []
-    meta_names = {p.name for p in all_paths if p.name.endswith(".meta.csv")}
     for p in all_paths:
-        # sidecar 不显示在列表里(meta / schema 是同 cipher 的辅助)
         if p.name.endswith(".meta.csv") or p.name.endswith(".schema.json"):
             continue
         size = p.stat().st_size if p.exists() else 0
+        meta_p = p.with_suffix(p.suffix + ".meta.csv")
         out.append({
             "name": p.name,
             "path": str(p),
             "size_kb": round(size / 1024, 1),
             "mtime": datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
-            "has_meta": (p.name + ".meta.csv") in meta_names,
+            "has_meta": meta_p.exists(),
         })
     out.sort(key=lambda f: f["mtime"], reverse=True)
     return out
 
 
+def _smart_read(path: Path, suffix: str):
+    """智能读表 + 找真实表头 + 选数据丰满的 sheet。"""
+    import pandas as pd
+
+    def _is_bad(df_) -> bool:
+        cols = [str(c) for c in df_.columns]
+        if not cols:
+            return True
+        bad = sum(1 for c in cols if c.startswith("Unnamed:") or not c.strip() or c.startswith("nan"))
+        return bad >= max(1, len(cols) // 2)
+
+    if suffix == ".csv":
+        try:
+            df = pd.read_csv(path)
+            if _is_bad(df) or (len(df.columns) == 1 and "," in path.read_text(errors="replace")[:300]):
+                import csv
+                with open(path, encoding="utf-8") as f:
+                    rows = list(csv.reader(f))
+                # 找前 10 行最像表头的
+                best, best_n = 0, -1
+                for i, r in enumerate(rows[:10]):
+                    s = sum(1 for v in r if v and v.strip())
+                    if s >= 2 and s > best_n:
+                        best, best_n = i, s
+                df = pd.read_csv(path, skiprows=best)
+                return df, "csv", best
+            return df, "csv", 0
+        except Exception:
+            raise
+
+    # xlsx
+    all_sheets = pd.read_excel(path, sheet_name=None)
+    best_name, best_score = None, -1
+    for n, sh in all_sheets.items():
+        if sh is None or sh.empty:
+            continue
+        score = sh.shape[0] * (sh.select_dtypes(include="number").shape[1] + 1) + sh.shape[1]
+        if score > best_score:
+            best_name, best_score = n, score
+    if best_name is None:
+        first = next(iter(all_sheets))
+        return all_sheets[first], str(first), 0
+    df = all_sheets[best_name]
+    header_row = 0
+    if _is_bad(df):
+        raw = pd.read_excel(path, sheet_name=best_name, header=None)
+        for i in range(min(10, len(raw))):
+            r = raw.iloc[i].tolist()
+            s = sum(1 for v in r if isinstance(v, str) and v.strip())
+            if s >= 2:
+                header_row = i
+                break
+        if header_row > 0:
+            df = pd.read_excel(path, sheet_name=best_name, header=header_row)
+    return df, str(best_name), header_row
+
+
 @app.post("/api/files/upload")
 async def api_files_upload(raw_file: UploadFile = File(...)):
-    """
-    上传原始数据 → 自动:
-    1. pandas 读出全部列,按 dtype 拆分:数字列加密入库,字符串列做明文 meta sidecar
-    2. 自动推断 schema(columns / encrypted / metadata_columns / primary_key)
-       并落到 *.cipher.schema.json 旁挂
-
-    用户不需要再单独上传 meta 或粘 schema:把原始 CSV/XLSX 一拖即可。
-    """
     if not _is_logged_in():
         return _need_login()
     username = _session_state["username"]
     keys = _keystore.get_paths(username)
     sk_path = keys.sk_path if keys else None
     evk_path = keys.evk_path if keys else None
-    backend = _config.get("backend", "stub")
+    backend = _config.get("backend", "real")
 
     raw_bytes = await raw_file.read()
     if not raw_bytes:
@@ -493,41 +420,24 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         tmp.write(raw_bytes); tmp_path = Path(tmp.name)
 
     try:
-        # ----- 1) 智能读表:挑数据最丰满的 sheet + 自动找表头行 -----
         import pandas as pd
         try:
-            df, sheet_name, header_row = _smart_read_tabular(tmp_path, raw_suffix)
+            df, sheet_name, header_row = _smart_read(tmp_path, raw_suffix)
         except Exception as e:
             raise HTTPException(400, f"无法解析文件:{type(e).__name__}: {e}")
-
-        if df is None or df.empty or df.shape[1] == 0:
+        if df.empty or df.shape[1] == 0:
             raise HTTPException(400, "文件没有任何列")
 
+        all_cols = df.columns.tolist()
+        if all(str(c).startswith("Unnamed:") for c in all_cols):
+            raise HTTPException(400, "无法识别表头(所有列都是 Unnamed)")
         string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
         numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-        all_cols = df.columns.tolist()
 
-        # 列名仍然全是 Unnamed → 警告(尽量别让 LLM 看到 Unnamed 列名)
-        if all(str(c).startswith("Unnamed:") for c in all_cols):
-            raise HTTPException(
-                400,
-                "无法识别表头(所有列都是 Unnamed)· 请确认文件第一行是字段名,"
-                "或第一行 / 第二行是不是被合并单元格 / 标题占了",
-            )
-
-        # ----- 2) 加密入库:仅数字列,**保留原文件类型** -----
-        # csv 输入  → ct.encrypt_csv  → 落 *_enc.csv
-        # xlsx 输入 → ct.encrypt_excel → 落 *_enc.xlsx
-        # 后端在 client/tools/crypto.py _real_encrypt_file 里给 ct.encrypt_excel
-        # 强制传 input_index_col=None,防止第一列被当成 index 不加密(否则会丢列)
         stem = Path(raw_file.filename or "data").stem
-        if backend == "real":
-            cipher_suffix = raw_suffix  # 跟原文件类型一致
-        else:
-            cipher_suffix = f"{raw_suffix}.cipher"
+        cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
         dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
 
-        # 统计 NaN(给前端反馈),加密前填 0 兜底
         nan_counts = {}
         if numeric_cols:
             num_df = df[numeric_cols].copy()
@@ -536,7 +446,6 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
                 if cnt > 0:
                     nan_counts[col] = cnt
             num_df = num_df.fillna(0)
-
             with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
                 num_tmp = Path(t2.name)
             try:
@@ -549,25 +458,20 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
             finally:
                 num_tmp.unlink(missing_ok=True)
         else:
-            # 全是字符串列?写空文件让 list_ciphertexts 能看到
             dst.write_bytes(b"")
 
-        # ----- 3) 自动 meta sidecar(身份/标签列)-----
         meta_path = ""
         if string_cols:
             meta_dst = dst.with_suffix(dst.suffix + ".meta.csv")
             df[string_cols].to_csv(meta_dst, index=False)
             meta_path = str(meta_dst)
 
-        # ----- 4) 自动 schema sidecar -----
+        # 自动 schema
         schema = {
             "scenario": "auto",
             "columns": [
-                {
-                    "name": c,
-                    "encrypted": c in numeric_cols,
-                    "type": "float" if c in numeric_cols else "string",
-                }
+                {"name": c, "encrypted": c in numeric_cols,
+                 "type": "float" if c in numeric_cols else "string"}
                 for c in all_cols
             ],
             "metadata_columns": string_cols,
@@ -577,158 +481,18 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
 
         return {
-            "name": dst.name,
-            "path": str(dst),
+            "name": dst.name, "path": str(dst),
             "size_kb": round(dst.stat().st_size / 1024, 1) if dst.exists() else 0,
             "backend": backend,
-            "meta_path": meta_path,
-            "schema_path": str(schema_dst),
-            "encrypted_columns": numeric_cols,
-            "plaintext_columns": string_cols,
+            "meta_path": meta_path, "schema_path": str(schema_dst),
+            "encrypted_columns": numeric_cols, "plaintext_columns": string_cols,
             "row_count": len(df),
-            # 解析出处:让前端 / 日志能看到我们到底从哪个 sheet、哪行起识别
-            "sheet_name": sheet_name,
-            "header_row": header_row,
+            "sheet_name": sheet_name, "header_row": header_row,
             "column_preview": all_cols[:8],
-            # 哪些数字列含空值被填了 0(HE 不能 encrypt 空字符串)
             "nan_filled": nan_counts,
         }
     finally:
         tmp_path.unlink(missing_ok=True)
-
-
-# ---------------------------------------------------------------------------
-# 智能读表(挑数据最丰满的 sheet + 找真实表头行)
-# ---------------------------------------------------------------------------
-
-
-def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
-    """
-    返回 (DataFrame, sheet_name, header_row_index)。
-
-    CSV: 只有一张表,但仍要找表头(可能前几行是标题/空行/合并单元格)
-    XLSX:
-      1. 把所有 sheet 都读出来,选"信息量最大"的(行数 × 数字列数)
-      2. 在那个 sheet 上找出第一行真正的列名
-    """
-    import pandas as pd
-
-    def _looks_bad(df_) -> bool:
-        """
-        坏表头判定:
-        a) 一半以上的列名是 'Unnamed:' / 空 / 'nan'
-        b) 后续行的非空单元格数明显多于列数(说明 header 行选错了 → pandas 用单列容纳了一整行标题)
-        """
-        cols_s = [str(c) for c in df_.columns.tolist()]
-        if not cols_s:
-            return True
-        bad_count = sum(
-            1 for c in cols_s
-            if c.startswith("Unnamed:") or c.strip() == "" or c.startswith("nan")
-        )
-        if bad_count >= max(1, len(cols_s) // 2):
-            return True
-        # b) 看前 5 行有效行的最大列数 vs 当前列数
-        try:
-            sample = df_.head(5).fillna("")
-            max_filled = max(
-                sum(1 for v in row if str(v).strip()) for _, row in sample.iterrows()
-            ) if len(sample) > 0 else 0
-            if max_filled > len(cols_s) * 1.5:
-                return True
-        except Exception:
-            pass
-        return False
-
-    def _find_header_row(raw_no_header, prev_cols_count: int = 1) -> int:
-        """
-        从前 10 行里找最像表头的:
-        优先选 字符串单元格数最多、且 ≥ prev_cols_count 的那一行
-        """
-        best_i = 0
-        best_score = -1
-        for i in range(min(10, len(raw_no_header))):
-            row = raw_no_header.iloc[i].tolist()
-            sc = sum(1 for v in row if isinstance(v, str) and v.strip())
-            if sc >= max(2, prev_cols_count) and sc > best_score:
-                best_score = sc
-                best_i = i
-        return best_i
-
-    def _retry_with_header(reader, df_default):
-        """通用重试:先 header=None 读 raw,找到表头行,重读。"""
-        try:
-            raw = reader(header=None)
-        except Exception:
-            # C engine 不接受列数不一致;换 python engine 兜底
-            raw = reader(header=None, engine="python")
-        # 注意:不能用 len(df_default.columns)+1 做下限 —— 旧 df 的列数
-        # 来自坏 header(可能比真实少),会把对的表头排除掉。这里只要 ≥2。
-        h = _find_header_row(raw, prev_cols_count=2)
-        try:
-            return reader(header=h), h
-        except Exception:
-            return reader(header=h, engine="python"), h
-
-    if suffix == ".csv":
-        df = pd.read_csv(path)
-        # CSV 检测加一个简单 sanity:列数=1 但文件里有逗号 → 多半 header 不对
-        if _looks_bad(df) or (
-            len(df.columns) == 1 and "," in path.read_text(encoding="utf-8", errors="replace")[:500]
-        ):
-            # 用标准库 csv 绕开 pandas 的"列数不一致就抛 ParserError",
-            # 自己找 header 行,再 skiprows= 让 pandas 从那一行起读
-            import csv as _csv
-            try:
-                with path.open("r", encoding="utf-8", newline="") as f:
-                    raw_rows = list(_csv.reader(f))
-            except UnicodeDecodeError:
-                with path.open("r", encoding="gbk", newline="", errors="replace") as f:
-                    raw_rows = list(_csv.reader(f))
-            header_idx = 0
-            best_score = -1
-            for i in range(min(10, len(raw_rows))):
-                row = raw_rows[i]
-                # 非空字符串单元格数,且总单元格数 ≥ 2(防止单列文件)
-                str_cnt = sum(1 for v in row if v and v.strip())
-                if str_cnt >= 2 and str_cnt > best_score:
-                    best_score = str_cnt
-                    header_idx = i
-            try:
-                df2 = pd.read_csv(path, skiprows=header_idx)
-                return df2, "csv", header_idx
-            except Exception:
-                # 实在解析不了,把发现的列数 / 行数告诉用户
-                pass
-        return df, "csv", 0
-
-    # XLSX: 选最像数据的 sheet
-    all_sheets = pd.read_excel(path, sheet_name=None)
-    if not all_sheets:
-        raise ValueError("xlsx 文件没有任何 sheet")
-    best_name = None
-    best_score = -1
-    for name, sheet in all_sheets.items():
-        if sheet is None or sheet.empty:
-            continue
-        nrows, ncols = sheet.shape
-        num_cols = sheet.select_dtypes(include=["number"]).shape[1]
-        score = nrows * (num_cols + 1) + ncols
-        if score > best_score:
-            best_name = name
-            best_score = score
-    if best_name is None:
-        # 全是空 sheet,返回第一个让上层判定
-        first = next(iter(all_sheets))
-        return all_sheets[first], str(first), 0
-
-    df = all_sheets[best_name]
-    header_row = 0
-    if _looks_bad(df):
-        df, header_row = _retry_with_header(
-            lambda **kw: pd.read_excel(path, sheet_name=best_name, **kw), df,
-        )
-    return df, str(best_name), header_row
 
 
 @app.delete("/api/files/{name}")
@@ -746,26 +510,15 @@ def api_files_delete(name: str):
 
 @app.get("/api/files/{name}/preview")
 def api_files_preview(name: str):
-    """
-    展示密文文件的"可见内容":
-    - meta sidecar 的前 N 行(身份列明文)
-    - schema 推断结果(列名 + 加密/明文标记)
-    - 文件大小 / 行数 / 列数等元信息
-    密文 cipher 本身是二进制,不可读;这里只展示 sidecar 内容。
-    """
     if not _is_logged_in():
         return _need_login()
     target = _storage.ciphertext_dir / name
     if not target.exists() or not target.is_relative_to(_storage.ciphertext_dir):
         raise HTTPException(404, "文件不存在或路径非法")
-
     info: dict[str, Any] = {
-        "name": target.name,
-        "path": str(target),
+        "name": target.name, "path": str(target),
         "size_kb": round(target.stat().st_size / 1024, 1),
     }
-
-    # meta sidecar
     meta_p = target.with_suffix(target.suffix + ".meta.csv")
     if meta_p.exists():
         try:
@@ -773,17 +526,11 @@ def api_files_preview(name: str):
             meta_df = pd.read_csv(meta_p)
             info["meta_columns"] = list(meta_df.columns)
             info["meta_row_count"] = len(meta_df)
-            # 前 8 行预览,转 str 让 JSON 安全
-            preview_rows = meta_df.head(8).fillna("").astype(str).values.tolist()
-            info["meta_preview"] = preview_rows
+            info["meta_preview"] = meta_df.head(8).fillna("").astype(str).values.tolist()
         except Exception as e:
             info["meta_error"] = str(e)
     else:
-        info["meta_columns"] = []
-        info["meta_preview"] = []
-        info["meta_row_count"] = 0
-
-    # schema sidecar
+        info.update({"meta_columns": [], "meta_preview": [], "meta_row_count": 0})
     schema_p = target.with_suffix(target.suffix + ".schema.json")
     if schema_p.exists():
         try:
@@ -795,9 +542,9 @@ def api_files_preview(name: str):
     return info
 
 
-# ---------------------------------------------------------------------------
-# JSON API:会话 + 消息
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# /api/sessions
+# ----------------------------------------------------------------------------
 
 
 def _sess_for_user(sid: str) -> ChatSession:
@@ -816,8 +563,6 @@ def api_sessions_list():
             "id": s.id, "title": s.title,
             "created_at": s.created_at, "updated_at": s.updated_at,
             "message_count": len(s.messages),
-            "context_ciphertext": Path(s.context_ciphertext).name if s.context_ciphertext else "",
-            "has_schema": bool(s.context_schema),
         }
         for s in _sessions.list_for(_session_state["username"])
     ]
@@ -850,89 +595,13 @@ async def api_sessions_rename(sid: str, request: Request):
     return {"ok": True}
 
 
-@app.post("/api/sessions/{sid}/context")
-async def api_sessions_set_context(sid: str, request: Request):
-    """
-    设置会话上下文。新约定:schema 默认不需要前端传 —— 服务端会从
-    密文文件旁挂的 *.schema.json 自动加载(上传时已自动生成)。
-    """
-    if not _is_logged_in():
-        return _need_login()
-    _sess_for_user(sid)
-    data = await request.json()
-    ciphertext = data.get("ciphertext")
-    ciphertexts = data.get("ciphertexts")
-    action = data.get("action") or "set"     # set | add | remove
-    schema = data.get("schema")
-
-    # 决定主路径:批量 ciphertexts > 单 ciphertext + action
-    if ciphertexts is not None:
-        # 批量替换
-        # 自动从第一个的旁挂 schema.json 加载
-        if ciphertexts and schema is None:
-            first = Path(ciphertexts[0])
-            sidecar = first.with_suffix(first.suffix + ".schema.json")
-            if sidecar.exists():
-                try:
-                    schema = sidecar.read_text(encoding="utf-8")
-                except Exception:
-                    schema = None
-        _sessions.set_context(sid, ciphertexts=ciphertexts, schema=schema)
-        return {"ok": True}
-
-    if ciphertext is not None:
-        if action == "add":
-            _sessions.add_ciphertext(sid, ciphertext)
-            # 第一次添加时同步 schema
-            sess = _sessions.get(sid)
-            if sess and not sess.context_schema:
-                first = Path(ciphertext)
-                sidecar = first.with_suffix(first.suffix + ".schema.json")
-                if sidecar.exists():
-                    try:
-                        _sessions.set_context(sid, schema=sidecar.read_text(encoding="utf-8"))
-                    except Exception:
-                        pass
-            return {"ok": True}
-        if action == "remove":
-            _sessions.remove_ciphertext(sid, ciphertext)
-            return {"ok": True}
-        # set:替换单文件(老接口语义)
-        if schema is None:
-            sidecar = Path(ciphertext).with_suffix(Path(ciphertext).suffix + ".schema.json")
-            if sidecar.exists():
-                try:
-                    schema = sidecar.read_text(encoding="utf-8")
-                except Exception:
-                    schema = None
-        _sessions.set_context(sid, ciphertext=ciphertext, schema=schema)
-        return {"ok": True}
-
-    # 只改 schema
-    if schema is not None:
-        _sessions.set_context(sid, schema=schema)
-    return {"ok": True}
-
-
 @app.get("/api/sessions/{sid}/messages")
 def api_messages_list(sid: str):
     if not _is_logged_in():
         return _need_login()
     sess = _sess_for_user(sid)
-    cts = sess.context_ciphertexts or ([sess.context_ciphertext] if sess.context_ciphertext else [])
     return {
-        "session": {
-            "id": sess.id, "title": sess.title,
-            # 兼容老前端 — 主密文
-            "context_ciphertext": sess.context_ciphertext,
-            "context_ciphertext_name": Path(sess.context_ciphertext).name if sess.context_ciphertext else "",
-            # 新接口 — 多密文
-            "context_ciphertexts": cts,
-            "context_ciphertexts_named": [
-                {"path": p, "name": Path(p).name} for p in cts
-            ],
-            "context_schema": sess.context_schema,
-        },
+        "session": {"id": sess.id, "title": sess.title},
         "messages": [m.to_dict() for m in sess.messages],
     }
 
@@ -950,10 +619,6 @@ def api_messages_get(sid: str, mid: str):
 
 @app.post("/api/sessions/{sid}/messages")
 async def api_messages_send(sid: str, request: Request):
-    """
-    用户发一条消息 → 立即落库 → 起后台 job 跑 workflow → 返回 user + assistant 两条
-    前端拿 assistant.id 后 polling 单条消息直到 status=done/failed
-    """
     if not _is_logged_in():
         return _need_login()
     sess = _sess_for_user(sid)
@@ -961,495 +626,112 @@ async def api_messages_send(sid: str, request: Request):
     content = (data.get("content") or "").strip()
     if not content:
         raise HTTPException(400, "消息为空")
-    attachments = data.get("attachments") or []
-    # 可选:更新会话上下文(前端可能换了密文 / schema)
-    ctx = data.get("context") or {}
-    if "ciphertext" in ctx:
-        _sessions.set_context(sid, ciphertext=ctx.get("ciphertext"))
-    if "schema" in ctx:
-        _sessions.set_context(sid, schema=ctx.get("schema"))
+    attached_cipher = (data.get("attached_cipher") or "").strip()
 
-    # 1) 用户消息
+    # 1) 落用户消息 + assistant 占位
     user_msg = Message(
-        id=secrets.token_hex(6),
-        role="user",
-        content=content,
-        attachments=attachments,
+        id=secrets.token_hex(6), role="user",
+        content=content, attached_cipher=attached_cipher,
     )
     _sessions.append_message(sid, user_msg)
+    asst = Message(id=secrets.token_hex(6), role="assistant", status="pending")
+    _sessions.append_message(sid, asst)
 
-    # 2) Assistant 占位(pending)
-    asst_msg = Message(
-        id=secrets.token_hex(6),
-        role="assistant",
-        status="pending",
-    )
-    _sessions.append_message(sid, asst_msg)
-
-    # 3) 起后台线程
+    # 2) 后台跑 pipeline
     threading.Thread(
-        target=_run_workflow_for_message,
-        args=(sid, asst_msg.id, content),
-        daemon=True,
-        name=f"chat-{sid}-{asst_msg.id}",
+        target=_run_pipeline,
+        args=(sid, asst.id, content, attached_cipher),
+        daemon=True, name=f"ask-{sid}-{asst.id}",
     ).start()
-
-    return {
-        "user_message": user_msg.to_dict(),
-        "assistant_message": asst_msg.to_dict(),
-    }
+    return {"user_message": user_msg.to_dict(), "assistant_message": asst.to_dict()}
 
 
-# ---------------------------------------------------------------------------
-# Workflow runner(后台线程)
-# ---------------------------------------------------------------------------
-
-
-FREECHAT_SYSTEM_PROMPT = (
-    "你是 Clawworker —— 一款基于同态加密(HE)的企业数据分析助手。"
-    "用户当前的会话还没有绑定任何加密数据,所以现在是普通对话模式。\n\n"
-    "请用简洁、清楚的中文回答用户的问题。\n"
-    "- 如果用户问的是闲聊 / 概念解释 / 编程问题等,直接回答即可。\n"
-    "- 如果用户问的是涉及具体数据的分析(例如「算一下我们公司销售额」),"
-    "请告诉用户:点击输入框左侧的回形针按钮上传 CSV / XLSX 数据,系统会"
-    "自动加密入库,然后再提问就会按密态数据分析模式运行。\n"
-    "- 不要伪造数据或编造分析结果。"
-)
-
-
-def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
-    """根据会话上下文分派:自由聊天 vs 数据分析。"""
+def _run_pipeline(sid: str, asst_mid: str, user_query: str, attached_cipher: str) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
+    steps: list[dict[str, Any]] = []
 
-    sess = _sessions.get(sid)
-    if not sess:
-        return
-
-    # 取所有有效密文(list 优先,fallback 到老的单文件字段)
-    cipher_paths = [Path(p) for p in (sess.context_ciphertexts or [])
-                    if p and Path(p).exists()]
-    if not cipher_paths and sess.context_ciphertext and Path(sess.context_ciphertext).exists():
-        cipher_paths = [Path(sess.context_ciphertext)]
-    has_cipher = bool(cipher_paths)
-
-    # ----- 自由聊天分支 -----
-    if not has_cipher:
-        if sess.context_ciphertext or sess.context_ciphertexts or sess.context_schema:
-            _sessions.set_context(sid, ciphertexts=[], ciphertext="", schema="")
-        _run_freechat(sid, asst_mid, user_query, t0)
-        return
-
-    # workflow 入口取第一份(workflow 自身只支持单 cipher,多文件后续扩展)
-    cipher_path = cipher_paths[0]
-
-    # ----- 数据分析分支(以下都是 has_cipher = True)-----
-    has_schema = bool(sess.context_schema)
-    # 兜底:schema 缺失,从旁挂 *.schema.json 重新加载
-    if not has_schema:
-        sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
-        if sidecar.exists():
-            try:
-                txt = sidecar.read_text(encoding="utf-8")
-                _sessions.set_context(sid, schema=txt)
-                sess = _sessions.get(sid) or sess
-                has_schema = True
-            except Exception:
-                pass
-
-    if not has_schema:
-        # 旁挂 sidecar 也没有 → 旧版本上传的密文 → 提示用户删了重传
-        cipher_name = Path(sess.context_ciphertext).name
-        _sessions.update_message(
-            sid, asst_mid,
-            status="failed",
-            error=f"密文文件「{cipher_name}」是旧版本上传的,缺失自动识别的字段信息。"
-                  f"请到设置 → 密文文件,删除这份旧文件并重新拖入原始 CSV/XLSX,"
-                  f"新版本会自动识别表头、加密数字列、保留身份标识列。",
-            duration_sec=round(time.time() - t0, 2),
-        )
-        return
-
-    try:
-        schema = json.loads(sess.context_schema)
-    except json.JSONDecodeError as e:
-        _sessions.update_message(
-            sid, asst_mid, status="failed",
-            error=f"schema JSON 不合法:{e}",
-            duration_sec=round(time.time() - t0, 2),
-        )
-        return
-
-    # cipher_path 已在上面取自 cipher_paths[0]
-    username = _session_state["username"]
-    host_url = _session_state["host_url"]
-    token = _session_state["token"]
-    backend = _config.get("backend", "stub")
-    keys = _keystore.get_paths(username)
-    sk_path = keys.sk_path if keys else None
-    evk_path = keys.evk_path if keys else None
-
-    try:
-        zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
-        wf = build_workflow(
-            llm_client=HTTPLLMClient(host_url=host_url, session_token=token),
-            zfhe=zfhe,
-            pandaseal=PandaSeal(backend=backend, evk_path=evk_path),
-            henumpy=HENumpy(backend=backend, evk_path=evk_path),
-            helearn=HELearn(backend=backend, evk_path=evk_path),
-            hetorch=HETorch(backend="stub", evk_path=evk_path),
-            authorizer=AutoApproveAuthorizer(),
-        )
-
-        # 流式执行:每个 node 完成立即把对应 step 持久化到 message
-        # 前端 polling /api/sessions/{sid}/messages/{mid} 时拿到最新 steps,实时展示
-        accumulated: dict[str, Any] = {
-            "user_query": user_query,
-            "schema": schema,
-            "ciphertext_paths": [str(cipher_path)],
-        }
-        steps: list[dict[str, Any]] = []
-        # 首步:识别意图(prepare 节点跑之前先 push)
-        meta_path = (cipher_path.with_suffix(cipher_path.suffix + ".meta.csv"))
-        meta_n = 0
-        if meta_path.exists():
-            try:
-                meta_n = sum(1 for _ in meta_path.open("r", encoding="utf-8")) - 1
-            except Exception:
-                meta_n = 0
-        detail = f"密文「{cipher_path.name}」· backend={backend}"
-        if meta_n > 0:
-            detail += f" · meta sidecar({meta_n} 行身份列)"
-        steps.append({"kind": "think", "label": "识别意图 · 数据分析模式",
-                      "detail": detail})
+    def on_step(kind: str, label: str):
+        steps.append({"kind": kind, "label": label})
         _sessions.update_message(sid, asst_mid, steps=list(steps))
 
-        # 跑 stream
-        for chunk in wf.stream(accumulated, stream_mode="updates"):
-            for node_name, delta in chunk.items():
-                if not isinstance(delta, dict):
-                    continue
-                accumulated.update(delta)
-                new_steps = _node_to_steps(node_name, delta, accumulated)
-                if new_steps:
-                    steps.extend(new_steps)
-                    # 实时推送,前端 polling 看得到
-                    _sessions.update_message(sid, asst_mid, steps=list(steps))
+    # 决定用哪份 cipher:这条消息带的 > 上一条 user 消息的
+    sess = _sessions.get(sid)
+    cipher_path = None
+    used_cipher = ""
+    if attached_cipher and Path(attached_cipher).exists():
+        cipher_path = Path(attached_cipher)
+        used_cipher = attached_cipher
+    elif sess:
+        last = sess.last_attached_cipher()
+        if last and Path(last).exists():
+            cipher_path = Path(last)
+            used_cipher = last
 
-        final = accumulated
-        summary = (final.get("summary_filtered") or final.get("summary") or "").strip()
-        excel_path = final.get("excel_path") or ""
-        excel_name = Path(excel_path).name if excel_path else ""
-
-        plan = final.get("plan")
-        scenario = ""
-        plan_summary = ""
-        if plan is not None:
-            try:
-                scenario = str(getattr(plan, "scenario", "")).replace("Scenario.", "")
-                ops = getattr(plan, "ops", []) or []
-                plan_summary = " → ".join(getattr(o, "op", str(o)) for o in ops)[:200]
-            except Exception:
-                pass
-
-        if final.get("error"):
-            raw_err = str(final["error"])
-            # 把 host session 失效翻译成中文,顺手清本机 state
-            friendly_err = _friendly_workflow_error(raw_err)
-            steps.append({"kind": "error", "label": "工作流失败", "detail": raw_err[:200]})
-            _sessions.update_message(
-                sid, asst_mid,
-                status="failed",
-                error=friendly_err,
-                summary=summary,
-                excel_path=str(excel_path) if excel_path else "",
-                excel_name=excel_name,
-                scenario=scenario,
-                plan_summary=plan_summary,
-                steps=steps,
-                duration_sec=round(time.time() - t0, 2),
-            )
-        else:
-            _sessions.update_message(
-                sid, asst_mid,
-                status="done",
-                summary=summary,
-                excel_path=str(excel_path) if excel_path else "",
-                excel_name=excel_name,
-                scenario=scenario,
-                plan_summary=plan_summary,
-                steps=steps,
-                duration_sec=round(time.time() - t0, 2),
-            )
+    try:
+        system_prompt = load_system_prompt()
     except Exception as e:
-        raw_err = f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1500:]}"
-        friendly_err = _friendly_workflow_error(raw_err)
         _sessions.update_message(
-            sid, asst_mid,
-            status="failed",
-            error=friendly_err,
-            steps=[{"kind": "error", "label": "工作流抛异常",
-                    "detail": f"{type(e).__name__}: {e}"}],
+            sid, asst_mid, status="failed",
+            error=f"系统 prompt 加载失败:{e}",
             duration_sec=round(time.time() - t0, 2),
         )
+        return
 
-
-def _friendly_workflow_error(raw: str) -> str:
-    """
-    把工作流冒出来的英文 / 栈错误翻译成给用户看的中文。
-    顺便对"session 失效"做副作用:清掉本机 _session_state,
-    这样用户下次任何 /api/* 调用就被 JS 重定向到 /login。
-    """
-    low = raw.lower()
-    if "401" in raw or "unauthorized" in low or "无效的 authorization" in raw or "session 无效" in raw:
-        _clear_local_session()
-        return (
-            "登录已过期或主机重启过 · 请点右上角用户名 → 退出登录,"
-            "或直接刷新页面重新登录。"
-        )
-    if "503" in raw and ("未绑定" in raw or "llm 配置" in low or "provider" in low):
-        return (
-            "用户没绑定 LLM 配置 / 配置不可用 · "
-            "请联系管理员到 admin 端 → 用户 → 修改 → 选 LLM 配置"
-        )
-    if "500" in raw and ("computation_plan" in low or "输出不符合规范" in raw):
-        return (
-            "LLM 这次没按格式输出 computation_plan(可能跑神了)· "
-            "稍后再试 / 换个模型 / 把问题写得更具体些"
-        )
-    if "timed out" in low or "timeout" in low or "readtimeout" in low or "connecttimeout" in low:
-        return (
-            "LLM 响应超时(> 3 分钟)· 可能是模型推理慢 / 网络抖动 / OpenRouter 排队 · "
-            "稍后重试 / 换个推理快的模型(如 deepseek-chat、gpt-4o-mini)"
-        )
-    if "plan op 顺序问题" in raw or "div 不能" in raw or "div 暂不支持" in raw:
-        return (
-            "LLM 给的 plan op 顺序不对 · 应该先 div(行级率)再 group_by/聚合,"
-            "而不是反过来。你可以重新提问:"
-            "「按 region 分组,先算每行的 actual/target 比率,再算每组平均」"
-            "原始错误:" + raw[:120]
-        )
-    if "could not convert string to float" in low:
-        return (
-            "数据里有非数字字符(空字符串 / 文本)· 可能上传时 NaN 处理失败 · "
-            "请去设置 → 密文文件,删掉这份密文,重新拖原文件上传(新流程会自动 fillna)"
-        )
-    return raw  # 兜底:原样显示
-
-
-def _node_to_steps(node_name: str, delta: dict, acc: dict) -> list[dict[str, Any]]:
-    """
-    把 workflow 一个 node 的 state delta 转成一到几个展示用 step。
-    在每个 node 完成时调用,实时 push 到 message。
-    """
-    out: list[dict[str, Any]] = []
-
-    if node_name == "prepare":
-        meta_rows = delta.get("metadata_rows") or []
-        if meta_rows:
-            out.append({
-                "kind": "think",
-                "label": "加载元数据 sidecar",
-                "detail": f"读到 {len(meta_rows)} 行身份列(姓名/大区/月份等)",
-            })
-        return out
-
-    if node_name == "call_llm":
-        out.append({"kind": "call", "label": "POST /llm/chat",
-                    "detail": "system + user → 返回 computation_plan + summary"})
-        raw = delta.get("summary_raw") or delta.get("computation_plan")
-        if raw is not None:
-            out.append({"kind": "result", "label": "LLM 响应已收到"})
-        return out
-
-    if node_name == "validate_plan":
-        if delta.get("error"):
-            out.append({"kind": "error", "label": "plan 校验失败",
-                        "detail": str(delta["error"])[:160]})
-            return out
-        plan = delta.get("plan") or acc.get("plan")
-        if plan is not None:
-            try:
-                ops = getattr(plan, "ops", []) or []
-                tool = getattr(plan, "tool", "") or ""
-                sc = str(getattr(plan, "scenario", "?")).replace("Scenario.", "")
-                op_names = [getattr(o, "op", str(o)) for o in ops]
-                out.append({
-                    "kind": "result",
-                    "label": "plan 解析 OK",
-                    "detail": f"scenario={sc} · tool={tool} · {len(ops)} 个 op: "
-                              + (" → ".join(op_names) if op_names else "(无)"),
-                })
-            except Exception:
-                out.append({"kind": "result", "label": "plan 解析 OK"})
-        return out
-
-    if node_name.startswith("compute_"):
-        tool = node_name.removeprefix("compute_")
-        plan = acc.get("plan")
-        ops_count = "?"
-        if plan is not None:
-            try:
-                ops_count = len(getattr(plan, "ops", []) or [])
-            except Exception:
-                pass
-        out.append({"kind": "call", "label": f"密态计算 · {tool}",
-                    "detail": f"{ops_count} 步密文操作(全程不解密 · backend HE)"})
-        if delta.get("error"):
-            out.append({"kind": "error", "label": f"{tool} 执行失败",
-                        "detail": str(delta["error"])[:200]})
-        else:
-            res = delta.get("encrypted_result")
-            out.append({"kind": "result", "label": "密文结果就绪",
-                        "detail": f"type={type(res).__name__}" if res is not None else ""})
-        return out
-
-    if node_name == "authorize":
-        if delta.get("authorized"):
-            out.append({"kind": "call", "label": "解密授权检查 (B6-1)",
-                        "detail": "auto-approve 通过"})
-        else:
-            out.append({"kind": "error", "label": "未授权解密",
-                        "detail": "将产出含密文版 Excel"})
-        return out
-
-    if node_name == "decrypt":
-        res = delta.get("decrypted_result")
-        n = "?"
-        if res is not None and hasattr(res, "__len__"):
-            try:
-                n = len(res)
-            except Exception:
-                pass
-        out.append({"kind": "call", "label": "ct.decrypt 解密最终结果"})
-        out.append({"kind": "result",
-                    "label": f"已解密 {n} 行" if n != "?" else "解密完成"})
-        return out
-
-    if node_name in ("write_excel", "write_excel_encrypted"):
-        excel_path = delta.get("excel_path")
-        label_prefix = "写 Excel(密文)" if node_name == "write_excel_encrypted" else "写 Excel(明文标识 + 计算结果)"
-        out.append({"kind": "call", "label": label_prefix})
-        if excel_path:
-            # 试着也带 sheet 数量
-            sheet_n = "?"
-            try:
-                import openpyxl
-                wb = openpyxl.load_workbook(excel_path, read_only=True)
-                sheet_n = len(wb.sheetnames)
-            except Exception:
-                pass
-            out.append({
-                "kind": "result",
-                "label": Path(excel_path).name,
-                "detail": (f"{sheet_n} 个 sheet · " if sheet_n != "?" else "")
-                          + excel_path,
-            })
-        elif delta.get("error"):
-            out.append({"kind": "error", "label": "Excel 写入失败",
-                        "detail": str(delta["error"])[:160]})
-        return out
-
-    if node_name == "filter_summary":
-        if delta.get("summary_filter_hit"):
-            out.append({
-                "kind": "think",
-                "label": "summary 零明文过滤 (B6-3 命中)",
-                "detail": "模型 summary 含数字 / 日期 / 长串 → 已替换为占位符",
-            })
-        # 没命中时不输出 step(不打扰主流程)
-        return out
-
-    if node_name == "retry_llm":
-        retry = delta.get("retry_count", 0) or acc.get("retry_count", 0)
-        out.append({"kind": "think", "label": f"LLM 重试(第 {retry} 次)"})
-        return out
-
-    if node_name == "fallback_summary":
-        out.append({"kind": "think", "label": "fallback summary 兜底",
-                    "detail": "多次重试仍不合规 · 用 fallback 简要总结"})
-        return out
-
-    return out
-
-
-def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
-    """自由聊天 —— 直接走主机 /llm/freechat,纯文本进 / 纯文本出。"""
-    host_url = _session_state["host_url"]
-    token = _session_state["token"]
-    steps: list[dict[str, Any]] = []
-    # think 立即 push
-    steps.append({"kind": "think", "label": "识别意图",
-                  "detail": "未绑定密文 → 进入自由对话模式(不走 HE 工作流)"})
-    _sessions.update_message(sid, asst_mid, steps=list(steps))
-    # call 也立即 push(在发起 httpx 之前)
-    steps.append({"kind": "call", "label": "POST /llm/freechat",
-                  "detail": f"system={len(FREECHAT_SYSTEM_PROMPT)} 字 · user={len(user_query)} 字"})
-    _sessions.update_message(sid, asst_mid, steps=list(steps))
     try:
-        r = httpx.post(
-            f"{host_url}/llm/freechat",
-            headers={"Authorization": f"Bearer {token}"},
-            json={"system": FREECHAT_SYSTEM_PROMPT, "user": user_query},
-            timeout=120,
+        result = pipeline_mod.ask(
+            user_query=user_query,
+            cipher_path=cipher_path,
+            host_url=_session_state["host_url"],
+            token=_session_state["token"],
+            system_prompt=system_prompt,
+            on_step=on_step,
         )
-    except httpx.HTTPError as e:
-        steps.append({"kind": "error", "label": "网络错误", "detail": f"{type(e).__name__}: {e}"})
+    except Exception as e:
         _sessions.update_message(
             sid, asst_mid, status="failed",
-            error=f"无法连接主机:{type(e).__name__}: {e}",
-            steps=steps,
-            scenario="freechat",
+            error=f"{type(e).__name__}: {e}\n{traceback.format_exc()[-1000:]}",
+            duration_sec=round(time.time() - t0, 2),
+            used_cipher=used_cipher,
+        )
+        return
+
+    status = result.get("status", "failed")
+    if status == "needs_cipher":
+        _sessions.update_message(
+            sid, asst_mid, status="needs_cipher",
+            summary=result.get("summary", ""),
             duration_sec=round(time.time() - t0, 2),
         )
         return
-    if r.status_code == 401:
-        steps.append({"kind": "error", "label": "主机返回 401",
-                      "detail": "session 失效 → 清掉本机 state"})
-        _clear_local_session()
+    if status == "failed":
+        err = result.get("error", "未知错误")
+        # 401 自动清 session
+        if "401" in err or "登录已过期" in err:
+            _clear_local_session()
         _sessions.update_message(
-            sid, asst_mid, status="failed",
-            error="登录已过期或主机被重启 · 请点右上角用户名 → 退出登录 → 重新登录",
-            steps=steps,
-            scenario="freechat",
+            sid, asst_mid, status="failed", error=err,
+            summary=result.get("summary", ""),
             duration_sec=round(time.time() - t0, 2),
+            used_cipher=used_cipher,
         )
         return
-    if r.status_code != 200:
-        try:
-            detail = r.json().get("detail", "")
-        except Exception:
-            detail = r.text[:200]
-        steps.append({"kind": "error", "label": f"主机拒绝 {r.status_code}",
-                      "detail": detail[:120]})
-        _sessions.update_message(
-            sid, asst_mid, status="failed",
-            error=f"主机拒绝({r.status_code}):{detail}",
-            steps=steps,
-            scenario="freechat",
-            duration_sec=round(time.time() - t0, 2),
-        )
-        return
-    try:
-        text = (r.json().get("text") or "").strip()
-    except Exception:
-        text = r.text
-    steps.append({"kind": "result", "label": "LLM 回复",
-                  "detail": f"{len(text)} 字"})
+
+    excel_path = result.get("excel_path", "")
     _sessions.update_message(
-        sid, asst_mid,
-        status="done",
-        summary=text or "(空回复)",
-        scenario="freechat",
-        plan_summary="自由聊天 · 无 HE 计算",
-        steps=steps,
+        sid, asst_mid, status="done",
+        summary=result.get("summary", ""),
+        excel_path=excel_path,
+        excel_name=Path(excel_path).name if excel_path else "",
+        skill_calls=result.get("skill_calls", []),
+        used_cipher=used_cipher,
         duration_sec=round(time.time() - t0, 2),
     )
 
 
-# ---------------------------------------------------------------------------
-# Excel 下载
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Excel 下载(B6-2 白名单)
+# ----------------------------------------------------------------------------
 
 
 @app.get("/api/excel/download")
@@ -1459,7 +741,6 @@ def api_excel_download(path: str):
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "Excel 文件不存在")
-    # 校验:必须落在 Downloads / agent-system 目录里(B6-2 白名单)
     allowed_roots = [Path.home() / "Downloads", APP_DATA_DIR]
     if not any(p.resolve().is_relative_to(r.resolve()) for r in allowed_roots if r.exists()):
         raise HTTPException(403, "拒绝下载白名单外的文件")

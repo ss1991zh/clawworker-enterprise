@@ -22,7 +22,6 @@ from enum import IntEnum
 from typing import Any, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing_extensions import TypedDict
 
 
 # ---------------------------------------------------------------------------
@@ -31,31 +30,17 @@ from typing_extensions import TypedDict
 
 
 class Scenario(IntEnum):
-    """六个场景标签,LLM 必须在 computation_plan.scenario 中显式标注。"""
+    """场景标签(v4 简化,场景 6 已合并到 1)。"""
 
-    DESCRIPTIVE = 1  # 汇总 / 分组 / 透视 / 时序
-    NUMERICAL = 2  # 矩阵 / 向量 / 线性代数
-    CLASSICAL_ML = 3  # 回归 / 分类 / 聚类 / 降维(通常仅推理)
-    DL_INFERENCE = 4  # 神经网络推理(不做训练)
-    INGESTION = 5  # 加密入库(独立,不经过 LLM 出方案)
-    PIPELINE = 6  # 多步串联
+    DESCRIPTIVE = 1   # 数据分析:统计 / 分组 / 排名 / 比率
+    NUMERICAL = 2     # 矩阵 / 向量(预留)
+    CLASSICAL_ML = 3  # ML 训练/推理(预留)
+    DL_INFERENCE = 4  # 神经网络推理(预留)
+    INGESTION = 5     # 加密入库(不出 plan)
 
-
-# 计算层工具(场景 1-4 使用)
-CalcTool = Literal["pandaseal", "henumpy", "helearn", "hetorch"]
 
 # 图表类型(Excel 内原生生成)
 ChartType = Literal["line", "bar", "pie", "scatter", "heatmap"]
-
-# 场景 → 默认主工具映射
-SCENARIO_DEFAULT_TOOL: dict[Scenario, Optional[str]] = {
-    Scenario.DESCRIPTIVE: "pandaseal",
-    Scenario.NUMERICAL: "henumpy",
-    Scenario.CLASSICAL_ML: "helearn",
-    Scenario.DL_INFERENCE: "hetorch",
-    Scenario.INGESTION: "zfhe",
-    Scenario.PIPELINE: None,  # 复合场景不固定主工具
-}
 
 
 # ---------------------------------------------------------------------------
@@ -125,49 +110,15 @@ class ExcelOutput(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# 操作与计算方案
+# SkillCall + ComputationPlan(v4 · 唯一主路径)
 # ---------------------------------------------------------------------------
-
-
-class Operation(BaseModel):
-    """单个计算操作。具体语义由 op 字符串决定,不同工具支持的 op 不同。"""
-
-    op: str
-    field: Optional[str] = None
-    fields: Optional[list[str]] = None
-    params: dict[str, Any] = Field(default_factory=dict)
-
-    @model_validator(mode="before")
-    @classmethod
-    def _normalize_field_fields(cls, data: Any) -> Any:
-        """
-        LLM 兼容:经常会把多列名当成 list 塞到 `field`,或反过来。
-        这里统一规范化:
-        - field 是 list/tuple → 自动迁到 fields
-        - fields 只有一个元素 → 同步落到 field
-        - 都给了:fields 优先,field 取 fields[0]
-        """
-        if not isinstance(data, dict):
-            return data
-        f = data.get("field")
-        fs = data.get("fields")
-        # field 是列表 → 迁
-        if isinstance(f, (list, tuple)):
-            if not fs:
-                fs = list(f)
-            data["fields"] = list(fs)
-            data["field"] = fs[0] if fs else None
-        # 有 fields 但没 field → 用第一项做 field(老 op 实现按 field 拿单列时有 fallback)
-        if isinstance(fs, list) and fs and not data.get("field"):
-            data["field"] = fs[0]
-        return data
 
 
 class SkillCall(BaseModel):
     """
-    新主路径 — LLM 通过 skill_calls 表达计算意图。
+    LLM 通过 skill_calls 表达计算意图。
     每个 SkillCall 对应 client/tools/skills.py 里的一个 skill 函数。
-    产出一个 sheet,自动合并 metadata 身份列。
+    产出一个 sheet,skill 内部自动合并 metadata 身份列。
     """
 
     skill: str                            # 必须在 SKILLS 注册表里
@@ -176,58 +127,27 @@ class SkillCall(BaseModel):
     chart: Optional[ChartSpec] = None     # 可选;skill 会给默认 chart
 
 
-class PipelineStep(BaseModel):
-    """复合场景中的一个流水线步骤。"""
-
-    tool: CalcTool
-    ops: list[Operation]
-    output_name: Optional[str] = None  # 中间结果命名
-
-
 class ComputationPlan(BaseModel):
     """
-    LLM 输出的结构化计算指令。
-
-    新主路径(v3,推荐):
-      - skill_calls: list[SkillCall]  ← LLM 挑预定义 skill + 填字段,
-                                        客户端直接调本地 skill 模板
-    老路径(已弃用,保留只为读历史会话):
-      - tool + ops:LLM 手写 op 序列
-
-    要求:
-      - 场景 1-4:必须有 skill_calls + output
-      - 场景 6:用 pipeline_steps(暂未改造)
-      - 场景 5:LLM 不出 plan
+    LLM 输出的结构化计算指令(v4):scenario + skill_calls + output。
+    弃用 v3 的 ops/tool/pipeline_steps 字段。
     """
 
     scenario: Scenario
-    skill_calls: list[SkillCall] = Field(default_factory=list)   # 新主路径
-    tool: Optional[CalcTool] = None                              # 已弃用
-    ops: list[Operation] = Field(default_factory=list)           # 已弃用
+    skill_calls: list[SkillCall] = Field(default_factory=list)
     output: Optional[ExcelOutput] = None
-    pipeline_steps: list[PipelineStep] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _check_scenario_consistency(self) -> "ComputationPlan":
         sc = self.scenario
         if sc in (Scenario.DESCRIPTIVE, Scenario.NUMERICAL, Scenario.CLASSICAL_ML, Scenario.DL_INFERENCE):
-            # 新路径主要校验 skill_calls;ops 留作 fallback(过渡期)
-            if not self.skill_calls and not self.ops:
-                raise ValueError(
-                    f"场景 {sc.value} 必须提供 skill_calls(推荐)或 ops(已弃用)"
-                )
+            if not self.skill_calls:
+                raise ValueError(f"场景 {sc.value} 必须提供至少一个 skill_call")
             if not self.output:
                 raise ValueError(f"场景 {sc.value} 必须指定 output(Excel 文件)")
-
-        elif sc == Scenario.PIPELINE:
-            if not self.pipeline_steps:
-                raise ValueError("场景 6(复合)必须提供 pipeline_steps")
-            if not self.output:
-                raise ValueError("场景 6 必须指定最终 output")
-
         elif sc == Scenario.INGESTION:
             pass
-
+        # 场景 6 (PIPELINE) 与 INGESTION 一样为占位,v4 不要求
         return self
 
 
@@ -248,37 +168,4 @@ class LLMResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AgentState(TypedDict, total=False):
-    """
-    LangGraph 工作流的状态对象(TypedDict 形态,LangGraph 推荐写法)。
-    所有字段都是可选,节点逐步填充。
-    """
-
-    # --- 输入 ---
-    user_query: str
-    schema: dict  # SchemaDescription 序列化形式
-    ciphertext_paths: list[str]  # 本地密文数据文件路径
-
-    # --- LLM 阶段 ---
-    llm_raw: Optional[dict]  # 原始 LLM 响应,调试用
-    computation_plan: Optional[dict]  # ComputationPlan 序列化
-    summary_raw: Optional[str]
-    summary_filtered: Optional[str]
-    summary_filter_hit: bool  # 是否被 B6 第 3 条过滤命中
-
-    # --- 执行阶段 ---
-    encrypted_input_paths: list[str]  # zfhe 加密后(若需)
-    encrypted_result: Any  # 计算工具产出的密文结果
-    decrypted_result: Any  # zfhe 解密后的明文,即将写入 Excel
-    excel_path: Optional[str]  # 最终 Excel 文件路径
-
-    # --- 元数据(明文标识列)---
-    metadata_path: Optional[str]  # <cipher>.meta.csv 路径
-    metadata_rows: Optional[list]  # 已加载的标识列(list of dict)
-    metadata_columns: Optional[list[str]]  # 列名
-
-    # --- 控制流 ---
-    error: Optional[str]
-    retry_count: int  # LLM 重试次数
-    needs_authorization: bool  # 是否需要用户授权解密(B6 第 1 条)
-    authorized: bool  # 用户是否已授权
+# v4 不再有 AgentState — 用 client/webui/pipeline.py 的单一函数路径

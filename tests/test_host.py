@@ -134,9 +134,10 @@ def test_parse_llm_text_valid():
 <computation_plan>
 {
   "scenario": 1,
-  "tool": "pandaseal",
-  "ops": [{"op":"group_by","field":"month"}, {"op":"sum","field":"amount"}],
-  "output": {"file": "~/Downloads/x.xlsx", "sheets": [{"name": "Monthly"}]}
+  "skill_calls": [
+    {"skill": "group_stats", "params": {"group_col": "month", "value_cols": ["amount"]}, "sheet_name": "Monthly"}
+  ],
+  "output": {"file": "~/Downloads/x.xlsx"}
 }
 </computation_plan>
 
@@ -146,7 +147,8 @@ def test_parse_llm_text_valid():
 """
     resp = parse_llm_text(text)
     assert resp.computation_plan.scenario == 1
-    assert resp.computation_plan.tool == "pandaseal"
+    assert len(resp.computation_plan.skill_calls) == 1
+    assert resp.computation_plan.skill_calls[0].skill == "group_stats"
     assert "Excel" in resp.summary
 
 
@@ -163,15 +165,16 @@ def test_parse_llm_text_chinese_markers_fallback():
 ```json
 {
   "scenario": 1,
-  "tool": "pandaseal",
-  "ops": [{"op":"mean"}],
-  "output": {"file": "~/Downloads/x.xlsx", "sheets": [{"name":"S"}]}
+  "skill_calls": [
+    {"skill": "describe", "params": {}}
+  ],
+  "output": {"file": "~/Downloads/x.xlsx"}
 }
 ```
 
 【2. summary】
-已生成均值结果。
+已生成描述统计。
 """
     resp = parse_llm_text(text)
     assert resp.computation_plan.scenario == 1
-    assert "均值" in resp.summary
+    assert "描述" in resp.summary
