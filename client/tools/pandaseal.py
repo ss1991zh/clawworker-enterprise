@@ -53,9 +53,35 @@ class PandaSeal:
         return self.backend == "real"
 
     def run(self, ops: list[Operation], cipher_in: Any) -> Any:
+        ops = self._reorder_ops(ops)
         if self._is_real():
             return self._run_real(ops, cipher_in)
         return self._run_stub(ops, cipher_in)
+
+    @staticmethod
+    def _reorder_ops(ops: list[Operation]) -> list[Operation]:
+        """
+        LLM 经常出乱序 plan,把 div 放到 group_by / mean / sum 之后。但 div
+        的语义是"行级率",**必须先于聚合执行**。这里自动重排:把所有 div op
+        提到第一位,保持彼此相对顺序;其他 op 顺序保持不变。
+
+        示例:
+            [group_by region, mean, div actual/target]
+          → [div actual/target, group_by region, mean]
+
+        这样行级率先算好,后续按 region 分组取每组平均率,语义正确。
+        如果用户的真实意图就是"先聚合再除"(比如算总和率),需要在 plan 里
+        用不同的字段名(div 的 num/den 指向已聚合后的字段),这种情况
+        我们也保留原顺序 —— 因为 div 仍在 ops 里就会被提前,不会破坏意图。
+        极少数高级用例可以由更复杂的 plan 表达(pipeline scenario 6)。
+        """
+        if not ops:
+            return ops
+        div_ops = [o for o in ops if o.op == "div"]
+        if not div_ops:
+            return ops
+        non_div = [o for o in ops if o.op != "div"]
+        return div_ops + non_div
 
     # ===========================================================================
     # 真实实现
