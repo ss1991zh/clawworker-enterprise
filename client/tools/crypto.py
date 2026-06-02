@@ -148,7 +148,10 @@ def _real_encrypt_file(src: Path, dst: Path) -> Path:
     if suffix == ".csv":
         ct.encrypt_csv(str(src), str(dst))
     elif suffix in (".xlsx", ".xls"):
-        ct.encrypt_excel(str(src), str(dst))
+        # ⚠️ ct.encrypt_excel 默认 input_index_col=0,会把"第一列"当 index 不加密。
+        # 后续 ps.read_excel(index_col=0) 又把第一列当 index 跳过 → 第一列(如 target)
+        # 完全丢失。改成 input_index_col=None,所有列都进密文,后续完整读回。
+        ct.encrypt_excel(str(src), str(dst), input_index_col=None)
     elif suffix == ".json":
         ct.encrypt_json(str(src), str(dst))
     else:

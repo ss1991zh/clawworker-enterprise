@@ -114,22 +114,20 @@ class PandaSeal:
         if isinstance(cipher_in, (str, Path)):
             p = Path(cipher_in)
             suffix = p.suffix.lower()
-            # 当前 ps 版本的实测行为(对照 zionskill SKILL.md):
-            # - ps.read_csv(p):自动识别 _P/_L 为 index,列名正确 → 用这个
-            # - ps.read_csv(p, index_col=0):TypeError(此版本不接受参数)
-            # - ps.read_excel(p):试图把字符串 _P 转 float → ValueError
-            # - ps.read_excel(p, index_col=0):把第一数据列也当 index → 数据丢
-            #
-            # 结论:仅用不传参数的形式,让 ps 自己按 _P/_L 约定处理。
-            # 客户端 webui 上传时我们已强制走 CSV 加密,xlsx 路径基本不命中。
+            # 配合 ct.encrypt_* 的输出格式:
+            # - CSV : ct.encrypt_csv 无 input_index_col 参数,_P/_L 自动占两行
+            #         索引位置,ps.read_csv(p) 无参数即正确读出列。
+            # - XLSX: ct.encrypt_excel 我们在 _real_encrypt_file 里强制传
+            #         input_index_col=None(所有列都加密),输出文件首列含
+            #         _P/_L 字符串 marker → ps.read_excel(p, index_col=0)
+            #         把它当 index 跳过即可正确读出全部数据列。
             if suffix == ".csv":
                 return ps.read_csv(str(p))
             if suffix in (".xlsx", ".xls"):
-                # xlsx 路径已知有问题,但仍兜底尝试
                 try:
-                    return ps.read_excel(str(p))
-                except Exception:
                     return ps.read_excel(str(p), index_col=0)
+                except Exception:
+                    return ps.read_excel(str(p))
             if suffix == ".json":
                 return ps.read_json(str(p))
             raise ValueError(f"pandaseal 不支持文件类型: {suffix}")
@@ -252,11 +250,24 @@ class PandaSeal:
 
             # 返回类型决策:
             # 默认:把率作为新列加回 cdf,后续 group_by / mean / sort 还能跑
-            #      (LLM 经常给 [div, group_by, mean],div 输出 Series 会让后续炸)
             # 显式 return_series=True 时才返回 CipherSeries
             if p.get("return_series", False):
                 return result
-            out_col = p.get("output_col") or p.get("name") or p.get("as") or "_ratio"
+            # 默认列名兜底(LLM 没给 output_col / name / as 时):
+            # - 单个 div:用 "<num>_per_<den>"(数字列名 → 中文也可)
+            # - 多个 div 都不给名:用自增 _ratio_0、_ratio_1...(避免覆盖)
+            out_col = p.get("output_col") or p.get("name") or p.get("as")
+            if not out_col:
+                # 尝试用 num_per_den 的可读名
+                if single_num and single_den:
+                    out_col = f"{single_num}_per_{single_den}"
+                else:
+                    # 自增防覆盖
+                    existing = list(getattr(cdf, "columns", []))
+                    i = 0
+                    while f"_ratio_{i}" in existing:
+                        i += 1
+                    out_col = f"_ratio_{i}"
             try:
                 cdf[out_col] = result
                 return cdf

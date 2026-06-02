@@ -514,32 +514,35 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
                 "或第一行 / 第二行是不是被合并单元格 / 标题占了",
             )
 
-        # ----- 2) 加密入库:仅数字列,**强制走 CSV 路径** -----
-        # 原因:ct.encrypt_excel 在 xlsx 里把 _P / _L marker 写成"字符串字面值",
-        # ps.read_excel 后续 float 转换时会炸("could not convert string to float: '_P'")。
-        # ct.encrypt_csv → ps.read_csv 路径下 _P/_L 是隐式 index 标签,完全兼容。
-        # 所以无论用户给 csv 还是 xlsx,我们都先 to_csv 再 encrypt_csv,落地 .cipher.csv。
+        # ----- 2) 加密入库:仅数字列,**保留原文件类型** -----
+        # csv 输入  → ct.encrypt_csv  → 落 *_enc.csv
+        # xlsx 输入 → ct.encrypt_excel → 落 *_enc.xlsx
+        # 后端在 client/tools/crypto.py _real_encrypt_file 里给 ct.encrypt_excel
+        # 强制传 input_index_col=None,防止第一列被当成 index 不加密(否则会丢列)
         stem = Path(raw_file.filename or "data").stem
-        # 命名约定:.csv.cipher(用 stub)or .csv(用 real;ct 输出 CSV)
-        cipher_suffix = ".csv" if backend == "real" else ".csv.cipher"
+        if backend == "real":
+            cipher_suffix = raw_suffix  # 跟原文件类型一致
+        else:
+            cipher_suffix = f"{raw_suffix}.cipher"
         dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
 
-        # 统计 NaN(为前端反馈用,也避免 ct.encrypt_csv 看到空字符串炸)
+        # 统计 NaN(给前端反馈),加密前填 0 兜底
         nan_counts = {}
         if numeric_cols:
             num_df = df[numeric_cols].copy()
-            # 哪些列含 NaN
             for col in numeric_cols:
                 cnt = int(num_df[col].isna().sum())
                 if cnt > 0:
                     nan_counts[col] = cnt
-            # ct.encrypt_csv 不接受空字符串/NaN → 全部填 0 兜底
-            # (HE 加 0 不影响 sum/mean 的相对关系,但要告诉用户)
             num_df = num_df.fillna(0)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as t2:
+
+            with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
                 num_tmp = Path(t2.name)
             try:
-                num_df.to_csv(num_tmp, index=False)
+                if raw_suffix == ".csv":
+                    num_df.to_csv(num_tmp, index=False)
+                else:
+                    num_df.to_excel(num_tmp, index=False)
                 zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
                 zfhe.encrypt_file(num_tmp, dst)
             finally:
