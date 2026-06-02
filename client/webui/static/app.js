@@ -206,9 +206,7 @@ function renderMessage(m) {
     if (m.attachments && m.attachments.length) {
       content += `<div class="att-line">`;
       m.attachments.forEach(a => {
-        const ic = a.kind === "schema_json" || a.kind === "schema_file"
-          ? `<svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>`
-          : `<svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`;
+        const ic = `<svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>`;
         content += `<span class="att-piece">${ic} ${esc(a.name || a.kind)}</span>`;
       });
       content += `</div>`;
@@ -313,12 +311,10 @@ async function sendMessage() {
     await createSession();
   }
 
-  // 1) 把附件先落到 session.context(cipher + schema)
+  // 1) 把附件里的密文落到 session.context(schema 由服务端从旁挂自动加载)
   let ctx = {};
   for (const a of state.pendingAttachments) {
     if (a.kind === "ciphertext" && a.path) ctx.ciphertext = a.path;
-    else if (a.kind === "schema_json") ctx.schema = a.content;
-    else if (a.kind === "schema_file") ctx.schema = a.content;
   }
 
   // 2) 发送
@@ -377,59 +373,45 @@ function renderAttachChips() {
 async function handleFileAttach(files) {
   for (const f of files) {
     const ext = (f.name.split(".").pop() || "").toLowerCase();
-    if (ext === "json") {
-      // 读为 schema
-      const text = await f.text();
-      state.pendingAttachments.push({
-        kind: "schema_file", name: f.name, content: text,
-        size: (f.size / 1024).toFixed(1) + "KB",
-      });
+    if (!["csv", "xlsx", "xls"].includes(ext)) {
+      alert(`不支持的文件类型:.${ext} · 仅 CSV / XLSX`);
+      continue;
+    }
+    // 上传 + 加密(schema 在服务端自动推断,无需用户介入)
+    const chip = {
+      kind: "ciphertext", name: f.name + " (加密中…)", uploading: true,
+      size: (f.size / 1024).toFixed(1) + "KB",
+    };
+    state.pendingAttachments.push(chip);
+    renderAttachChips();
+    const fd = new FormData();
+    fd.append("raw_file", f);
+    try {
+      const res = await api("POST", "/api/files/upload", fd, true);
+      chip.name = res.name;
+      chip.path = res.path;
+      chip.uploading = false;
       renderAttachChips();
-    } else if (["csv", "xlsx", "xls"].includes(ext)) {
-      // 上传 + 加密
-      const chip = {
-        kind: "ciphertext", name: f.name + " (加密中…)", uploading: true,
-        size: (f.size / 1024).toFixed(1) + "KB",
-      };
-      state.pendingAttachments.push(chip);
+      loadFiles();
+    } catch (e) {
+      const idx = state.pendingAttachments.indexOf(chip);
+      if (idx >= 0) state.pendingAttachments.splice(idx, 1);
       renderAttachChips();
-      const fd = new FormData();
-      fd.append("raw_file", f);
-      try {
-        const res = await api("POST", "/api/files/upload", fd, true);
-        chip.name = res.name;
-        chip.path = res.path;
-        chip.uploading = false;
-        renderAttachChips();
-        loadFiles();
-      } catch (e) {
-        const idx = state.pendingAttachments.indexOf(chip);
-        if (idx >= 0) state.pendingAttachments.splice(idx, 1);
-        renderAttachChips();
-        alert("加密失败:" + e.message);
-      }
-    } else {
-      alert(`不支持的文件类型:.${ext} · 仅 CSV / XLSX / JSON`);
+      alert("加密失败:" + e.message);
     }
   }
 }
 
-// ============ 上下文条 ============
+// ============ 上下文条(仅密文 · schema 自动从旁挂加载)============
 function updateCtxBar() {
   const bar = $("ctxBar");
   if (!state.currentSession) { bar.style.display = "none"; return; }
   bar.style.display = "flex";
 
   const cipher = state.currentSession.context_ciphertext_name || "";
-  const schemaSet = !!state.currentSession.context_schema;
-
   const cChip = $("ctxCipher");
   cChip.classList.toggle("set", !!cipher);
   cChip.querySelector(".ctx-name").textContent = cipher || "未绑定密文 · 点击选择";
-
-  const sChip = $("ctxSchema");
-  sChip.classList.toggle("set", schemaSet);
-  sChip.querySelector(".ctx-name").textContent = schemaSet ? "schema 已设置" : "未设置 schema · 点击设置";
 }
 
 // ============ 设置 Modal ============
@@ -437,7 +419,6 @@ const TABS = {
   general: { title: "连接 / 计算", render: renderGeneralTab },
   files:   { title: "密文文件管理", render: renderFilesTab },
   keys:    { title: "同态密钥", render: renderKeysTab },
-  schema:  { title: "当前会话 schema", render: renderSchemaTab },
   account: { title: "账户", render: renderAccountTab },
 };
 let currentTab = "general";
@@ -494,36 +475,65 @@ async function renderFilesTab() {
   await loadFiles();
   $("modalBody").innerHTML = `
     <h2>${TABS.files.title}</h2>
-    <p class="sub">已加密入库的文件 · 删除后可重新上传</p>
+    <p class="sub">已加密入库的文件 · 数字列自动加密 · 字符串列(姓名/大区/月份)自动保留为明文身份标识</p>
     <div id="filesList"></div>
-    <div class="field" style="margin-top:18px;">
-      <label>上传新数据(自动加密)</label>
-      <input type="file" id="fileUpRaw" accept=".csv,.xlsx,.xls">
+
+    <h3 style="font-size:14px; margin: 22px 0 10px;">上传新数据</h3>
+    <div class="sk-drop" id="fileDropZone" tabindex="0">
+      <div class="sk-drop__t">点击或拖入 <strong>CSV / XLSX</strong> 数据文件</div>
+      <div class="sk-drop__s" id="fileDropHint">系统会自动识别数字列加密、字符串列做身份标识</div>
+      <input type="file" id="fileUpRaw" accept=".csv,.xlsx,.xls" hidden>
     </div>
-    <div class="field">
-      <label>可选 meta sidecar(明文标识列)</label>
-      <input type="file" id="fileUpMeta" accept=".csv,.xlsx,.xls">
-    </div>
-    <button class="btn-primary" id="fileUpBtn">加密入库</button>
     <div id="fileUpStatus" style="margin-top:12px;"></div>
   `;
   renderFilesList();
-  $("fileUpBtn").addEventListener("click", async () => {
-    const raw = $("fileUpRaw").files[0];
-    if (!raw) { $("fileUpStatus").innerHTML = '<div class="alert-box">请选择数据文件</div>'; return; }
+
+  const zone = $("fileDropZone");
+  const inp = $("fileUpRaw");
+  const hint = $("fileDropHint");
+
+  function setHint(html) { hint.innerHTML = html; }
+
+  async function doUpload(file) {
+    if (!file) return;
+    if (!/\.(csv|xlsx|xls)$/i.test(file.name)) {
+      $("fileUpStatus").innerHTML = `<div class="alert-box">仅支持 CSV / XLSX</div>`;
+      return;
+    }
+    setHint(`正在加密 <strong>${esc(file.name)}</strong>…`);
+    $("fileUpStatus").innerHTML = '<div class="alert-box info">加密中(数字列 → 密文,字符串列 → 明文身份)…</div>';
     const fd = new FormData();
-    fd.append("raw_file", raw);
-    const meta = $("fileUpMeta").files[0];
-    if (meta) fd.append("meta_file", meta);
-    $("fileUpStatus").innerHTML = '<div class="alert-box info">加密中…</div>';
+    fd.append("raw_file", file);
     try {
       const res = await api("POST", "/api/files/upload", fd, true);
-      $("fileUpStatus").innerHTML = `<div class="alert-box success">✓ 已加密入库:${esc(res.name)}</div>`;
-      $("fileUpRaw").value = ""; $("fileUpMeta").value = "";
+      const enc = (res.encrypted_columns || []).length;
+      const pt = (res.plaintext_columns || []).length;
+      $("fileUpStatus").innerHTML =
+        `<div class="alert-box success">✓ 已加密入库:<strong>${esc(res.name)}</strong>` +
+        `<br>📊 ${enc} 列加密 · ${pt} 列身份标识 · ${res.row_count || "?"} 行</div>`;
+      setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
+      inp.value = "";
       await loadFiles(); renderFilesList();
     } catch (e) {
       $("fileUpStatus").innerHTML = `<div class="alert-box">加密失败:${esc(e.message)}</div>`;
+      setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
     }
+  }
+
+  zone.addEventListener("click", () => inp.click());
+  zone.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); inp.click(); }
+  });
+  inp.addEventListener("change", e => doUpload(e.target.files[0]));
+
+  ["dragenter", "dragover"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.add("dragover"); })
+  );
+  ["dragleave", "drop"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.remove("dragover"); })
+  );
+  zone.addEventListener("drop", e => {
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) doUpload(e.dataTransfer.files[0]);
   });
 }
 
@@ -761,36 +771,6 @@ function bindKeyDrop(zoneId, inputId, label, endpoint) {
   });
 }
 
-function renderSchemaTab() {
-  const cur = state.currentSession?.context_schema || "";
-  $("modalBody").innerHTML = `
-    <h2>${TABS.schema.title}</h2>
-    <p class="sub">当前会话用的字段 schema(JSON) · 同一会话内多轮共用</p>
-    ${!state.currentSid ? '<div class="alert-box info">还没有会话 · 请先新建/选择一个会话</div>' : ""}
-    <div class="field">
-      <label>Schema JSON</label>
-      <textarea id="schemaText" rows="14" ${!state.currentSid ? "disabled" : ""}>${esc(cur || SAMPLE_SCHEMA)}</textarea>
-      <p class="hint">字段名 / encrypted 标记 / metadata_columns · 改完点击保存</p>
-    </div>
-    <button class="btn-primary" id="schemaSave" ${!state.currentSid ? "disabled" : ""}>保存到当前会话</button>
-    <div id="schemaStatus" style="margin-top:12px;"></div>
-  `;
-  if (!state.currentSid) return;
-  $("schemaSave").addEventListener("click", async () => {
-    const v = $("schemaText").value;
-    try {
-      JSON.parse(v);
-    } catch (e) {
-      $("schemaStatus").innerHTML = `<div class="alert-box">JSON 不合法:${esc(e.message)}</div>`;
-      return;
-    }
-    await api("POST", `/api/sessions/${state.currentSid}/context`, { schema: v });
-    state.currentSession.context_schema = v;
-    updateCtxBar();
-    $("schemaStatus").innerHTML = '<div class="alert-box success">已保存</div>';
-  });
-}
-
 async function renderAccountTab() {
   const me = await api("GET", "/api/me");
   $("modalBody").innerHTML = `
@@ -814,19 +794,7 @@ async function renderAccountTab() {
   });
 }
 
-const SAMPLE_SCHEMA = `{
-  "scenario": "sales_commission",
-  "columns": [
-    {"name": "name",       "encrypted": false, "type": "string"},
-    {"name": "region",     "encrypted": false, "type": "string"},
-    {"name": "month",      "encrypted": false, "type": "string"},
-    {"name": "target",     "encrypted": true,  "type": "float"},
-    {"name": "actual",     "encrypted": true,  "type": "float"},
-    {"name": "commission", "encrypted": true,  "type": "float"}
-  ],
-  "metadata_columns": ["name", "region", "month"],
-  "primary_key": "name"
-}`;
+// schema 现在由服务端在上传时自动生成,前端不再需要 SAMPLE_SCHEMA
 
 // ============ 事件绑定 ============
 function bindEvents() {
@@ -870,9 +838,8 @@ function bindEvents() {
     }
   });
 
-  // ctx chips
+  // ctx chip (只有 cipher,schema 自动)
   $("ctxCipher").addEventListener("click", () => openModal("files"));
-  $("ctxSchema").addEventListener("click", () => openModal("schema"));
 
   // settings
   $("settingsBtn").addEventListener("click", () => openModal("general"));

@@ -64,15 +64,11 @@
 
     <footer>
       <div class="composer" id="composer">
-        <!-- 上下文条:当前会话绑定的密文 + schema -->
+        <!-- 上下文条:当前会话绑定的密文(schema 自动从旁挂 .schema.json 加载,不需要展示)-->
         <div class="ctx-bar" id="ctxBar" style="display:none;">
           <div class="ctx-chip" id="ctxCipher">
             <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
             <span class="ctx-name">未绑定密文</span>
-          </div>
-          <div class="ctx-chip" id="ctxSchema">
-            <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
-            <span class="ctx-name">未设置 schema</span>
           </div>
         </div>
 
@@ -112,7 +108,6 @@
         <button class="tab-btn active" data-tab="general">连接 / 计算</button>
         <button class="tab-btn" data-tab="files">密文文件</button>
         <button class="tab-btn" data-tab="keys">同态密钥</button>
-        <button class="tab-btn" data-tab="schema">会话 schema</button>
         <button class="tab-btn" data-tab="account">账户</button>
       </nav>
       <div class="modal__body" id="modalBody"></div>

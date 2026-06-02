@@ -436,10 +436,15 @@ def api_files_list():
 
 
 @app.post("/api/files/upload")
-async def api_files_upload(
-    raw_file: UploadFile = File(...),
-    meta_file: Optional[UploadFile] = File(None),
-):
+async def api_files_upload(raw_file: UploadFile = File(...)):
+    """
+    上传原始数据 → 自动:
+    1. pandas 读出全部列,按 dtype 拆分:数字列加密入库,字符串列做明文 meta sidecar
+    2. 自动推断 schema(columns / encrypted / metadata_columns / primary_key)
+       并落到 *.cipher.schema.json 旁挂
+
+    用户不需要再单独上传 meta 或粘 schema:把原始 CSV/XLSX 一拖即可。
+    """
     if not _is_logged_in():
         return _need_login()
     username = _session_state["username"]
@@ -451,38 +456,87 @@ async def api_files_upload(
     raw_bytes = await raw_file.read()
     if not raw_bytes:
         raise HTTPException(400, "数据文件为空")
-    raw_suffix = Path(raw_file.filename or "data").suffix or ".csv"
+    raw_suffix = Path(raw_file.filename or "data").suffix.lower() or ".csv"
+    if raw_suffix not in (".csv", ".xlsx", ".xls"):
+        raise HTTPException(400, f"暂不支持的格式:{raw_suffix} · 仅 CSV / XLSX")
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as tmp:
         tmp.write(raw_bytes); tmp_path = Path(tmp.name)
 
     try:
-        zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
+        # ----- 1) 用 pandas 读全表,做列类型识别 -----
+        import pandas as pd
+        try:
+            if raw_suffix == ".csv":
+                df = pd.read_csv(tmp_path)
+            else:
+                df = pd.read_excel(tmp_path)
+        except Exception as e:
+            raise HTTPException(400, f"无法解析文件:{type(e).__name__}: {e}")
+
+        if df.empty or df.shape[1] == 0:
+            raise HTTPException(400, "文件没有任何列")
+
+        string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        all_cols = df.columns.tolist()
+
+        # ----- 2) 加密入库:仅数字列(字符串无法 HE 编码)-----
+        # 先把数字列单独存成纯数字 CSV,送给 ZFHE
         cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
         stem = Path(raw_file.filename or "data").stem
         dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
-        zfhe.encrypt_file(tmp_path, dst)
 
+        if numeric_cols:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
+                num_tmp = Path(t2.name)
+            try:
+                if raw_suffix == ".csv":
+                    df[numeric_cols].to_csv(num_tmp, index=False)
+                else:
+                    df[numeric_cols].to_excel(num_tmp, index=False)
+                zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
+                zfhe.encrypt_file(num_tmp, dst)
+            finally:
+                num_tmp.unlink(missing_ok=True)
+        else:
+            # 全是字符串列?写空文件让 list_ciphertexts 能看到
+            dst.write_bytes(b"")
+
+        # ----- 3) 自动 meta sidecar(身份/标签列)-----
         meta_path = ""
-        if meta_file is not None and meta_file.filename:
-            meta_bytes = await meta_file.read()
-            if meta_bytes:
-                meta_suffix = Path(meta_file.filename).suffix.lower()
-                meta_dst = dst.with_suffix(dst.suffix + ".meta.csv")
-                if meta_suffix == ".csv":
-                    meta_dst.write_bytes(meta_bytes)
-                elif meta_suffix in (".xlsx", ".xls"):
-                    import pandas as pd
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=meta_suffix) as t:
-                        t.write(meta_bytes); meta_tmp = Path(t.name)
-                    try:
-                        pd.read_excel(meta_tmp).to_csv(meta_dst, index=False)
-                    finally:
-                        meta_tmp.unlink(missing_ok=True)
-                meta_path = str(meta_dst)
+        if string_cols:
+            meta_dst = dst.with_suffix(dst.suffix + ".meta.csv")
+            df[string_cols].to_csv(meta_dst, index=False)
+            meta_path = str(meta_dst)
+
+        # ----- 4) 自动 schema sidecar -----
+        schema = {
+            "scenario": "auto",
+            "columns": [
+                {
+                    "name": c,
+                    "encrypted": c in numeric_cols,
+                    "type": "float" if c in numeric_cols else "string",
+                }
+                for c in all_cols
+            ],
+            "metadata_columns": string_cols,
+            "primary_key": string_cols[0] if string_cols else (numeric_cols[0] if numeric_cols else ""),
+        }
+        schema_dst = dst.with_suffix(dst.suffix + ".schema.json")
+        schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+
         return {
-            "name": dst.name, "path": str(dst),
-            "size_kb": round(dst.stat().st_size / 1024, 1),
-            "backend": backend, "meta_path": meta_path,
+            "name": dst.name,
+            "path": str(dst),
+            "size_kb": round(dst.stat().st_size / 1024, 1) if dst.exists() else 0,
+            "backend": backend,
+            "meta_path": meta_path,
+            "schema_path": str(schema_dst),
+            "encrypted_columns": numeric_cols,
+            "plaintext_columns": string_cols,
+            "row_count": len(df),
         }
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -497,6 +551,7 @@ def api_files_delete(name: str):
         raise HTTPException(404, "文件不存在或路径非法")
     target.unlink()
     target.with_suffix(target.suffix + ".meta.csv").unlink(missing_ok=True)
+    target.with_suffix(target.suffix + ".schema.json").unlink(missing_ok=True)
     return {"ok": True}
 
 
@@ -557,15 +612,28 @@ async def api_sessions_rename(sid: str, request: Request):
 
 @app.post("/api/sessions/{sid}/context")
 async def api_sessions_set_context(sid: str, request: Request):
+    """
+    设置会话上下文。新约定:schema 默认不需要前端传 —— 服务端会从
+    密文文件旁挂的 *.schema.json 自动加载(上传时已自动生成)。
+    """
     if not _is_logged_in():
         return _need_login()
     _sess_for_user(sid)
     data = await request.json()
-    _sessions.set_context(
-        sid,
-        ciphertext=data.get("ciphertext"),
-        schema=data.get("schema"),
-    )
+    ciphertext = data.get("ciphertext")
+    schema = data.get("schema")
+
+    # 切换密文时,默认从旁挂 schema.json 自动加载
+    if ciphertext and schema is None:
+        cipher_path = Path(ciphertext)
+        sidecar = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
+        if sidecar.exists():
+            try:
+                schema = sidecar.read_text(encoding="utf-8")
+            except Exception:
+                schema = None
+
+    _sessions.set_context(sid, ciphertext=ciphertext, schema=schema)
     return {"ok": True}
 
 
