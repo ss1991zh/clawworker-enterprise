@@ -635,7 +635,9 @@ def _smart_read_tabular(path: Path, suffix: str) -> tuple[Any, str, int]:
         except Exception:
             # C engine 不接受列数不一致;换 python engine 兜底
             raw = reader(header=None, engine="python")
-        h = _find_header_row(raw, prev_cols_count=len(df_default.columns) + 1)
+        # 注意:不能用 len(df_default.columns)+1 做下限 —— 旧 df 的列数
+        # 来自坏 header(可能比真实少),会把对的表头排除掉。这里只要 ≥2。
+        h = _find_header_row(raw, prev_cols_count=2)
         try:
             return reader(header=h), h
         except Exception:
