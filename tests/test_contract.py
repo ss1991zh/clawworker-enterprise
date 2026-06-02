@@ -51,15 +51,17 @@ class TestComputationPlanScenarios:
             sheets=[SheetSpec(name="S1")],
         )
 
-    def test_scenario_1_requires_tool(self):
-        with pytest.raises(ValidationError):
-            ComputationPlan(
-                scenario=Scenario.DESCRIPTIVE,
-                ops=[Operation(op="sum")],
-                output=self._valid_output(),
-            )
+    def test_scenario_1_allows_legacy_ops(self):
+        # v3:tool 不再必填,ops 仍可作为 legacy 入口
+        plan = ComputationPlan(
+            scenario=Scenario.DESCRIPTIVE,
+            ops=[Operation(op="sum")],
+            output=self._valid_output(),
+        )
+        assert plan.ops
 
-    def test_scenario_1_requires_ops(self):
+    def test_scenario_1_requires_skill_calls_or_ops(self):
+        # 没有 skill_calls 也没有 ops 时必须报错
         with pytest.raises(ValidationError):
             ComputationPlan(
                 scenario=Scenario.DESCRIPTIVE,

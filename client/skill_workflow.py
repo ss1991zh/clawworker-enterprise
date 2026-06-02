@@ -250,6 +250,121 @@ def _make_decrypt(deps: WorkflowDeps):
     return decrypt
 
 
+def _make_execute_skills(deps: WorkflowDeps):
+    """
+    v3 主路径:跑 plan.skill_calls,产出 [(sheet_name, df, chart)]。
+    每个 SkillCall 对应 client/tools/skills.py 里的 skill 函数,
+    内部自己 ps 计算 → ct.decrypt → 合并 metadata。
+    多 SkillCall 自动出多 sheet。
+    """
+
+    def execute_skills(state: AgentState) -> dict:
+        if state.get("error"):
+            return {}
+        plan = ComputationPlan.model_validate(state["computation_plan"])
+        if not plan.skill_calls:
+            return {"error": "execute_skills: plan.skill_calls 为空"}
+
+        paths = state.get("ciphertext_paths", [])
+        if not paths:
+            return {"error": "没有可用的密文输入文件"}
+        ps_tool = deps.pandaseal
+        backend = getattr(ps_tool, "backend", "stub")
+        if backend == "real":
+            cipher_in: Any = paths[0]
+        else:
+            cipher_in = Path(paths[0]).read_bytes()
+
+        try:
+            cdf = ps_tool._load_real(cipher_in) if backend == "real" else cipher_in
+        except Exception as e:
+            return {"error": f"加载密文失败: {e}"}
+
+        metadata_rows = state.get("metadata_rows")
+        metadata_columns = state.get("metadata_columns")
+
+        from client.tools.skills import run_skill
+        results: list[dict] = []
+        for i, sc in enumerate(plan.skill_calls):
+            try:
+                sheet_name, df, chart_hint = run_skill(
+                    sc.skill, cdf,
+                    sc.params or {},
+                    metadata_rows, metadata_columns,
+                )
+                if sc.sheet_name:
+                    sheet_name = sc.sheet_name
+                final_chart = sc.chart.model_dump() if sc.chart else chart_hint
+                results.append({
+                    "sheet_name": sheet_name,
+                    "df": df,
+                    "chart": final_chart,
+                })
+            except Exception as e:
+                return {"error": f"skill「{sc.skill}」(第 {i+1} 个 SkillCall)失败: {e}"}
+
+        return {"skill_results": results}
+
+    return execute_skills
+
+
+def _write_excel_from_skills_node(state: AgentState) -> dict:
+    """v3:把 execute_skills 产出的 [(sheet_name, df, chart)] 列表写成多 sheet Excel。"""
+    if state.get("error"):
+        return {}
+    results = state.get("skill_results") or []
+    if not results:
+        return {"error": "skill_results 为空,无法写 Excel"}
+
+    from client.excel_output import SheetData as _SD
+    from shared.contract import ChartSpec as _CS
+    sheets: list[_SD] = []
+    for r in results:
+        df = r["df"]
+        if df is None or df.empty:
+            continue
+        chart = r.get("chart")
+        chart_spec = None
+        if chart:
+            try:
+                chart_spec = _CS(
+                    type=chart.get("type", "bar"),
+                    x=chart.get("x", df.columns[0]),
+                    y=chart.get("y", df.columns[-1]),
+                    title=chart.get("title", r["sheet_name"]),
+                )
+            except Exception:
+                chart_spec = None
+        headers = list(df.columns)
+        rows = df.values.tolist()
+        # 自动 number_format
+        nf = {}
+        for c in headers:
+            sc = str(c).lower()
+            if any(k in sc for k in ("rate", "ratio")) or any(k in str(c) for k in ("率", "比例")):
+                nf[c] = "0.00%"
+            elif any(k in str(c) for k in ("金额", "(元)", "(元)", "amount", "value")):
+                nf[c] = "#,##0.00"
+        sheets.append(_SD(
+            name=str(r["sheet_name"])[:31],
+            headers=headers,
+            rows=rows,
+            chart=chart_spec,
+            number_formats=nf,
+        ))
+
+    if not sheets:
+        return {"error": "所有 SkillCall 都产出了空表"}
+
+    final_path = make_excel_path()
+    enforce_excel_path(final_path)
+    try:
+        result: WriteResult = write_excel(sheets, path=final_path)
+    except Exception as e:
+        return {"error": f"Excel 写入失败: {e}"}
+    return {"excel_path": str(result.path)}
+
+
 def _write_excel_node(state: AgentState) -> dict:
     """根据 plan.output 渲染解密结果,写入 Excel。
 
@@ -1979,6 +2094,9 @@ def build_workflow(
     g.add_node("compute_pipeline", _make_compute_pipeline(deps))
     g.add_node("decrypt", _make_decrypt(deps))
     g.add_node("write_excel", _write_excel_node)
+    # v3 主路径
+    g.add_node("execute_skills", _make_execute_skills(deps))
+    g.add_node("write_excel_from_skills", _write_excel_from_skills_node)
 
     # ----- 边 -----
     g.add_edge(START, "prepare")
@@ -1989,59 +2107,88 @@ def build_workflow(
         _after_validate_plan,
         {"filter_summary": "filter_summary", "retry_or_fail": END},
     )
+    # v3 路由:plan.skill_calls 非空走 execute_skills,否则走老路径(compute_*)
+    def _v3_or_legacy(state: AgentState) -> str:
+        s = _after_filter_summary(state, max_retries)
+        # 过滤命中 / 重试 / fallback / end_early 维持原值
+        if s in ("retry_llm", "fallback_summary", "end_early"):
+            return s
+        # 否则按 plan 类型分:有 skill_calls 走 v3,无则走老 compute_*
+        cp = state.get("computation_plan") or {}
+        if cp.get("skill_calls"):
+            return "execute_skills"
+        return s  # compute_pandaseal / compute_henumpy / ...
+
     g.add_conditional_edges(
         "filter_summary",
-        lambda s: _after_filter_summary(s, max_retries),
+        _v3_or_legacy,
         {
-            # 场景路由出口
+            "execute_skills": "execute_skills",
             "compute_pandaseal": "compute_pandaseal",
             "compute_henumpy": "compute_henumpy",
             "compute_helearn": "compute_helearn",
             "compute_hetorch": "compute_hetorch",
             "compute_pipeline": "compute_pipeline",
             "end_early": END,
-            # 过滤命中的两条
             "retry_llm": "retry_llm",
             "fallback_summary": "fallback_summary",
         },
     )
     g.add_edge("retry_llm", "call_llm")
 
-    # filter_summary 通过 → 直接按 scenario 路由到 compute(不再先走 authorize)
-    # fallback_summary 走完也用同一组路由,保持兜底仍能产出 Excel
-    scenario_routes = {
-        "compute_pandaseal": "compute_pandaseal",
-        "compute_henumpy": "compute_henumpy",
-        "compute_helearn": "compute_helearn",
-        "compute_hetorch": "compute_hetorch",
-        "compute_pipeline": "compute_pipeline",
-        "end_early": END,
-    }
-    # filter_summary 的 clean 分支重定向到场景路由
-    # (filter_summary 已有 add_conditional_edges,改 "authorize" 出口为 "route_scenario")
-    g.add_conditional_edges("fallback_summary", _route_scenario, scenario_routes)
+    # fallback_summary 也支持 v3
+    def _fb_route(state: AgentState) -> str:
+        cp = state.get("computation_plan") or {}
+        if cp.get("skill_calls"):
+            return "execute_skills"
+        return _route_scenario(state)
 
-    # compute_* → authorize(架构 §B6:解密前授权)→ decrypt
+    g.add_conditional_edges(
+        "fallback_summary", _fb_route,
+        {
+            "execute_skills": "execute_skills",
+            "compute_pandaseal": "compute_pandaseal",
+            "compute_henumpy": "compute_henumpy",
+            "compute_helearn": "compute_helearn",
+            "compute_hetorch": "compute_hetorch",
+            "compute_pipeline": "compute_pipeline",
+            "end_early": END,
+        },
+    )
+
+    # 老路径:compute_* → authorize → decrypt → write_excel
     for compute in (
-        "compute_pandaseal",
-        "compute_henumpy",
-        "compute_helearn",
-        "compute_hetorch",
-        "compute_pipeline",
+        "compute_pandaseal", "compute_henumpy",
+        "compute_helearn", "compute_hetorch", "compute_pipeline",
     ):
         g.add_edge(compute, "authorize")
 
+    # v3 路径:execute_skills(内部已解密)→ authorize → write_excel_from_skills
+    g.add_edge("execute_skills", "authorize")
+
+    def _after_authorize_v3(state: AgentState) -> str:
+        """v3 路径 authorize 后走 write_excel_from_skills;老路径走 decrypt。"""
+        if state.get("error"):
+            return "end_early"
+        if not state.get("authorized"):
+            return "write_excel_encrypted"
+        if state.get("skill_results"):
+            return "write_excel_from_skills"
+        return "decrypt"
+
     g.add_conditional_edges(
         "authorize",
-        _after_authorize,
+        _after_authorize_v3,
         {
             "decrypt": "decrypt",
+            "write_excel_from_skills": "write_excel_from_skills",
             "write_excel_encrypted": "write_excel_encrypted",
             "end_early": END,
         },
     )
     g.add_edge("decrypt", "write_excel")
     g.add_edge("write_excel", END)
+    g.add_edge("write_excel_from_skills", END)
     g.add_edge("write_excel_encrypted", END)
 
     return g.compile()

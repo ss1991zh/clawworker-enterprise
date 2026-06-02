@@ -161,6 +161,19 @@ class Operation(BaseModel):
         return data
 
 
+class SkillCall(BaseModel):
+    """
+    新主路径 — LLM 通过 skill_calls 表达计算意图。
+    每个 SkillCall 对应 client/tools/skills.py 里的一个 skill 函数。
+    产出一个 sheet,自动合并 metadata 身份列。
+    """
+
+    skill: str                            # 必须在 SKILLS 注册表里
+    params: dict[str, Any] = Field(default_factory=dict)
+    sheet_name: Optional[str] = None      # 不传时由 skill 自定
+    chart: Optional[ChartSpec] = None     # 可选;skill 会给默认 chart
+
+
 class PipelineStep(BaseModel):
     """复合场景中的一个流水线步骤。"""
 
@@ -173,14 +186,22 @@ class ComputationPlan(BaseModel):
     """
     LLM 输出的结构化计算指令。
 
-    - 场景 1-4:tool + ops + output 必填
-    - 场景 5:tool=None,只做加密入库(实际上 LLM 不会输出这种 plan)
-    - 场景 6:pipeline_steps 必填,顶层 tool/ops 不使用
+    新主路径(v3,推荐):
+      - skill_calls: list[SkillCall]  ← LLM 挑预定义 skill + 填字段,
+                                        客户端直接调本地 skill 模板
+    老路径(已弃用,保留只为读历史会话):
+      - tool + ops:LLM 手写 op 序列
+
+    要求:
+      - 场景 1-4:必须有 skill_calls + output
+      - 场景 6:用 pipeline_steps(暂未改造)
+      - 场景 5:LLM 不出 plan
     """
 
     scenario: Scenario
-    tool: Optional[CalcTool] = None
-    ops: list[Operation] = Field(default_factory=list)
+    skill_calls: list[SkillCall] = Field(default_factory=list)   # 新主路径
+    tool: Optional[CalcTool] = None                              # 已弃用
+    ops: list[Operation] = Field(default_factory=list)           # 已弃用
     output: Optional[ExcelOutput] = None
     pipeline_steps: list[PipelineStep] = Field(default_factory=list)
 
@@ -188,14 +209,11 @@ class ComputationPlan(BaseModel):
     def _check_scenario_consistency(self) -> "ComputationPlan":
         sc = self.scenario
         if sc in (Scenario.DESCRIPTIVE, Scenario.NUMERICAL, Scenario.CLASSICAL_ML, Scenario.DL_INFERENCE):
-            if not self.tool:
-                raise ValueError(f"场景 {sc.value} 必须指定 tool")
-            expected = SCENARIO_DEFAULT_TOOL[sc]
-            if self.tool != expected:
-                # 允许但警告(后续可改成严格)—— 此处仅记录到 ops 不阻塞
-                pass
-            if not self.ops:
-                raise ValueError(f"场景 {sc.value} 必须至少有一个 op")
+            # 新路径主要校验 skill_calls;ops 留作 fallback(过渡期)
+            if not self.skill_calls and not self.ops:
+                raise ValueError(
+                    f"场景 {sc.value} 必须提供 skill_calls(推荐)或 ops(已弃用)"
+                )
             if not self.output:
                 raise ValueError(f"场景 {sc.value} 必须指定 output(Excel 文件)")
 
@@ -206,7 +224,6 @@ class ComputationPlan(BaseModel):
                 raise ValueError("场景 6 必须指定最终 output")
 
         elif sc == Scenario.INGESTION:
-            # 场景 5 一般不会由 LLM 出 plan,但允许构造空 plan
             pass
 
         return self
