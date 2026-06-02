@@ -511,10 +511,19 @@ async function renderFilesTab() {
       const cols = res.column_preview || [];
       const sheet = res.sheet_name && res.sheet_name !== "csv" ? `sheet「${esc(res.sheet_name)}」` : "";
       const headerHint = (res.header_row || 0) > 0 ? `(从第 ${res.header_row + 1} 行开始识别表头)` : "";
+      // NaN 填 0 的列(HE 不能 encrypt 空字符串)
+      const nan = res.nan_filled || {};
+      const nanKeys = Object.keys(nan);
+      const nanHint = nanKeys.length
+        ? `<br><span style="color:#92400e;">⚠ ${nanKeys.length} 列有空值已自动填 0:` +
+          `${nanKeys.map(k => `${esc(k)}(${nan[k]} 个)`).join(", ")}</span>`
+        : "";
       $("fileUpStatus").innerHTML =
         `<div class="alert-box success">✓ 已加密入库:<strong>${esc(res.name)}</strong>` +
         `<br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行 · ${sheet} ${headerHint}` +
-        `<br>识别到的列:<span class="mono" style="font-size:11px;">${cols.map(esc).join(", ")}</span></div>`;
+        `<br>识别到的列:<span class="mono" style="font-size:11px;">${cols.map(esc).join(", ")}</span>` +
+        nanHint +
+        `</div>`;
       setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
       inp.value = "";
       await loadFiles(); renderFilesList();

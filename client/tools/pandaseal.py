@@ -88,10 +88,22 @@ class PandaSeal:
         if isinstance(cipher_in, (str, Path)):
             p = Path(cipher_in)
             suffix = p.suffix.lower()
+            # SKILL.md(pandaseal §快速参考):
+            #   "读取加密文件: cdf = ps.read_excel('cipher.xlsx', index_col=0)"
+            # 必须传 index_col=0,让 ps 把 _P / _L marker 行当索引,不当数据列;
+            # 否则 ps.read_excel 会试图把字符串 "_P" 转 float 报错。
+            # csv 也加(虽然 csv 默认能识别,但显式更安全)。
             if suffix == ".csv":
-                return ps.read_csv(str(p))
+                try:
+                    return ps.read_csv(str(p), index_col=0)
+                except TypeError:
+                    # 老版本 ps 可能不支持 index_col 参数
+                    return ps.read_csv(str(p))
             if suffix in (".xlsx", ".xls"):
-                return ps.read_excel(str(p))
+                try:
+                    return ps.read_excel(str(p), index_col=0)
+                except TypeError:
+                    return ps.read_excel(str(p))
             if suffix == ".json":
                 return ps.read_json(str(p))
             raise ValueError(f"pandaseal 不支持文件类型: {suffix}")

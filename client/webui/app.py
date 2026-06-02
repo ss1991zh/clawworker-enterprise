@@ -524,11 +524,22 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         cipher_suffix = ".csv" if backend == "real" else ".csv.cipher"
         dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
 
+        # 统计 NaN(为前端反馈用,也避免 ct.encrypt_csv 看到空字符串炸)
+        nan_counts = {}
         if numeric_cols:
+            num_df = df[numeric_cols].copy()
+            # 哪些列含 NaN
+            for col in numeric_cols:
+                cnt = int(num_df[col].isna().sum())
+                if cnt > 0:
+                    nan_counts[col] = cnt
+            # ct.encrypt_csv 不接受空字符串/NaN → 全部填 0 兜底
+            # (HE 加 0 不影响 sum/mean 的相对关系,但要告诉用户)
+            num_df = num_df.fillna(0)
             with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as t2:
                 num_tmp = Path(t2.name)
             try:
-                df[numeric_cols].to_csv(num_tmp, index=False)
+                num_df.to_csv(num_tmp, index=False)
                 zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
                 zfhe.encrypt_file(num_tmp, dst)
             finally:
@@ -575,6 +586,8 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
             "sheet_name": sheet_name,
             "header_row": header_row,
             "column_preview": all_cols[:8],
+            # 哪些数字列含空值被填了 0(HE 不能 encrypt 空字符串)
+            "nan_filled": nan_counts,
         }
     finally:
         tmp_path.unlink(missing_ok=True)
