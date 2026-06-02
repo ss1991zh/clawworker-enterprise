@@ -514,20 +514,21 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
                 "或第一行 / 第二行是不是被合并单元格 / 标题占了",
             )
 
-        # ----- 2) 加密入库:仅数字列(字符串无法 HE 编码)-----
-        # 先把数字列单独存成纯数字 CSV,送给 ZFHE
-        cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
+        # ----- 2) 加密入库:仅数字列,**强制走 CSV 路径** -----
+        # 原因:ct.encrypt_excel 在 xlsx 里把 _P / _L marker 写成"字符串字面值",
+        # ps.read_excel 后续 float 转换时会炸("could not convert string to float: '_P'")。
+        # ct.encrypt_csv → ps.read_csv 路径下 _P/_L 是隐式 index 标签,完全兼容。
+        # 所以无论用户给 csv 还是 xlsx,我们都先 to_csv 再 encrypt_csv,落地 .cipher.csv。
         stem = Path(raw_file.filename or "data").stem
+        # 命名约定:.csv.cipher(用 stub)or .csv(用 real;ct 输出 CSV)
+        cipher_suffix = ".csv" if backend == "real" else ".csv.cipher"
         dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
 
         if numeric_cols:
-            with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".csv") as t2:
                 num_tmp = Path(t2.name)
             try:
-                if raw_suffix == ".csv":
-                    df[numeric_cols].to_csv(num_tmp, index=False)
-                else:
-                    df[numeric_cols].to_excel(num_tmp, index=False)
+                df[numeric_cols].to_csv(num_tmp, index=False)
                 zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
                 zfhe.encrypt_file(num_tmp, dst)
             finally:
