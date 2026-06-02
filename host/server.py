@@ -282,23 +282,16 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     # 1) 找用户绑定的 LLM 配置
     provider, cfg = _resolve_user_provider(sess.username)
 
-    # 2) 跑 dispatcher,出错也要记一条失败统计
+    # 2) 拆成两步:先 raw_chat 拿文本,再 parse_llm_text 抽计划。
+    #    这样 LLM 把 plan 给糊了也能把 raw 文本打日志、给前端友好提示
+    from host.llm_proxy import parse_llm_text
+
     task_id = dispatcher.create(sess.username)
     dispatcher.mark_running(task_id)
+
+    # 2a) 先调用 LLM
     try:
-        resp = provider.chat(system=req.system, user=req.user)
-    except ValueError as e:
-        # parse_llm_text 失败:LLM 输出没按格式给。打出最后一次 raw 文本前 500 字符
-        import traceback as _tb
-        print(f"[/llm/chat] parse fail · user={sess.username} · "
-              f"cfg={cfg.name} · err={e}\n{_tb.format_exc()[-1000:]}")
-        dispatcher.fail(task_id, str(e))
-        call_stats.record(
-            config=cfg, username=sess.username,
-            prompt_tokens=0, completion_tokens=0,
-            success=False, cost_usd=0.0,
-        )
-        raise HTTPException(500, f"LLM 输出格式不符:{e}") from e
+        raw_text = provider.raw_chat(system=req.system, user=req.user)
     except Exception as e:
         dispatcher.fail(task_id, str(e))
         call_stats.record(
@@ -307,6 +300,33 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
             success=False, cost_usd=0.0,
         )
         raise HTTPException(500, f"LLM 调用失败: {e}") from e
+
+    # 2b) 再 parse — 失败时把原文留日志,前端给简洁提示
+    try:
+        resp = parse_llm_text(raw_text)
+    except ValueError as e:
+        print(
+            f"[/llm/chat] parse fail · user={sess.username} · cfg={cfg.name}\n"
+            f"  err: {e}\n"
+            f"  raw (前 600 字): {raw_text[:600]!r}\n"
+            f"  raw (末 200 字): {raw_text[-200:]!r}"
+        )
+        dispatcher.fail(task_id, str(e))
+        # 用 raw_chat 时 last_usage 已填,这里也记一条失败统计但保留 token 用量
+        usage = getattr(provider, "last_usage", {}) or {}
+        call_stats.record(
+            config=cfg, username=sess.username,
+            prompt_tokens=int(usage.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(usage.get("completion_tokens", 0) or 0),
+            success=False,
+            cost_usd=float(usage.get("cost_usd", 0.0) or 0.0),
+        )
+        raise HTTPException(
+            500,
+            f"LLM 输出不符合规范(未找到 computation_plan)· "
+            f"模型可能没按 system prompt 输出 JSON · "
+            f"请稍后再试 / 换个模型 / 重写问题",
+        ) from e
 
     # 3) 记录用量
     usage = getattr(provider, "last_usage", {}) or {}
