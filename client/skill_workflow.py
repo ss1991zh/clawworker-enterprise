@@ -1632,8 +1632,27 @@ def _render_to_sheets(
         pd = None  # type: ignore
 
     if pd is not None and isinstance(decrypted, pd.DataFrame):
-        df = decrypted.reset_index()
-        # 索引列名兜底
+        df = decrypted.reset_index(drop=True)
+
+        # 关键:若行数对齐 metadata,prepend 身份列(员工编号 / 销售代表 / 大区...)
+        # 否则只输出 index + 数字列,用户看不出每行是谁。
+        if metadata_rows and len(metadata_rows) == len(df):
+            try:
+                meta_df = pd.DataFrame(metadata_rows)
+                # 用 metadata_columns 的顺序(若有),否则用 meta_df 原列序
+                if metadata_columns:
+                    keep = [c for c in metadata_columns if c in meta_df.columns]
+                    meta_df = meta_df[keep] if keep else meta_df
+                # 避免列名冲突:meta 列在前,只保留 df 里没有的
+                meta_cols = [c for c in meta_df.columns if c not in df.columns]
+                if meta_cols:
+                    df = pd.concat(
+                        [meta_df[meta_cols].reset_index(drop=True), df], axis=1
+                    )
+            except Exception:
+                pass  # 合并失败也不阻塞,继续走原路径
+
+        # 列名兜底
         df.columns = [str(c) if c is not None and str(c) != "" else "index" for c in df.columns]
         headers = primary_spec.columns or list(df.columns)
         # 容错:headers 在 df 中不存在的列跳过
