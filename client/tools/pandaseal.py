@@ -250,7 +250,19 @@ class PandaSeal:
                     raise ValueError(f"multiplier 列不存在: {multiplier}")
                 result = result * cdf[multiplier]
 
-            return result
+            # 返回类型决策:
+            # 默认:把率作为新列加回 cdf,后续 group_by / mean / sort 还能跑
+            #      (LLM 经常给 [div, group_by, mean],div 输出 Series 会让后续炸)
+            # 显式 return_series=True 时才返回 CipherSeries
+            if p.get("return_series", False):
+                return result
+            out_col = p.get("output_col") or p.get("name") or p.get("as") or "_ratio"
+            try:
+                cdf[out_col] = result
+                return cdf
+            except Exception:
+                # CipherDataFrame 不支持赋值就只能返回 series
+                return result
 
         if name == "forecast":
             # 时间序列预测 hint op:HE 上仅返回值列(CipherSeries 或 CipherDataFrame),
