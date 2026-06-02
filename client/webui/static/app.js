@@ -223,19 +223,39 @@ function renderMessage(m) {
           <span class="run-time" data-since="${m.created_at}">0s</span>
         </div>`;
     } else if (m.status === "failed") {
-      if (m.scenario || m.plan_summary) {
-        content += `<div class="trace"><details><summary>计算追踪</summary>
-          <div class="step">场景: ${esc(m.scenario || "—")}</div>
-          <div class="step">步骤: ${esc(m.plan_summary || "—")}</div>
-        </details></div>`;
+      if (m.steps && m.steps.length) {
+        const dur = (m.duration_sec || 0).toFixed(1);
+        const sc = m.scenario || "—";
+        content += `<div class="trace"><details open>` +
+          `<summary>计算追踪 · ${esc(sc)} · ${dur}s · ${m.steps.length} 步</summary>` +
+          `<div class="steps">`;
+        m.steps.forEach(s => {
+          const cls = s.kind || 'step';
+          const det = s.detail ? `<span class="step-detail"> · ${esc(s.detail)}</span>` : '';
+          content += `<div class="step ${cls}">${esc(s.label)}${det}</div>`;
+        });
+        content += `</div></details></div>`;
       }
       content += `<div class="err-card">${ICON_SVG.warn}<span class="err-text">${withFlatIcons(esc(m.error || "未知错误"))}</span></div>`;
     } else {
       // done
-      if (m.scenario || m.plan_summary) {
-        content += `<div class="trace"><details><summary>计算追踪 · ${esc(m.scenario || "—")} · ${(m.duration_sec || 0).toFixed(1)}s</summary>
-          <div class="step">${esc(m.plan_summary || "(无 op 列表)")}</div>
-        </details></div>`;
+      if ((m.steps && m.steps.length) || m.scenario || m.plan_summary) {
+        const steps = m.steps || [];
+        const dur = (m.duration_sec || 0).toFixed(1);
+        const sc = m.scenario || "—";
+        content += `<div class="trace"><details>` +
+          `<summary>计算追踪 · ${esc(sc)} · ${dur}s · ${steps.length} 步</summary>` +
+          `<div class="steps">`;
+        if (steps.length) {
+          steps.forEach(s => {
+            const cls = s.kind || 'step';
+            const det = s.detail ? `<span class="step-detail"> · ${esc(s.detail)}</span>` : '';
+            content += `<div class="step ${cls}">${esc(s.label)}${det}</div>`;
+          });
+        } else if (m.plan_summary) {
+          content += `<div class="step">${esc(m.plan_summary)}</div>`;
+        }
+        content += `</div></details></div>`;
       }
       content += `<div class="bubble">${esc(m.summary || "(无总结)").replace(/\n/g, "<br>")}</div>`;
       if (m.excel_path && m.excel_name) {

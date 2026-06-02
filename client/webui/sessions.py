@@ -34,6 +34,9 @@ class Message:
     error: str = ""
     scenario: str = ""
     plan_summary: str = ""
+    # 每一步执行追踪 — 给"计算追踪"折叠面板用
+    # [{kind: think|call|result|error, label: str, detail: str(optional)}]
+    steps: list[dict[str, Any]] = field(default_factory=list)
     status: str = "done"                       # pending / running / done / failed
     duration_sec: float = 0.0
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
@@ -54,6 +57,7 @@ class Message:
             error=d.get("error", ""),
             scenario=d.get("scenario", ""),
             plan_summary=d.get("plan_summary", ""),
+            steps=list(d.get("steps", []) or []),
             status=d.get("status", "done"),
             duration_sec=float(d.get("duration_sec", 0.0) or 0.0),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),

@@ -1015,10 +1015,14 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
             except Exception:
                 pass
 
+        # 从 final state 重建每一步 trace
+        steps = _build_workflow_steps(final, cipher_path, backend, scenario)
+
         if final.get("error"):
             raw_err = str(final["error"])
             # 把 host session 失效翻译成中文,顺手清本机 state
             friendly_err = _friendly_workflow_error(raw_err)
+            steps.append({"kind": "error", "label": "工作流失败", "detail": raw_err[:200]})
             _sessions.update_message(
                 sid, asst_mid,
                 status="failed",
@@ -1028,6 +1032,7 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
                 excel_name=excel_name,
                 scenario=scenario,
                 plan_summary=plan_summary,
+                steps=steps,
                 duration_sec=round(time.time() - t0, 2),
             )
         else:
@@ -1039,6 +1044,7 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
                 excel_name=excel_name,
                 scenario=scenario,
                 plan_summary=plan_summary,
+                steps=steps,
                 duration_sec=round(time.time() - t0, 2),
             )
     except Exception as e:
@@ -1048,6 +1054,8 @@ def _run_workflow_for_message(sid: str, asst_mid: str, user_query: str) -> None:
             sid, asst_mid,
             status="failed",
             error=friendly_err,
+            steps=[{"kind": "error", "label": "工作流抛异常",
+                    "detail": f"{type(e).__name__}: {e}"}],
             duration_sec=round(time.time() - t0, 2),
         )
 
@@ -1083,10 +1091,137 @@ def _friendly_workflow_error(raw: str) -> str:
     return raw  # 兜底:原样显示
 
 
+def _build_workflow_steps(final: dict, cipher_path: Path, backend: str, scenario: str) -> list[dict[str, Any]]:
+    """
+    从 wf.invoke 的 final state 重建每一步追踪。
+    workflow 节点链:prepare → call_llm → validate_plan →
+        compute_(pandaseal|henumpy|helearn|hetorch|pipeline) →
+        authorize → [write_excel_encrypted | decrypt] → write_excel → filter_summary
+    """
+    steps: list[dict[str, Any]] = []
+    cipher_name = cipher_path.name
+    meta_path = final.get("metadata_path")
+    meta_rows = final.get("metadata_rows") or []
+
+    # 1) prepare(意图识别 + 加载 sidecar)
+    detail_parts = [f"密文「{cipher_name}」", f"backend={backend}"]
+    if meta_path:
+        detail_parts.append(f"meta sidecar({len(meta_rows)} 行身份列)")
+    steps.append({
+        "kind": "think",
+        "label": "识别意图 · 数据分析模式",
+        "detail": " · ".join(detail_parts),
+    })
+
+    # 2) call_llm → validate_plan
+    plan = final.get("plan")
+    if plan is not None:
+        steps.append({
+            "kind": "call",
+            "label": "POST /llm/chat",
+            "detail": f"system prompt + 用户问题 + schema",
+        })
+        try:
+            ops = getattr(plan, "ops", []) or []
+            tool = getattr(plan, "tool", "") or ""
+            op_names = [getattr(o, "op", str(o)) for o in ops]
+            steps.append({
+                "kind": "result",
+                "label": f"plan 解析 OK",
+                "detail": f"scenario={scenario} · tool={tool} · {len(ops)} 个 op: {' → '.join(op_names) if op_names else '(无)'}",
+            })
+        except Exception:
+            steps.append({"kind": "result", "label": "plan 解析 OK"})
+    else:
+        # LLM 没返回合法 plan
+        retry = final.get("retry_count", 0)
+        if retry > 0:
+            steps.append({"kind": "error", "label": f"LLM 返回不合法 · 重试 {retry} 次"})
+
+    # 3) 计算节点
+    enc_result = final.get("encrypted_result")
+    if enc_result is not None and plan is not None:
+        try:
+            ops = getattr(plan, "ops", []) or []
+            tool = getattr(plan, "tool", "pandaseal")
+            steps.append({
+                "kind": "call",
+                "label": f"密态计算 · {tool}",
+                "detail": f"{len(ops)} 步密文操作(全程不解密)",
+            })
+            steps.append({
+                "kind": "result",
+                "label": "密文结果就绪",
+                "detail": f"type={type(enc_result).__name__}",
+            })
+        except Exception:
+            pass
+
+    # 4) 解密授权(B6-1)
+    if final.get("needs_authorization") is not None:
+        if final.get("authorized"):
+            steps.append({
+                "kind": "call",
+                "label": "解密授权检查(B6-1)",
+                "detail": "auto-approve 通过",
+            })
+        else:
+            steps.append({
+                "kind": "error",
+                "label": "授权拒绝",
+                "detail": "用户未批准解密 · 仅产出包含密文版的 Excel",
+            })
+
+    # 5) 解密
+    dr = final.get("decrypted_rows") or final.get("decrypted_result")
+    if dr is not None:
+        try:
+            n = len(dr) if hasattr(dr, "__len__") else 1
+            steps.append({
+                "kind": "call",
+                "label": "ct.decrypt 解密最终结果",
+            })
+            steps.append({
+                "kind": "result",
+                "label": f"已解密 {n} 行",
+            })
+        except Exception:
+            pass
+
+    # 6) 写 Excel
+    excel_path = final.get("excel_path")
+    if excel_path:
+        steps.append({
+            "kind": "call",
+            "label": "写 Excel(明文标识 + 计算结果)",
+        })
+        steps.append({
+            "kind": "result",
+            "label": Path(excel_path).name,
+            "detail": f"{excel_path}",
+        })
+
+    # 7) summary 过滤(B6-3 零明文)
+    if final.get("summary_filter_hit"):
+        steps.append({
+            "kind": "think",
+            "label": "summary 零明文过滤(B6-3 命中)",
+            "detail": "模型 summary 含数字 / 日期 / 长串数字 → 已替换为占位符",
+        })
+
+    return steps
+
+
 def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
     """自由聊天 —— 直接走主机 /llm/freechat,纯文本进 / 纯文本出。"""
     host_url = _session_state["host_url"]
     token = _session_state["token"]
+    steps: list[dict[str, Any]] = [
+        {"kind": "think", "label": "识别意图",
+         "detail": "未绑定密文 → 进入自由对话模式(不走 HE 工作流)"},
+        {"kind": "call", "label": "POST /llm/freechat",
+         "detail": f"system={len(FREECHAT_SYSTEM_PROMPT)} 字 · user={len(user_query)} 字"},
+    ]
     try:
         r = httpx.post(
             f"{host_url}/llm/freechat",
@@ -1095,17 +1230,24 @@ def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
             timeout=120,
         )
     except httpx.HTTPError as e:
+        steps.append({"kind": "error", "label": "网络错误", "detail": f"{type(e).__name__}: {e}"})
         _sessions.update_message(
             sid, asst_mid, status="failed",
             error=f"无法连接主机:{type(e).__name__}: {e}",
+            steps=steps,
+            scenario="freechat",
             duration_sec=round(time.time() - t0, 2),
         )
         return
     if r.status_code == 401:
+        steps.append({"kind": "error", "label": "主机返回 401",
+                      "detail": "session 失效 → 清掉本机 state"})
         _clear_local_session()
         _sessions.update_message(
             sid, asst_mid, status="failed",
             error="登录已过期或主机被重启 · 请点右上角用户名 → 退出登录 → 重新登录",
+            steps=steps,
+            scenario="freechat",
             duration_sec=round(time.time() - t0, 2),
         )
         return
@@ -1114,9 +1256,13 @@ def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
             detail = r.json().get("detail", "")
         except Exception:
             detail = r.text[:200]
+        steps.append({"kind": "error", "label": f"主机拒绝 {r.status_code}",
+                      "detail": detail[:120]})
         _sessions.update_message(
             sid, asst_mid, status="failed",
             error=f"主机拒绝({r.status_code}):{detail}",
+            steps=steps,
+            scenario="freechat",
             duration_sec=round(time.time() - t0, 2),
         )
         return
@@ -1124,12 +1270,15 @@ def _run_freechat(sid: str, asst_mid: str, user_query: str, t0: float) -> None:
         text = (r.json().get("text") or "").strip()
     except Exception:
         text = r.text
+    steps.append({"kind": "result", "label": "LLM 回复",
+                  "detail": f"{len(text)} 字"})
     _sessions.update_message(
         sid, asst_mid,
         status="done",
         summary=text or "(空回复)",
         scenario="freechat",
         plan_summary="自由聊天 · 无 HE 计算",
+        steps=steps,
         duration_sec=round(time.time() - t0, 2),
     )
 
