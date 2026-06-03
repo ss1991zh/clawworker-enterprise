@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -25,7 +26,12 @@ import httpx
 
 from client.tools.runtime import Runtime
 from client.tools.skills import run_skill, SKILLS
-from client.webui.writer import write_skill_results
+from client.webui.plan_validator import validate_and_repair_plan
+from client.webui.writer import (
+    derive_excel_stem,
+    export_skill_results_encrypted,
+    write_skill_results,
+)
 from client.permissions import scan_summary
 from shared.contract import ComputationPlan
 
@@ -33,6 +39,51 @@ from shared.contract import ComputationPlan
 StepCallback = Callable[[str, str], None]  # (kind, label)
 # kind: think | call | result | error
 # label: 一行简短描述,前端直接显示
+
+# should_cancel: () -> bool;若返回 True,pipeline 在下一个检查点抛 CancelledError
+ShouldCancel = Callable[[], bool]
+
+
+class CancelledError(Exception):
+    """pipeline.ask 被用户取消时抛。"""
+
+
+def _post_cancellable(
+    url: str,
+    *,
+    headers: dict,
+    json_body: dict,
+    timeout: float,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    poll_interval: float = 0.2,
+) -> httpx.Response:
+    """
+    httpx.post 包一层:把请求丢子线程跑,主线程 200ms 轮询 cancel。
+    用户点停止 → 不等 LLM 返回直接抛 CancelledError,孤儿线程会自己结束被回收。
+    """
+    chk = should_cancel or (lambda: False)
+    box: dict = {}
+
+    def worker():
+        try:
+            box["resp"] = httpx.post(
+                url, headers=headers, json=json_body,
+                # 整体允许 timeout 秒,但 read/write/pool 都不主动断 —— 长任务靠 cancel
+                timeout=httpx.Timeout(timeout, connect=10.0, read=None, write=None, pool=None),
+            )
+        except Exception as e:
+            box["err"] = e
+
+    t = threading.Thread(target=worker, daemon=True, name="llm-post")
+    t.start()
+    while t.is_alive():
+        if chk():
+            # 不 join,直接抛 —— 线程会在自己的 httpx 调用结束时自然释放
+            raise CancelledError("用户已停止")
+        t.join(timeout=poll_interval)
+    if "err" in box:
+        raise box["err"]
+    return box["resp"]
 
 
 # ----------------------------------------------------------------------------
@@ -77,9 +128,133 @@ def _extract_plan_and_summary(text: str) -> tuple[ComputationPlan, str]:
     return plan, summary
 
 
+# ----------------------------------------------------------------------------
+# 意图识别 —— 区分"自由聊天"和"加密数据分析"
+# ----------------------------------------------------------------------------
+
+_ANALYSIS_KEYWORDS = (
+    # 中文动词 / 名词
+    "统计", "计算", "算一下", "算下", "算出", "算算", "分析", "汇总",
+    "排名", "排行", "明细", "对比", "占比",
+    "完成率", "回款率", "毛利率", "比率", "比例",
+    "平均", "均值", "总和", "求和", "总计", "合计",
+    "按", "分组", "分布", "分类", "描述", "概览", "概述",
+    "趋势", "预测", "环比", "同比",
+    "看每", "看各", "每位", "每个", "每人", "每月", "每天",
+    "Excel", "表格", "导出", "出表",
+    # 英文
+    "sum ", "mean ", "average", "count(", "group by", "groupby",
+    "analyze", "analyse", "stats", "top", "bottom", "rank",
+)
+
+
+def looks_like_analysis(user_query: str) -> bool:
+    """启发式:是否像数据分析意图。否 → 走自由聊天端点。"""
+    if not user_query:
+        return False
+    q = user_query.lower()
+    for kw in _ANALYSIS_KEYWORDS:
+        if kw.lower() in q:
+            return True
+    # 很长的问题通常也意味着复杂的分析意图
+    if len(user_query) > 60:
+        return True
+    return False
+
+
+# ----------------------------------------------------------------------------
+# 自由聊天 —— /llm/freechat
+# ----------------------------------------------------------------------------
+
+_FREECHAT_SYSTEM = (
+    "你是 Clawworker 企业版 · 同态加密数据分析助手。"
+    "用户现在没有附加密文文件 / 也没提数据分析诉求,你只是和他闲聊。"
+    "请用简洁、礼貌的中文回答。不要输出 <computation_plan> 或 JSON 块。"
+    "如果用户问起怎么用,可以提醒:点击下方回形针按钮选一份已加密文件,"
+    "再问类似「按大区统计完成率」「TOP10 销售」这样的问题即可生成 Excel 报表。"
+)
+
+
+def call_llm_for_freechat(
+    host_url: str, token: str, user_query: str,
+    history: Optional[list[dict]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    timeout: float = 1800.0,
+) -> str:
+    """调 host /llm/freechat,返回纯文本回复。history 可选透传。"""
+    r = _post_cancellable(
+        f"{host_url}/llm/freechat",
+        headers={"Authorization": f"Bearer {token}"},
+        json_body={
+            "system": _FREECHAT_SYSTEM,
+            "user": user_query,
+            "history": history or [],
+        },
+        timeout=timeout,
+        should_cancel=should_cancel,
+    )
+    if r.status_code == 401:
+        raise PermissionError("登录已过期")
+    r.raise_for_status()
+    body = r.json()
+    return body.get("text", "") or "(LLM 返回空文本)"
+
+
+def call_llm_for_plan_repair(
+    host_url: str, token: str, system_prompt: str, original_query: str, schema: dict,
+    prev_plan: ComputationPlan, warnings: list[str],
+    history: Optional[list[dict]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    timeout: float = 1800.0,
+) -> tuple[ComputationPlan, str]:
+    """
+    LLM 回环修正 —— validator 检出的 warning 反馈给 LLM,要它带着上下文重出 plan。
+    场景:LLM 漏写 compute / 用了校验表里没的指标名 / num_col 字段对不上 等。
+    """
+    warn_lines = "\n".join(
+        f"  · {w[len('warn:'):].strip()}"
+        for w in warnings if w.startswith("warn:")
+    )
+    prev_plan_json = json.dumps(prev_plan.model_dump(), ensure_ascii=False, indent=2)
+    user_msg = (
+        f"用户原问题:\n{original_query}\n\n"
+        f"你刚才生成的 plan(未通过业务校验):\n"
+        f"```json\n{prev_plan_json}\n```\n\n"
+        f"**校验未修复项**:\n{warn_lines}\n\n"
+        f"数据 schema:\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
+        f"请按 system prompt 的「派生指标识别铁律」**完整重写一份 plan**,务必:\n"
+        f"  1. sheet_name / value_cols / sort_by 里出现的 X率 / X比例 / X占比 / X差 / X贡献\n"
+        f"     **必须在 compute 里有同名条目**(可用 op:div / sub / add / mul / formula)\n"
+        f"  2. ratio_by_group 必须有有效 num_col / den_col,字段严格取自 schema\n"
+        f"  3. 字段名直接复用 schema(含括号、单位都不要省)\n"
+        f"  4. 若 schema 缺关键字段,**改用 describe 兜底 + summary 说明缺什么**,别瞎编公式\n"
+        f"只输出 <computation_plan>...</computation_plan> + <summary>...</summary> 两段,不要解释。"
+    )
+    r = _post_cancellable(
+        f"{host_url}/llm/chat",
+        headers={"Authorization": f"Bearer {token}"},
+        json_body={
+            "system": system_prompt, "user": user_msg,
+            "history": history or [],
+        },
+        timeout=timeout,
+        should_cancel=should_cancel,
+    )
+    if r.status_code == 401:
+        raise PermissionError("登录已过期")
+    r.raise_for_status()
+    body = r.json()
+    if "computation_plan" in body and "summary" in body:
+        plan = ComputationPlan.model_validate(body["computation_plan"])
+        return plan, body["summary"]
+    raise ValueError(f"repair LLM 返回未知格式: {list(body.keys())[:5]}")
+
+
 def call_llm_for_plan(
     host_url: str, token: str, system_prompt: str, user_query: str, schema: dict,
-    timeout: float = 180.0,
+    history: Optional[list[dict]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    timeout: float = 1800.0,
 ) -> tuple[ComputationPlan, str]:
     """调 host /llm/chat,返回 (plan, summary)。"""
     user_msg = (
@@ -88,11 +263,15 @@ def call_llm_for_plan(
         f"{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
         f"请按 system prompt 输出 computation_plan + summary。"
     )
-    r = httpx.post(
+    r = _post_cancellable(
         f"{host_url}/llm/chat",
         headers={"Authorization": f"Bearer {token}"},
-        json={"system": system_prompt, "user": user_msg},
-        timeout=httpx.Timeout(timeout, connect=5.0),
+        json_body={
+            "system": system_prompt, "user": user_msg,
+            "history": history or [],
+        },
+        timeout=timeout,
+        should_cancel=should_cancel,
     )
     if r.status_code == 401:
         raise PermissionError("登录已过期")
@@ -161,6 +340,22 @@ def load_schema(cipher_path: Path) -> dict:
 # ----------------------------------------------------------------------------
 
 
+def _fold_text_attachments(user_query: str, atts: Optional[list[dict]]) -> str:
+    """把 text_attachments 折到 user_query 前面 —— LLM 看到时已经合并好。"""
+    if not atts:
+        return user_query
+    parts: list[str] = []
+    for a in atts:
+        nm = a.get("name") or "attachment"
+        content = (a.get("content") or "").strip()
+        if not content:
+            continue
+        parts.append(f"[附件文件 · {nm}]\n{content}")
+    parts.append("[用户问题]")
+    parts.append(user_query)
+    return "\n\n".join(parts)
+
+
 def ask(
     *,
     user_query: str,
@@ -169,31 +364,77 @@ def ask(
     token: str,
     system_prompt: str,
     on_step: Optional[StepCallback] = None,
+    should_cancel: Optional[ShouldCancel] = None,
+    history: Optional[list[dict]] = None,
+    text_attachments: Optional[list[dict]] = None,
+    prompt_decrypt: Optional[Callable[[], str]] = None,
 ) -> dict:
     """
     跑一次完整分析。返回:
       {
-        status: "done" | "failed" | "needs_cipher",
+        status: "done" | "failed" | "cancelled",
         summary: str,
         excel_path: str,
-        skill_calls: list[str],   # 跑了哪些 skill
+        skill_calls: list[str],
         error: str,
       }
     """
     log = on_step or (lambda kind, label: None)
+    chk = should_cancel or (lambda: False)
 
-    # 1) 必须有密文
-    if cipher_path is None:
-        log("think", "未附密文文件 · 等待用户上传或指定")
-        return {
-            "status": "needs_cipher",
-            "summary": "请上传一份加密数据文件,或在消息里指定要分析哪份已加密的文件。",
-            "error": "",
-        }
+    def _ck():
+        if chk():
+            raise CancelledError("用户已停止")
+
+    # 把文本附件折到 user_query 顶部 —— 后续所有 LLM 调用都用这个版本
+    effective_query = _fold_text_attachments(user_query, text_attachments)
+    if text_attachments:
+        names = [a.get("name", "") for a in text_attachments if a.get("content")]
+        if names:
+            log("think", f"读取文本附件 · {' · '.join(names)}")
+
+    # 0) 意图识别 —— 不像分析就走自由聊天(允许"没附密文也能聊天")
+    # 用原始 user_query 判断,不让附件内容干扰意图判断
+    is_analysis = looks_like_analysis(user_query)
+
+    try:
+        # 1) 没附密文 → 自由聊天(LLM 直接回答)
+        if cipher_path is None:
+            log("think", "未附密文文件 · 自由聊天模式")
+            log("call", "调用 LLM(freechat)")
+            _ck()
+            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk)
+            _ck()
+            log("result", "已回复")
+            return {
+                "status": "done", "summary": text,
+                "excel_path": "", "skill_calls": [], "error": "",
+            }
+
+        # 2) 有密文但意图不像分析 → 仍走自由聊天
+        if not is_analysis:
+            log("think", f"已附密文「{cipher_path.name}」· 但问题不像数据分析 · 自由聊天模式")
+            log("call", "调用 LLM(freechat)")
+            _ck()
+            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk)
+            _ck()
+            log("result", "已回复")
+            return {
+                "status": "done", "summary": text,
+                "excel_path": "", "skill_calls": [], "error": "",
+            }
+    except CancelledError:
+        log("error", "已停止 · 用户取消")
+        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
+    except PermissionError:
+        return {"status": "failed", "error": "登录已过期 · 请重新登录", "summary": ""}
+    except Exception as e:
+        return {"status": "failed", "error": f"LLM 调用失败: {e}", "summary": ""}
+
     if not cipher_path.exists():
         return {"status": "failed", "error": f"密文文件不存在: {cipher_path}", "summary": ""}
 
-    log("think", f"识别意图 · 数据文件「{cipher_path.name}」")
+    log("think", f"识别意图:数据分析 · 文件「{cipher_path.name}」")
 
     # 2) 加载 sidecar
     schema = load_schema(cipher_path)
@@ -210,7 +451,15 @@ def ask(
     # 3) 调 LLM 拿 plan
     log("call", "调用 LLM 生成 skill_calls 计划")
     try:
-        plan, summary_raw = call_llm_for_plan(host_url, token, system_prompt, user_query, schema)
+        _ck()
+        plan, summary_raw = call_llm_for_plan(
+            host_url, token, system_prompt, effective_query, schema,
+            history=history, should_cancel=chk,
+        )
+        _ck()
+    except CancelledError:
+        log("error", "已停止 · 用户取消")
+        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
     except PermissionError as e:
         return {"status": "failed", "error": "登录已过期 · 请重新登录", "summary": ""}
     except Exception as e:
@@ -225,16 +474,60 @@ def ask(
 
     log("result", f"plan 解析 OK · {len(plan.skill_calls)} 个 skill 待执行")
 
-    # 4) 加载 cipher
+    # 校验 + 自动修复 LLM 输出偏差(漏写 compute、漏填 num_col 等)
+    plan, plan_warnings = validate_and_repair_plan(plan, schema, log_fn=log)
+    if plan_warnings:
+        fix_count = sum(1 for w in plan_warnings if w.startswith("fixed:"))
+        warn_count = sum(1 for w in plan_warnings if w.startswith("warn:"))
+        if fix_count:
+            log("think", f"plan 校验 · 自动修复 {fix_count} 处指标缺失")
+        if warn_count:
+            log("think", f"plan 校验 · {warn_count} 处未硬编码 · 进入 LLM 回环修正")
+            try:
+                _ck()
+                plan, summary_repaired = call_llm_for_plan_repair(
+                    host_url, token, system_prompt, user_query, schema,
+                    plan, plan_warnings,
+                    history=history, should_cancel=chk,
+                )
+                _ck()
+                summary_raw = summary_repaired or summary_raw
+                log("result", f"LLM 回环修正成功 · {len(plan.skill_calls)} 个 skill")
+                # 二次校验 —— 这次只补不再回环,避免死循环
+                plan, plan_warnings2 = validate_and_repair_plan(plan, schema, log_fn=log)
+                fix2 = sum(1 for w in plan_warnings2 if w.startswith("fixed:"))
+                warn2 = sum(1 for w in plan_warnings2 if w.startswith("warn:"))
+                if fix2:
+                    log("think", f"二次校验 · 又自动补了 {fix2} 处")
+                if warn2:
+                    log("think", f"二次校验仍有 {warn2} 处未修复 · 按现有 plan 继续(用户可在 Excel 自检)")
+            except CancelledError:
+                raise
+            except PermissionError:
+                return {"status": "failed", "error": "登录已过期 · 请重新登录", "summary": summary_raw}
+            except Exception as e:
+                log("error", f"LLM 回环修正失败:{e} · 用原 plan 继续")
+
+    # 4) 加载 cipher(读密文 · CipherDataFrame · 不涉及解密)
     log("call", f"加载密文 {cipher_path.name}")
     try:
+        _ck()
         cdf = load_cipher_df(cipher_path)
+    except CancelledError:
+        log("error", "已停止 · 用户取消")
+        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
     except Exception as e:
         return {"status": "failed", "error": f"密文加载失败: {e}", "summary": summary_raw}
 
-    # 5) 跑每个 SkillCall
+    # 5) 密态计算 —— 每个 SkillCall 在密文上跑(各 skill 计算路径不同)
+    log("think", "进入密态计算阶段 · 计算全程不暴露明文")
     results: list[dict] = []
     for i, sc in enumerate(plan.skill_calls, 1):
+        try:
+            _ck()
+        except CancelledError:
+            log("error", "已停止 · 用户取消")
+            return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [sc.skill for sc in plan.skill_calls[:i-1]]}
         skill_def = SKILLS.get(sc.skill)
         if not skill_def:
             return {
@@ -243,7 +536,7 @@ def ask(
                 "summary": summary_raw,
             }
         desc = skill_def.get("desc", sc.skill)
-        log("call", f"({i}/{len(plan.skill_calls)}) {sc.skill} · {desc[:30]}")
+        log("call", f"({i}/{len(plan.skill_calls)}) 密态运算 · {sc.skill} · {desc[:30]}")
         try:
             sheet_name, df, chart_hint = run_skill(
                 sc.skill, cdf, sc.params or {},
@@ -252,7 +545,7 @@ def ask(
             if sc.sheet_name:
                 sheet_name = sc.sheet_name
             chart = sc.chart.model_dump() if sc.chart else chart_hint
-            results.append({"sheet_name": sheet_name, "df": df, "chart": chart})
+            results.append({"sheet_name": sheet_name, "df": df, "chart": chart, "skill": sc.skill})
             log("result", f"sheet「{sheet_name}」就绪 · {len(df)} 行 × {len(df.columns)} 列")
         except Exception as e:
             return {
@@ -261,10 +554,52 @@ def ask(
                 "summary": summary_raw,
             }
 
-    # 6) 写 Excel
+    # ──────────────────────────────────────────────
+    # B6-1 解密展示授权:计算已在密态完成,问用户结果是否解密展示
+    # 选项:decrypt(解密后写 Excel)/ keep_encrypted(导出密文文件)/ cancel
+    # ──────────────────────────────────────────────
+    decision = "decrypt"
+    if prompt_decrypt:
+        log("think", f"密态计算完成 · 等待解密展示授权({len(results)} 个 sheet)")
+        try:
+            decision = prompt_decrypt() or "decrypt"
+        except CancelledError:
+            log("error", "已停止 · 用户取消")
+            return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [r["skill"] for r in results]}
+        log("result", f"用户选择:{'解密展示' if decision == 'decrypt' else '保留密文展示' if decision == 'keep_encrypted' else '取消'}")
+
+    if decision == "cancel":
+        return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [r["skill"] for r in results]}
+
+    # Excel 文件名 stem:<密文原名> + <用户问题关键词>(尽量贴近用户语境)
+    excel_stem = derive_excel_stem(cipher_path, user_query)
+
+    if decision == "keep_encrypted":
+        log("call", f"重新加密 {len(results)} 个 sheet · 数值列保持密文")
+        try:
+            excel_path = export_skill_results_encrypted(
+                results, cipher_path, stem=excel_stem,
+            )
+        except Exception as e:
+            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
+        log("result", f"完成 · {excel_path.name}")
+        cipher_summary = (
+            f"密态计算已完成 · 已按要求**保留密文展示** · 共 {len(results)} 个 sheet。"
+            f"输出 Excel 与解密版结构一致(身份列 + 数值列),但数值列保持同态密文 (base64) 形式;"
+            f"「说明」sheet 列出了 skill → sheet 映射。若要查看明文结果请重新提问并选择「解密展示」。"
+        )
+        return {
+            "status": "done",
+            "summary": cipher_summary,
+            "excel_path": str(excel_path),
+            "skill_calls": [r["skill"] for r in results],
+            "error": "",
+        }
+
+    # 6) 写 Excel(decision == "decrypt" · 解密后正常输出)
     log("call", "写入 Excel")
     try:
-        excel_path = write_skill_results(results)
+        excel_path = write_skill_results(results, stem=excel_stem)
     except Exception as e:
         return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": summary_raw}
     log("result", f"完成 · {excel_path.name}")

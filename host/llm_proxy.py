@@ -78,12 +78,14 @@ class StubLLMProvider(LLMProvider):
 class AnthropicLLMProvider(LLMProvider):
     """对接 Anthropic Claude API。需要 api_key + model。"""
 
-    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", max_tokens: int = 16000):
+    def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", max_tokens: int = 16000,
+                 timeout: float = 1800.0):
         try:
             import anthropic  # type: ignore
         except ImportError as e:
             raise RuntimeError("未安装 anthropic 包,请 `pip install anthropic`") from e
-        self._client = anthropic.Anthropic(api_key=api_key)
+        # timeout 单位秒 · 长任务(5-15 分钟级)不能默认 10 分钟就断
+        self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
         self._model = model
         self._max_tokens = max_tokens
         self.last_usage: dict[str, int] = {}
@@ -139,12 +141,14 @@ class OpenAICompatibleProvider(LLMProvider):
         base_url: str = "https://api.openai.com/v1",
         max_tokens: int = 16000,
         temperature: float = 0.2,
+        timeout: float = 1800.0,
     ):
         try:
             from openai import OpenAI  # type: ignore
         except ImportError as e:
             raise RuntimeError("未安装 openai 包,请 `pip install openai`") from e
-        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        # timeout 单位秒 · 长任务(推理模型 / 大上下文)默认 10 分钟容易断
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -220,6 +224,51 @@ _SUMMARY_MARK_RE = re.compile(
 _ANY_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
+def _repair_plan_json(s: str) -> str:
+    """
+    LLM 常见 JSON 错误就地修补:
+      - 尾随逗号(`,\n}`)
+      - 缺失的右花/方括号(按计数补齐)
+      - 单引号 → 双引号(只对 key/字符串值;粗略)
+    任何修不动的留给 json.loads 自己抛错。
+    """
+    # 1) 去尾随逗号:`,\n}` / `,\n]`
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    # 2) 计算花/方括号差并在末尾补齐(仅处理"少右括号",不处理"少左括号")
+    open_curly = s.count("{")
+    close_curly = s.count("}")
+    open_brack = s.count("[")
+    close_brack = s.count("]")
+    if open_curly > close_curly:
+        s = s + ("}" * (open_curly - close_curly))
+    if open_brack > close_brack:
+        s = s + ("]" * (open_brack - close_brack))
+    # 再扫一次尾随逗号(补完括号后可能又有)
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
+
+
+def _normalize_plan_dict(d: dict) -> dict:
+    """
+    对解析出来的 dict 做软化处理 —— 不让 LLM 的小毛糙击穿 pydantic。
+      - SkillCall.chart 如果是字符串 → 丢弃(skill 会用默认 chart)
+      - SkillCall.chart 如果是 dict 但缺 x/y → 丢弃
+    """
+    skill_calls = d.get("skill_calls")
+    if isinstance(skill_calls, list):
+        for sc in skill_calls:
+            if not isinstance(sc, dict):
+                continue
+            chart = sc.get("chart")
+            if isinstance(chart, str):
+                # "bar" → 丢弃(让 skill 内部决定默认图)
+                sc.pop("chart", None)
+            elif isinstance(chart, dict):
+                if not (chart.get("x") and chart.get("y")):
+                    sc.pop("chart", None)
+    return d
+
+
 def parse_llm_text(text: str) -> LLMResponse:
     """
     把 LLM 的自由文本响应解析为 LLMResponse。
@@ -246,20 +295,64 @@ def parse_llm_text(text: str) -> LLMResponse:
 
     try:
         plan_dict = json.loads(plan_json)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"computation_plan 不是有效 JSON: {e}")
-    plan = ComputationPlan.model_validate(plan_dict)
+    except json.JSONDecodeError:
+        # 1) 尝试简单修复(尾随逗号 / 缺失右括号)
+        try:
+            plan_dict = json.loads(_repair_plan_json(plan_json))
+        except json.JSONDecodeError:
+            # 2) 上 json_repair —— 专门修 LLM 残缺 JSON
+            try:
+                import json_repair  # type: ignore
+                plan_dict = json_repair.loads(plan_json)
+            except Exception as e3:
+                raise ValueError(f"computation_plan 不是有效 JSON: {e3}")
+        if not isinstance(plan_dict, dict):
+            raise ValueError("computation_plan 修复后不是合法 dict")
 
-    # ---- summary ----
-    summary_match = _SUMMARY_TAG_RE.search(text)
-    if summary_match:
-        summary = summary_match.group(1).strip()
-    else:
-        summary_match = _SUMMARY_MARK_RE.search(text)
-        if summary_match:
-            summary = summary_match.group(1).strip()
-        else:
-            raise ValueError("LLM 响应中未找到 summary")
+    plan_dict = _normalize_plan_dict(plan_dict)
+
+    try:
+        plan = ComputationPlan.model_validate(plan_dict)
+    except Exception as e:
+        # 软化失败仍兜底:再过一次更宽松的字段清理(删 chart 之类问题)
+        sc_list = plan_dict.get("skill_calls") or []
+        for sc in sc_list:
+            if isinstance(sc, dict):
+                sc.pop("chart", None)
+        plan = ComputationPlan.model_validate(plan_dict)
+
+    # ---- summary —— 多层容错,绝不因 summary 缺失而 500 ----
+    summary = ""
+
+    # 1) <summary>...</summary>(契约标准,要求闭合)
+    m = _SUMMARY_TAG_RE.search(text)
+    if m:
+        summary = m.group(1).strip()
+
+    # 2) 只有开标签 <summary> 没闭合 —— 模型常见疏忽
+    if not summary:
+        idx = text.lower().find("<summary>")
+        if idx >= 0:
+            tail = text[idx + len("<summary>"):]
+            # 截到 </summary> 或直接到结尾
+            end = tail.lower().find("</summary>")
+            summary = (tail[:end] if end >= 0 else tail).strip()
+
+    # 3) 中文【】或 markdown ## summary
+    if not summary:
+        m = _SUMMARY_MARK_RE.search(text)
+        if m:
+            summary = m.group(1).strip()
+
+    # 4) </computation_plan> 后面的所有自由文本
+    if not summary:
+        idx = text.lower().find("</computation_plan>")
+        if idx >= 0:
+            summary = text[idx + len("</computation_plan>"):].strip()[:2000]
+
+    # 5) 实在没有 —— 给个占位,客户端不会 500
+    if not summary:
+        summary = "已生成分析,详见 Excel。"
 
     return LLMResponse(computation_plan=plan, summary=summary)
 

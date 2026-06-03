@@ -4,8 +4,9 @@
 设计:
 - LLMConfig:一份"已保存"的 provider 设定(类型 + 模型 + key + base_url)
 - LLMConfigStore:JSON 持久化(~/.agent-system/host-config/llm_configs.json)
-- CallStat:每 (config_id, username) 的累计调用 / token / 花费
-- CallStatStore:内存累加(MVP 不持久化,重启清零)
+- CallStat:每 (period, config_id, username) 的累计调用 / token / 花费
+  period ∈ {"all", "YYYY-MM-DD"(每日), "YYYY-MM"(每月)}
+- CallStatStore:三层桶(lifetime + daily + monthly)+ JSON 持久化
 - ProviderManager:按 config_id 缓存 LLMProvider 实例,配置变更即失效
 - discover_models:用 api_key 调 /v1/models 拉真实可用模型列表
 - estimate_cost:按 PRICE_PER_1K 估算美元花费
@@ -191,6 +192,8 @@ class CallStat:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     cost_usd: float = 0.0
+    # period:"all"(累计) / "YYYY-MM-DD"(单日) / "YYYY-MM"(单月)
+    period: str = "all"
 
 
 # ---------------------------------------------------------------------------
@@ -323,16 +326,86 @@ class LLMConfigStore:
 # ---------------------------------------------------------------------------
 
 
+DEFAULT_STAT_PATH = Path.home() / ".agent-system" / "host-config" / "call_stats.json"
+
+
+def _today_key() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _month_key() -> str:
+    return datetime.now().strftime("%Y-%m")
+
+
 class CallStatStore:
     """
-    Per (config_id, username) 调用统计。
-    MVP:内存累加,主机重启清零。生产可加 SQLite。
+    Per (period, config_id, username) 调用统计 —— 三层桶 + JSON 持久化:
+      - lifetime:累计(主机历史以来,主键 (config_id, username))
+      - daily   :按天(主键 (date, config_id, username))
+      - monthly :按月(主键 (month, config_id, username))
+
+    每次 record() 同时落三个桶,然后写盘。重启后从盘上恢复。
     """
 
-    def __init__(self):
+    def __init__(self, path: Optional[Path] = None):
+        self._path = path or DEFAULT_STAT_PATH
         self._lock = threading.Lock()
-        self._stats: dict[tuple[str, str], CallStat] = {}
+        self._lifetime: dict[tuple[str, str], CallStat] = {}
+        self._daily:    dict[tuple[str, str, str], CallStat] = {}
+        self._monthly:  dict[tuple[str, str, str], CallStat] = {}
+        self._load()
 
+    # ---- 持久化 -----------------------------------------------------------
+    def _load(self) -> None:
+        if not self._path.exists():
+            return
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        for d in data.get("lifetime", []) or []:
+            s = self._stat_from_dict(d, period="all")
+            self._lifetime[(s.config_id, s.username)] = s
+        for d in data.get("daily", []) or []:
+            s = self._stat_from_dict(d, period=d.get("period", "all"))
+            self._daily[(s.period, s.config_id, s.username)] = s
+        for d in data.get("monthly", []) or []:
+            s = self._stat_from_dict(d, period=d.get("period", "all"))
+            self._monthly[(s.period, s.config_id, s.username)] = s
+
+    @staticmethod
+    def _stat_from_dict(d: dict[str, Any], period: str) -> CallStat:
+        return CallStat(
+            config_id=d.get("config_id", ""),
+            config_name=d.get("config_name", ""),
+            model_name=d.get("model_name", ""),
+            username=d.get("username", ""),
+            count=int(d.get("count", 0) or 0),
+            success=int(d.get("success", 0) or 0),
+            failed=int(d.get("failed", 0) or 0),
+            prompt_tokens=int(d.get("prompt_tokens", 0) or 0),
+            completion_tokens=int(d.get("completion_tokens", 0) or 0),
+            cost_usd=float(d.get("cost_usd", 0.0) or 0.0),
+            period=d.get("period", period) or period,
+        )
+
+    def _save(self) -> None:
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "lifetime": [asdict(s) for s in self._lifetime.values()],
+                "daily":    [asdict(s) for s in self._daily.values()],
+                "monthly":  [asdict(s) for s in self._monthly.values()],
+            }
+            # 原子写:tmp → rename
+            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            tmp.replace(self._path)
+        except Exception:
+            # 持久化失败不阻断业务
+            pass
+
+    # ---- 录入 -------------------------------------------------------------
     def record(
         self,
         *,
@@ -343,48 +416,77 @@ class CallStatStore:
         success: bool,
         cost_usd: Optional[float] = None,
     ) -> None:
+        if cost_usd is None:
+            cost_usd = estimate_cost(config.model_name, prompt_tokens, completion_tokens)
+        today = _today_key()
+        month = _month_key()
         with self._lock:
-            key = (config.id, username)
-            if key not in self._stats:
-                self._stats[key] = CallStat(
-                    config_id=config.id,
-                    config_name=config.name,
-                    model_name=config.model_name,
-                    username=username,
-                )
-            s = self._stats[key]
-            s.count += 1
-            if success:
-                s.success += 1
-            else:
-                s.failed += 1
-            s.prompt_tokens += prompt_tokens
-            s.completion_tokens += completion_tokens
-            if cost_usd is None:
-                cost_usd = estimate_cost(config.model_name, prompt_tokens, completion_tokens)
-            s.cost_usd += cost_usd
-            # 同步保留最新 config_name / model_name(配置改名后统计页能跟上)
-            s.config_name = config.name
-            s.model_name = config.model_name
+            for bucket, key, period in (
+                (self._lifetime, (config.id, username),         "all"),
+                (self._daily,    (today, config.id, username),  today),
+                (self._monthly,  (month, config.id, username),  month),
+            ):
+                if key not in bucket:
+                    bucket[key] = CallStat(
+                        config_id=config.id,
+                        config_name=config.name,
+                        model_name=config.model_name,
+                        username=username,
+                        period=period,
+                    )
+                s = bucket[key]
+                s.count += 1
+                if success:
+                    s.success += 1
+                else:
+                    s.failed += 1
+                s.prompt_tokens += prompt_tokens
+                s.completion_tokens += completion_tokens
+                s.cost_usd += cost_usd
+                # 同步最新名字,配置重命名后报表仍能跟上
+                s.config_name = config.name
+                s.model_name = config.model_name
+            self._save()
+
+    # ---- 查询 -------------------------------------------------------------
+    def _select(self, period: str) -> list[CallStat]:
+        """根据 period 选择哪个桶的哪些条目。period:
+        - "all"        → 累计桶全部
+        - "today"      → 今日
+        - "this_month" → 本月
+        - "YYYY-MM-DD" → 指定日
+        - "YYYY-MM"    → 指定月
+        """
+        if period == "all":
+            return list(self._lifetime.values())
+        if period == "today":
+            today = _today_key()
+            return [s for s in self._daily.values() if s.period == today]
+        if period == "this_month":
+            month = _month_key()
+            return [s for s in self._monthly.values() if s.period == month]
+        if len(period) == 10:
+            return [s for s in self._daily.values() if s.period == period]
+        if len(period) == 7:
+            return [s for s in self._monthly.values() if s.period == period]
+        return []
 
     def list_all(self) -> list[CallStat]:
-        return list(self._stats.values())
+        """向后兼容:返回累计桶全部条目。"""
+        return list(self._lifetime.values())
 
-    def by_model(self) -> list[dict[str, Any]]:
-        """按 (config_id, model_name) 聚合 —— 用于 dashboard 表。"""
+    def by_model(self, period: str = "all") -> list[dict[str, Any]]:
+        """按 config_id 聚合(忽略 username)。"""
         agg: dict[str, dict[str, Any]] = {}
-        for s in self._stats.values():
+        for s in self._select(period):
             key = s.config_id
             if key not in agg:
                 agg[key] = {
                     "config_id": s.config_id,
                     "config_name": s.config_name,
                     "model_name": s.model_name,
-                    "count": 0,
-                    "success": 0,
-                    "failed": 0,
-                    "prompt_tokens": 0,
-                    "completion_tokens": 0,
+                    "count": 0, "success": 0, "failed": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
                     "cost_usd": 0.0,
                 }
             a = agg[key]
@@ -396,11 +498,10 @@ class CallStatStore:
             a["cost_usd"] += s.cost_usd
         return sorted(agg.values(), key=lambda x: x["count"], reverse=True)
 
-    def by_user(self) -> list[dict[str, Any]]:
-        """按 (username, config_id) 聚合 —— 用户视角统计。"""
-        rows = []
-        for s in self._stats.values():
-            rows.append({
+    def by_user(self, period: str = "all") -> list[dict[str, Any]]:
+        """按 username + config 聚合 —— 用户视角统计。"""
+        rows = [
+            {
                 "username": s.username,
                 "config_name": s.config_name,
                 "model_name": s.model_name,
@@ -410,25 +511,45 @@ class CallStatStore:
                 "prompt_tokens": s.prompt_tokens,
                 "completion_tokens": s.completion_tokens,
                 "cost_usd": s.cost_usd,
-            })
+            }
+            for s in self._select(period)
+        ]
         return sorted(rows, key=lambda x: x["count"], reverse=True)
 
-    def totals(self) -> dict[str, Any]:
-        total_count = sum(s.count for s in self._stats.values())
-        total_success = sum(s.success for s in self._stats.values())
-        total_failed = sum(s.failed for s in self._stats.values())
-        total_prompt = sum(s.prompt_tokens for s in self._stats.values())
-        total_completion = sum(s.completion_tokens for s in self._stats.values())
-        total_cost = sum(s.cost_usd for s in self._stats.values())
+    def totals(self, period: str = "all") -> dict[str, Any]:
+        rows = self._select(period)
         return {
-            "calls": total_count,
-            "success": total_success,
-            "failed": total_failed,
-            "prompt_tokens": total_prompt,
-            "completion_tokens": total_completion,
-            "total_tokens": total_prompt + total_completion,
-            "cost_usd": total_cost,
+            "calls":             sum(s.count for s in rows),
+            "success":           sum(s.success for s in rows),
+            "failed":            sum(s.failed for s in rows),
+            "prompt_tokens":     sum(s.prompt_tokens for s in rows),
+            "completion_tokens": sum(s.completion_tokens for s in rows),
+            "total_tokens":      sum(s.prompt_tokens + s.completion_tokens for s in rows),
+            "cost_usd":          sum(s.cost_usd for s in rows),
         }
+
+    def recent_days(self, n: int = 7) -> list[dict[str, Any]]:
+        """近 n 天每日汇总(供未来加趋势图用)。"""
+        by_date: dict[str, dict[str, Any]] = {}
+        for s in self._daily.values():
+            d = by_date.setdefault(s.period, {
+                "date": s.period, "calls": 0, "tokens": 0, "cost_usd": 0.0,
+            })
+            d["calls"] += s.count
+            d["tokens"] += s.prompt_tokens + s.completion_tokens
+            d["cost_usd"] += s.cost_usd
+        return sorted(by_date.values(), key=lambda x: x["date"], reverse=True)[:n]
+
+    def recent_months(self, n: int = 6) -> list[dict[str, Any]]:
+        by_month: dict[str, dict[str, Any]] = {}
+        for s in self._monthly.values():
+            m = by_month.setdefault(s.period, {
+                "month": s.period, "calls": 0, "tokens": 0, "cost_usd": 0.0,
+            })
+            m["calls"] += s.count
+            m["tokens"] += s.prompt_tokens + s.completion_tokens
+            m["cost_usd"] += s.cost_usd
+        return sorted(by_month.values(), key=lambda x: x["month"], reverse=True)[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -623,19 +744,30 @@ def discover_models(
     OpenAI 兼容协议的(国内大多数厂商)统一走 /models 端点。
 
     Returns:
-        (models, source) — source ∈ {"api", "fallback", "fallback:<err>"}
+        (models, source)
+        source 形如:
+          - "api"                         实时拉取成功
+          - "fallback:no_provider"        provider 未知
+          - "fallback:stub_provider"      stub provider 没有真实端点
+          - "fallback:no_api_key"         没传 api_key
+          - "fallback:http_<code>"        HTTP 错误(401/403/429/500…)
+          - "fallback:net_<exc>"          网络异常(timeout / DNS / connreset…)
+          - "fallback:empty_response"     端点 200 但 data 为空
     """
     preset = PROVIDER_PRESETS.get(provider_type)
     fallback = FALLBACK_MODELS.get(provider_type, [])
 
-    if not preset or preset["kind"] == "stub":
-        return fallback, "fallback"
+    if not preset:
+        return fallback, "fallback:no_provider"
+    if preset["kind"] == "stub":
+        return fallback, "fallback:stub_provider"
     if not api_key:
-        return fallback, "fallback"
+        return fallback, "fallback:no_api_key"
 
     effective_base = (base_url or preset["base_url"]).rstrip("/")
 
     try:
+        import urllib.error
         import urllib.request
 
         if preset["kind"] == "anthropic":
@@ -650,12 +782,24 @@ def discover_models(
             headers = {"Authorization": f"Bearer {api_key}"}
 
         req = urllib.request.Request(url, headers=headers, method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                raw = r.read().decode("utf-8")
+        except urllib.error.HTTPError as e:
+            return fallback, f"fallback:http_{e.code}"
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", e)
+            return fallback, f"fallback:net_{type(reason).__name__}"
+        except Exception as e:  # socket.timeout, ssl errors 等
+            return fallback, f"fallback:net_{type(e).__name__}"
 
-        models = []
-        # OpenAI 协议: {"data": [{"id": "..."}, ...]};少数返回 {"models":[...]}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return fallback, "fallback:invalid_json"
+
         items = data.get("data") or data.get("models") or []
+        models: list[str] = []
         for m in items:
             if isinstance(m, str):
                 models.append(m)
@@ -664,8 +808,8 @@ def discover_models(
                 if mid:
                     models.append(mid)
         if not models:
-            return fallback, "fallback"
+            return fallback, "fallback:empty_response"
         models.sort()
         return models, "api"
     except Exception as e:
-        return fallback, f"fallback:{type(e).__name__}"
+        return fallback, f"fallback:exc_{type(e).__name__}"

@@ -23,7 +23,13 @@ const state = {
   currentSid: null,
   currentSession: null,
   pendingCipher: null,   // {name, path, size, uploading?}
+  pendingTexts: [],      // [{name, content, chars, uploading?}]
   files: [],
+  // 运行状态:有 assistant 消息在跑时锁住发送按钮 / 变停止
+  running: false,
+  runningMid: null,
+  // 已经播过打字机动画的 mid(防止重渲时再次动画)
+  typedMids: new Set(),
 };
 
 // ============ API helpers ============
@@ -107,9 +113,15 @@ async function createSession() {
 
 async function selectSession(sid) {
   state.currentSid = sid;
+  // 切会话时把"运行中"状态复位 —— 进的新会话单独跟踪
+  setRunning(false);
   const data = await api("GET", `/api/sessions/${sid}/messages`);
   state.currentSession = data.session;
   state.currentSession.messages = data.messages;
+  // 已经在视图里的 assistant summary 不再播打字机(只对新消息播)
+  (state.currentSession.messages || []).forEach(m => {
+    if (m.role === "assistant" && m.status === "done") state.typedMids.add(m.id);
+  });
   renderSessionList();
   renderChat();
   enableComposer();
@@ -118,6 +130,7 @@ async function selectSession(sid) {
   // 重新轮询所有 pending/running 的 assistant 消息(防主进程重启后丢轮询)
   (state.currentSession.messages || []).forEach(m => {
     if (m.role === "assistant" && (m.status === "pending" || m.status === "running")) {
+      setRunning(true, m.id);
       pollMessage(sid, m.id);
     }
   });
@@ -173,25 +186,41 @@ function renderMessage(m) {
 
   if (m.role === "user") {
     content += `<div class="bubble">${esc(m.content).replace(/\n/g, "<br>")}</div>`;
+    const lines = [];
     if (m.attached_cipher) {
       const nm = m.attached_cipher.split("/").pop();
-      content += `<div class="att-line"><span class="att-piece">${ICON_SVG.doc} ${esc(nm)}</span></div>`;
+      lines.push(`<span class="att-piece cipher">${ICON_SVG.doc} ${esc(nm)}</span>`);
     }
+    (m.text_attachment_names || []).forEach(nm => {
+      lines.push(`<span class="att-piece text">${ICON_SVG.doc} ${esc(nm)}</span>`);
+    });
+    if (lines.length) content += `<div class="att-line">${lines.join("")}</div>`;
   } else {
     // ============ assistant ============
     const running = (m.status === "pending" || m.status === "running");
     const failed = (m.status === "failed");
     const needsCipher = (m.status === "needs_cipher");
+    const cancelled = (m.status === "cancelled");
+    const awaitingDecrypt = (m.status === "awaiting_decrypt");
     const steps = m.steps || [];
 
-    // 进度行(running 时持续刷新;done 时也保留)
-    if (steps.length) {
-      content += `<div class="trace">`;
+    // 进度行(running 时实时追加;done 时默认折叠)
+    // 用 <details> 让用户可以折叠/展开;running 时默认打开,done 时默认收起
+    if (steps.length || running || awaitingDecrypt) {
+      const detailsOpen = (running || awaitingDecrypt) ? " open" : "";
+      const stateLabel = awaitingDecrypt
+        ? "计算追踪 · 密态计算已完成 · 等待解密授权"
+        : running
+        ? "计算追踪 · 密态运算中"
+        : `计算追踪 · 已完成 · ${steps.length} 步`;
+      content += `<details class="trace"${detailsOpen}>`;
+      content += `<summary class="trace-summary">${stateLabel}</summary>`;
+      content += `<div class="trace-steps">`;
       steps.forEach(s => {
         const cls = s.kind || "step";
         content += `<div class="step ${cls}">${esc(s.label)}</div>`;
       });
-      content += `</div>`;
+      content += `</div></details>`;
     }
 
     if (running) {
@@ -210,13 +239,53 @@ function renderMessage(m) {
       }
     } else if (needsCipher) {
       content += `<div class="ask-card">${ICON_SVG.ask}<span>${esc(m.summary || "请附一份已加密的数据文件")}</span></div>`;
+    } else if (cancelled) {
+      content += `<div class="ask-card">${ICON_SVG.warn}<span>${esc(m.summary || "已停止")}</span></div>`;
+    } else if (awaitingDecrypt) {
+      // 从 trace 里提"sheet「...」就绪"行,告诉用户哪些 sheet 已在密态下算好
+      const readyLines = (m.steps || [])
+        .filter(s => (s.label || "").includes("就绪"))
+        .map(s => s.label);
+      const skillLines = readyLines.length
+        ? `<ul class="dc-list">${readyLines.map(l => `<li>${esc(l)}</li>`).join("")}</ul>`
+        : "";
+      content += `
+        <div class="decrypt-card" data-mid="${esc(m.id)}">
+          <div class="dc-title">结果解密展示授权 · B6-1</div>
+          <div class="dc-body">
+            <strong>计算已在密态下完成</strong>,全程未暴露明文。
+            各 skill 的密态运算路径不同,详见上方「计算追踪」。
+            ${readyLines.length ? `共产出 ${readyLines.length} 个 sheet:` : ""}
+            ${skillLines}
+            请选择结果是否解密展示:
+          </div>
+          <div class="dc-actions">
+            <button class="dc-btn primary" data-choice="decrypt">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="dc-ic"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+              解密展示结果
+            </button>
+            <button class="dc-btn ghost" data-choice="keep_encrypted">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="dc-ic"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+              保留密文(不解密)
+            </button>
+          </div>
+          <div class="dc-hint">选「保留密文」会导出未解密的 Excel,数值列保持同态密文形式 · 5 分钟未操作自动取消</div>
+        </div>`;
     } else {
       // done
-      content += `<div class="bubble">${esc(m.summary || "(无总结)").replace(/\n/g, "<br>")}</div>`;
+      // 打字机:首次渲染留空 bubble + cursor,渲染完后 JS 逐字填入
+      const willType = !state.typedMids.has(m.id) && (m.summary || "").length > 0;
+      if (willType) {
+        content += `<div class="bubble" data-typewriter="${esc(m.summary || "")}"><span class="type-cursor">▍</span></div>`;
+      } else {
+        content += `<div class="bubble">${esc(m.summary || "(无总结)").replace(/\n/g, "<br>")}</div>`;
+      }
       if (m.excel_path && m.excel_name) {
         const dlUrl = `/api/excel/download?path=${encodeURIComponent(m.excel_path)}`;
+        // 如果要打字机,先隐藏附件卡 —— 打字完才浮现;不打字直接显示
+        const hiddenAttr = willType ? ' data-defer-reveal="1"' : '';
         content += `
-          <a class="file-card" href="${dlUrl}" download="${esc(m.excel_name)}">
+          <a class="file-card"${hiddenAttr} href="${dlUrl}" download="${esc(m.excel_name)}">
             <div class="fc-ic">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
                 <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
@@ -232,43 +301,200 @@ function renderMessage(m) {
             <div class="fc-btn">⬇ 下载</div>
           </a>`;
       }
-      // 底栏小信息:跑了哪些 skill + 用了哪份密文 + 时长
-      const meta = [];
-      if (m.skill_calls && m.skill_calls.length) meta.push(`skill: ${m.skill_calls.join(" · ")}`);
-      if (m.used_cipher) meta.push(`密文: ${m.used_cipher.split("/").pop()}`);
-      if (m.duration_sec) meta.push(`${m.duration_sec.toFixed(1)}s`);
-      if (meta.length) content += `<div class="msg-meta">${esc(meta.join(" · "))}</div>`;
     }
   }
   content += `</div>`;
   wrap.innerHTML = avatar + content;
+
+  // 解密授权浮卡按钮 → POST decision
+  wrap.querySelectorAll(".decrypt-card .dc-btn").forEach(b => {
+    b.addEventListener("click", async () => {
+      const card = b.closest(".decrypt-card");
+      const mid = card?.dataset.mid;
+      const choice = b.dataset.choice;
+      if (!mid || !choice) return;
+      // 锁定全部按钮防重复
+      card.querySelectorAll(".dc-btn").forEach(x => x.disabled = true);
+      card.querySelector(".dc-hint").textContent =
+        choice === "decrypt" ? "已选择「解密展示」· 正在解密结果…" : "已选择「保留密文」· 正在导出未解密的 Excel…";
+      try {
+        await api(
+          "POST",
+          `/api/sessions/${state.currentSid}/messages/${mid}/decrypt_decision`,
+          { choice },
+        );
+      } catch (e) {
+        alert("提交选择失败:" + e.message);
+        card.querySelectorAll(".dc-btn").forEach(x => x.disabled = false);
+      }
+    });
+  });
+
+  // 渲染完成后:发现 data-typewriter 标记 → 启动逐字动画
+  const bubble = wrap.querySelector('.bubble[data-typewriter]');
+  if (bubble) {
+    const full = bubble.getAttribute('data-typewriter') || "";
+    bubble.removeAttribute('data-typewriter');
+    state.typedMids.add(m.id);
+    typewriter(bubble, full, () => {
+      // 打字完 → 让所有标记为 defer-reveal 的兄弟节点淡入
+      wrap.querySelectorAll('[data-defer-reveal]').forEach(el => {
+        el.removeAttribute('data-defer-reveal');
+        el.classList.add('revealed');
+      });
+    });
+  }
   return wrap;
 }
 
+// 打字机:逐字符注入 bubble,完成后调 onDone
+function typewriter(node, fullText, onDone) {
+  let i = 0;
+  // 短文本快一些,长文本不要拖太久
+  const total = fullText.length;
+  const speed = total > 400 ? 8 : (total > 120 ? 15 : 25);  // ms / char
+  const cursor = document.createElement("span");
+  cursor.className = "type-cursor";
+  cursor.textContent = "▍";
+  node.innerHTML = "";
+  node.appendChild(cursor);
+
+  function tick() {
+    if (i >= total) {
+      cursor.remove();
+      if (typeof onDone === "function") onDone();
+      return;
+    }
+    // 一次注入若干字符,长文本不要让动画拖太久
+    const burst = total > 400 ? 3 : (total > 120 ? 2 : 1);
+    const slice = fullText.slice(i, i + burst);
+    i += burst;
+    // 文本插入到 cursor 之前(转义 + 换行)
+    slice.split("").forEach(ch => {
+      if (ch === "\n") {
+        node.insertBefore(document.createElement("br"), cursor);
+      } else {
+        node.insertBefore(document.createTextNode(ch), cursor);
+      }
+    });
+    const main = $("main");
+    if (main && main.scrollHeight - main.scrollTop - main.clientHeight < 80) {
+      main.scrollTop = main.scrollHeight;
+    }
+    setTimeout(tick, speed);
+  }
+  tick();
+}
+
+// ============ 发送/停止 按钮状态机 ============
+// 停止图标:扁平实心方块,纯几何,无文字
+const STOP_ICON_SVG = `
+  <svg class="ic-stop" viewBox="0 0 24 24" aria-label="停止" role="img">
+    <rect x="6" y="6" width="12" height="12" rx="2"></rect>
+  </svg>`;
+
+function setRunning(running, mid) {
+  state.running = running;
+  state.runningMid = mid || null;
+  const btn = $("sendBtn");
+  if (running) {
+    btn.classList.add("stop");
+    btn.innerHTML = STOP_ICON_SVG;
+    btn.setAttribute("title", "停止");
+  } else {
+    btn.classList.remove("stop");
+    btn.textContent = "发送";
+    btn.removeAttribute("title");
+  }
+}
+
+async function stopRunning() {
+  const sid = state.currentSid, mid = state.runningMid;
+  if (!sid || !mid) return;
+  try {
+    await api("POST", `/api/sessions/${sid}/messages/${mid}/cancel`);
+  } catch (e) {
+    // 已经结束或网络问题:不阻断 UI
+    console.warn("cancel 调用失败:", e);
+  }
+  // 不主动 clearInterval —— 让 pollMessage 自己感知 cancelled 终态
+}
+
 // ============ 轮询 assistant 消息 ============
+// 设计:running 期间只**追加**新出现的 step 行,不重渲整条消息 —— 保留:
+//   ① 用户已经手动折叠/展开的状态
+//   ② 滚动位置(只有真新内容到底部时才滚)
+// 状态终结时(done/failed/needs_cipher)再一次性整体重渲。
 function pollMessage(sid, mid) {
   const since = Date.now();
+  let renderedSteps = 0;
   const intv = setInterval(async () => {
     try {
       const m = await api("GET", `/api/sessions/${sid}/messages/${mid}`);
-      const el = document.querySelector(`.msg[data-mid="${mid}"] .run-time`);
+      const node = document.querySelector(`.msg[data-mid="${mid}"]`);
+      const el = node?.querySelector(".run-time");
       if (el) el.textContent = ((Date.now() - since) / 1000).toFixed(0) + "s";
 
-      // 进度行实时刷新(即使还在 running)
-      if (m.steps && m.steps.length) {
-        const node = document.querySelector(`.msg[data-mid="${mid}"]`);
-        const idx = state.currentSession?.messages?.findIndex(x => x.id === mid);
-        if (idx >= 0) state.currentSession.messages[idx] = m;
+      const terminal = (m.status === "done" || m.status === "failed" ||
+                        m.status === "needs_cipher" || m.status === "cancelled");
+      const awaitingDecrypt = (m.status === "awaiting_decrypt");
+
+      // 出现授权门 → 主动重渲一次(把浮卡渲出来),但不终止轮询
+      if (awaitingDecrypt && node) {
+        const fresh = renderMessage(m);
+        node.replaceWith(fresh);
+        $("main").scrollTop = $("main").scrollHeight;
+      }
+      const idx = state.currentSession?.messages?.findIndex(x => x.id === mid);
+      if (idx >= 0) state.currentSession.messages[idx] = m;
+
+      if (terminal) {
+        // 终态:完整重渲 → 折叠态、显示 summary / Excel 卡 / 错误 / 取消
         if (node) {
           const fresh = renderMessage(m);
           node.replaceWith(fresh);
           $("main").scrollTop = $("main").scrollHeight;
         }
+        clearInterval(intv);
+        setRunning(false);
+        loadSessions();
+        return;
       }
 
-      if (m.status === "done" || m.status === "failed" || m.status === "needs_cipher") {
-        clearInterval(intv);
-        loadSessions();
+      // running 增量:把新出现的 step 行追加到现有 trace 里
+      const steps = m.steps || [];
+      if (node && steps.length > renderedSteps) {
+        let stepsBox = node.querySelector(".trace-steps");
+        let traceDetails = node.querySelector("details.trace");
+        // 极少数情况:首批 step 抵达前 trace 还没渲;补建一个
+        if (!stepsBox) {
+          const content = node.querySelector(".msg__content");
+          if (content) {
+            traceDetails = document.createElement("details");
+            traceDetails.className = "trace";
+            traceDetails.open = true;
+            traceDetails.innerHTML =
+              `<summary class="trace-summary">计算追踪 · 运行中</summary>
+               <div class="trace-steps"></div>`;
+            // 插入到 run-pill 前面(若有),否则放最前
+            const pill = content.querySelector(".run-pill");
+            content.insertBefore(traceDetails, pill || content.firstChild);
+            stepsBox = traceDetails.querySelector(".trace-steps");
+          }
+        }
+        if (stepsBox) {
+          const wasNearBottom =
+            ($("main").scrollHeight - $("main").scrollTop - $("main").clientHeight) < 80;
+          for (let i = renderedSteps; i < steps.length; i++) {
+            const s = steps[i];
+            const div = document.createElement("div");
+            div.className = `step ${s.kind || "step"}`;
+            div.textContent = s.label;
+            stepsBox.appendChild(div);
+          }
+          renderedSteps = steps.length;
+          if (wasNearBottom) $("main").scrollTop = $("main").scrollHeight;
+        }
       }
     } catch (e) {
       clearInterval(intv);
@@ -284,79 +510,123 @@ function enableComposer() {
 }
 
 async function sendMessage() {
+  // 运行中按了"停止"
+  if (state.running) {
+    await stopRunning();
+    return;
+  }
+
   const text = $("input").value.trim();
   if (!text) return;
   if (!state.currentSid) await createSession();
 
-  // 还在上传 cipher 阻塞
+  // 还在上传 cipher / 抽文本 阻塞
   if (state.pendingCipher && state.pendingCipher.uploading) {
-    alert("等密文加密完成后再发送");
-    return;
+    alert("等密文加密完成后再发送"); return;
+  }
+  if (state.pendingTexts.some(t => t.uploading)) {
+    alert("等文本文件读取完成后再发送"); return;
   }
 
-  const sendBtn = $("sendBtn");
-  sendBtn.disabled = true;
   $("input").value = "";
   $("input").style.height = "auto";
 
   const attached_cipher = state.pendingCipher?.path || "";
+  const text_attachments = state.pendingTexts
+    .filter(t => !t.uploading && t.content)
+    .map(t => ({ name: t.name, content: t.content }));
   state.pendingCipher = null;
+  state.pendingTexts = [];
   renderAttachChips();
 
   try {
     const res = await api("POST", `/api/sessions/${state.currentSid}/messages`, {
-      content: text, attached_cipher,
+      content: text, attached_cipher, text_attachments,
     });
     state.currentSession.messages.push(res.user_message, res.assistant_message);
     if (state.currentSession.messages.length === 2 && state.currentSession.title === "新会话") {
       state.currentSession.title = text.slice(0, 40);
     }
     renderChat();
+    setRunning(true, res.assistant_message.id);
     pollMessage(state.currentSid, res.assistant_message.id);
     loadSessions();
   } catch (e) {
     alert("发送失败:" + e.message);
+    setRunning(false);
   } finally {
-    sendBtn.disabled = false;
     $("input").focus();
   }
 }
 
-// ============ 附件(单密文) ============
+// ============ 附件(密文 + 明文文本) ============
+const DATA_EXTS = ["csv", "xlsx", "xls"];
+const TEXT_EXTS = ["txt", "md", "markdown", "rst", "log", "text",
+                   "docx", "pdf", "rtf", "html", "htm", "json", "yml", "yaml"];
+
 function renderAttachChips() {
   const box = $("attachChips");
-  if (!state.pendingCipher) { box.innerHTML = ""; return; }
-  const a = state.pendingCipher;
-  box.innerHTML = `
-    <div class="att-chip ${a.uploading ? "uploading" : ""}">
-      <span class="nm">${esc(a.name)}</span>
-      ${a.size ? `<span class="sz">${a.size}</span>` : ""}
-      <button class="rm" data-rm="1">×</button>
-    </div>
-  `;
-  box.querySelector("[data-rm]")?.addEventListener("click", () => {
-    state.pendingCipher = null;
-    renderAttachChips();
+  const chips = [];
+  if (state.pendingCipher) {
+    const a = state.pendingCipher;
+    chips.push(`
+      <div class="att-chip cipher ${a.uploading ? "uploading" : ""}">
+        <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+        <span class="nm">${esc(a.name)}</span>
+        ${a.size ? `<span class="sz">${a.size}</span>` : ""}
+        <button class="rm" data-rm-cipher="1">×</button>
+      </div>
+    `);
+  }
+  state.pendingTexts.forEach((t, i) => {
+    chips.push(`
+      <div class="att-chip text ${t.uploading ? "uploading" : ""}">
+        <svg class="ic-tiny" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+        <span class="nm">${esc(t.name)}</span>
+        ${t.chars ? `<span class="sz">${t.chars} 字</span>` : ""}
+        <button class="rm" data-rm-text="${i}">×</button>
+      </div>
+    `);
+  });
+  box.innerHTML = chips.join("");
+  box.querySelector("[data-rm-cipher]")?.addEventListener("click", () => {
+    state.pendingCipher = null; renderAttachChips();
+  });
+  box.querySelectorAll("[data-rm-text]").forEach(b => {
+    b.addEventListener("click", () => {
+      state.pendingTexts.splice(+b.dataset.rmText, 1);
+      renderAttachChips();
+    });
   });
 }
 
-async function handleFileAttach(file) {
-  if (!file) return;
-  const ext = (file.name.split(".").pop() || "").toLowerCase();
-  // 已加密文件直接使用 / 原始数据先上传加密
-  const isCipher = file.name.includes("_enc") || file.name.endsWith(".cipher");
-  if (!["csv", "xlsx", "xls"].includes(ext)) {
-    alert(`不支持的文件类型:.${ext} · 仅 CSV / XLSX`);
-    return;
+async function handleFileAttach(filesArg) {
+  // 支持单文件或多文件
+  const files = filesArg instanceof FileList ? Array.from(filesArg)
+                : Array.isArray(filesArg) ? filesArg
+                : (filesArg ? [filesArg] : []);
+  for (const file of files) {
+    if (!file) continue;
+    const ext = (file.name.split(".").pop() || "").toLowerCase();
+    if (DATA_EXTS.includes(ext)) {
+      await _attachDataFile(file);
+    } else if (TEXT_EXTS.includes(ext)) {
+      await _attachTextFile(file);
+    } else {
+      alert(`不支持的文件类型:.${ext}\n数据:${DATA_EXTS.join("/")}\n文本:${TEXT_EXTS.join("/")}`);
+    }
   }
+}
+
+async function _attachDataFile(file) {
+  // 同消息最多一个密文(replace 旧的)
   const chip = {
     name: file.name + " (加密中…)", uploading: true,
     size: (file.size / 1024).toFixed(1) + "KB",
   };
   state.pendingCipher = chip;
   renderAttachChips();
-  const fd = new FormData();
-  fd.append("raw_file", file);
+  const fd = new FormData(); fd.append("raw_file", file);
   try {
     const res = await api("POST", "/api/files/upload", fd, true);
     chip.name = res.name; chip.path = res.path; chip.uploading = false;
@@ -366,6 +636,26 @@ async function handleFileAttach(file) {
     state.pendingCipher = null;
     renderAttachChips();
     alert("加密失败:" + e.message);
+  }
+}
+
+async function _attachTextFile(file) {
+  const chip = { name: file.name + " (读取中…)", uploading: true, content: "", chars: 0 };
+  state.pendingTexts.push(chip);
+  renderAttachChips();
+  const fd = new FormData(); fd.append("raw_file", file);
+  try {
+    const res = await api("POST", "/api/files/text_extract", fd, true);
+    chip.name = res.name;
+    chip.content = res.content;
+    chip.chars = res.chars;
+    chip.uploading = false;
+    renderAttachChips();
+  } catch (e) {
+    const idx = state.pendingTexts.indexOf(chip);
+    if (idx >= 0) state.pendingTexts.splice(idx, 1);
+    renderAttachChips();
+    alert("文本读取失败:" + e.message);
   }
 }
 
@@ -701,8 +991,20 @@ async function renderAccountTab() {
 function bindEvents() {
   $("newBtn").addEventListener("click", createSession);
   $("sendBtn").addEventListener("click", sendMessage);
-  $("input").addEventListener("keydown", e => {
-    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+
+  // 输入法(中文/日文/韩文等)组词期间不发送
+  // - e.isComposing 是 W3C 标准属性,组词期间为 true
+  // - e.keyCode === 229 是兼容老浏览器的 fallback(Safari/老 Chrome 在选词期触发的 Enter)
+  // - 还监听 compositionstart/end 维护一个手动标志,兜底
+  let imeComposing = false;
+  const input = $("input");
+  input.addEventListener("compositionstart", () => { imeComposing = true; });
+  input.addEventListener("compositionend",   () => { imeComposing = false; });
+  input.addEventListener("keydown", e => {
+    if (e.key !== "Enter" || e.shiftKey) return;
+    if (e.isComposing || e.keyCode === 229 || imeComposing) return;  // 组词中,Enter 用于确认候选,不发送
+    e.preventDefault();
+    sendMessage();
   });
   $("input").addEventListener("input", e => {
     e.target.style.height = "auto";
@@ -710,7 +1012,10 @@ function bindEvents() {
   });
 
   $("attachBtn").addEventListener("click", () => $("fileInput").click());
-  $("fileInput").addEventListener("change", e => handleFileAttach(e.target.files?.[0]));
+  $("fileInput").addEventListener("change", e => {
+    handleFileAttach(e.target.files);
+    e.target.value = "";  // 允许重复选同一文件
+  });
 
   // 拖拽到 composer overlay
   const modalOpen = () => $("modalMask").classList.contains("open");
@@ -729,7 +1034,7 @@ function bindEvents() {
     if (modalOpen()) return;
     e.preventDefault(); dragCounter = 0;
     $("dropOverlay").classList.remove("show");
-    if (e.dataTransfer.files && e.dataTransfer.files[0]) handleFileAttach(e.dataTransfer.files[0]);
+    if (e.dataTransfer.files && e.dataTransfer.files.length) handleFileAttach(e.dataTransfer.files);
   });
 
   // settings

@@ -217,9 +217,34 @@ def create_account(req: CreateAccountRequest):
 # ----- LLM 代理 -----
 
 
+class ChatTurn(BaseModel):
+    role: str  # "user" / "assistant"
+    content: str
+
+
 class ChatRequest(BaseModel):
     system: str
     user: str
+    # 可选:同会话的近端历史(由客户端裁剪);后端会折叠到 user prompt 顶部
+    history: list[ChatTurn] = []
+
+
+def _compose_user_with_history(history: list[ChatTurn], new_user: str) -> str:
+    """把 history 折叠到一段 user prompt 里 —— provider 接口不变。"""
+    if not history:
+        return new_user
+    parts = ["[最近对话历史 · 仅供上下文参考,不一定与本次问题相关]"]
+    for t in history:
+        role = "用户" if t.role == "user" else "助手"
+        content = (t.content or "").strip()
+        if not content:
+            continue
+        # 截断每条 600 字,避免历史过长把 prompt 撑爆
+        parts.append(f"{role}: {content[:600]}")
+    parts.append("")
+    parts.append("[本次新消息]")
+    parts.append(new_user)
+    return "\n".join(parts)
 
 
 def _resolve_user_provider(username: str):
@@ -252,8 +277,9 @@ def freechat(req: ChatRequest, sess=Depends(get_current_session)):
     用于客户端"会话还没绑定密文文件"的场景:用户只是想跟 AI 聊天。
     """
     provider, cfg = _resolve_user_provider(sess.username)
+    user_msg = _compose_user_with_history(req.history, req.user)
     try:
-        text = provider.raw_chat(system=req.system, user=req.user)
+        text = provider.raw_chat(system=req.system, user=user_msg)
     except Exception as e:
         call_stats.record(
             config=cfg, username=sess.username,
@@ -289,9 +315,10 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     task_id = dispatcher.create(sess.username)
     dispatcher.mark_running(task_id)
 
-    # 2a) 先调用 LLM
+    # 2a) 先调用 LLM(把会话历史折叠到 user prompt 顶部)
+    user_msg = _compose_user_with_history(req.history, req.user)
     try:
-        raw_text = provider.raw_chat(system=req.system, user=req.user)
+        raw_text = provider.raw_chat(system=req.system, user=user_msg)
     except Exception as e:
         dispatcher.fail(task_id, str(e))
         call_stats.record(

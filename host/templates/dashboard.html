@@ -23,17 +23,26 @@
     <div class="kpi-card">
       <div class="label">LLM 调用</div>
       <div class="value">{{ stats.llm_calls }}</div>
-      <div class="hint">{{ stats.llm_success }} 成功 · {{ stats.llm_failed }} 失败</div>
+      <div class="hint">
+        {{ stats.llm_success }} 成功 · {{ stats.llm_failed }} 失败
+        <br>今日 {{ stats.llm_calls_day }} · 本月 {{ stats.llm_calls_month }}
+      </div>
     </div>
     <div class="kpi-card">
       <div class="label">Token 消耗</div>
       <div class="value">{{ '{:,}'.format(stats.llm_total_tokens) }}</div>
-      <div class="hint">累计 prompt + completion</div>
+      <div class="hint">
+        累计 prompt + completion
+        <br>今日 {{ '{:,}'.format(stats.llm_tokens_day) }} · 本月 {{ '{:,}'.format(stats.llm_tokens_month) }}
+      </div>
     </div>
     <div class="kpi-card">
       <div class="label">累计花费</div>
       <div class="value">${{ '%.4f'|format(stats.llm_cost_usd) }}</div>
-      <div class="hint">按各 provider 标价估算</div>
+      <div class="hint">
+        按各 provider 标价估算
+        <br>今日 ${{ '%.4f'|format(stats.llm_cost_day) }} · 本月 ${{ '%.4f'|format(stats.llm_cost_month) }}
+      </div>
     </div>
   </div>
 
@@ -51,77 +60,213 @@
   </div>
   {% endif %}
 
+  {# ---- 按模型统计(三 tab:今日 · 本月 · 累计) ---- #}
   <div class="panel">
-    <div class="panel-header"><h3>按模型统计</h3></div>
+    <div class="panel-header">
+      <h3>按模型统计</h3>
+      <div class="stat-tabs" data-scope="model">
+        <button class="stat-tab active" data-tab="day">今日</button>
+        <button class="stat-tab" data-tab="month">本月</button>
+        <button class="stat-tab" data-tab="all">累计</button>
+      </div>
+    </div>
     <div class="panel-body compact">
-      {% if by_model %}
-      <table class="table">
-        <thead>
-          <tr>
-            <th>配置名</th>
-            <th>模型</th>
-            <th>调用</th>
-            <th>成功 / 失败</th>
-            <th>Prompt tokens</th>
-            <th>Completion tokens</th>
-            <th>花费 (USD)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for m in by_model %}
-          <tr>
-            <td><strong>{{ m.config_name }}</strong></td>
-            <td class="mono">{{ m.model_name }}</td>
-            <td>{{ m.count }}</td>
-            <td><span class="pill active">{{ m.success }}</span> / <span class="pill disabled">{{ m.failed }}</span></td>
-            <td class="mono">{{ '{:,}'.format(m.prompt_tokens) }}</td>
-            <td class="mono">{{ '{:,}'.format(m.completion_tokens) }}</td>
-            <td class="mono">${{ '%.4f'|format(m.cost_usd) }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-        <div class="empty">还没有 LLM 调用记录</div>
-      {% endif %}
+      {% for rows, key in [(by_model_day, 'day'), (by_model_month, 'month'), (by_model, 'all')] %}
+      <div class="stat-tabpane{% if key == 'day' %} active{% endif %}" data-scope="model" data-tab="{{ key }}">
+        {% if rows %}
+        <table class="table paged">
+          <thead>
+            <tr>
+              <th>配置名</th><th>模型</th><th>调用</th><th>成功 / 失败</th>
+              <th>Prompt tokens</th><th>Completion tokens</th><th>花费 (USD)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for m in rows %}
+            <tr>
+              <td><strong>{{ m.config_name }}</strong></td>
+              <td class="mono">{{ m.model_name }}</td>
+              <td>{{ m.count }}</td>
+              <td><span class="pill active">{{ m.success }}</span> / <span class="pill disabled">{{ m.failed }}</span></td>
+              <td class="mono">{{ '{:,}'.format(m.prompt_tokens) }}</td>
+              <td class="mono">{{ '{:,}'.format(m.completion_tokens) }}</td>
+              <td class="mono">${{ '%.4f'|format(m.cost_usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="empty">
+            {% if key == 'day' %}今日还没有调用{% elif key == 'month' %}本月还没有调用{% else %}还没有 LLM 调用记录{% endif %}
+          </div>
+        {% endif %}
+      </div>
+      {% endfor %}
     </div>
   </div>
 
+  {# ---- 按用户统计(三 tab:今日 · 本月 · 累计) ---- #}
   <div class="panel">
-    <div class="panel-header"><h3>按用户统计</h3></div>
+    <div class="panel-header">
+      <h3>按用户统计</h3>
+      <div class="stat-tabs" data-scope="user">
+        <button class="stat-tab active" data-tab="day">今日</button>
+        <button class="stat-tab" data-tab="month">本月</button>
+        <button class="stat-tab" data-tab="all">累计</button>
+      </div>
+    </div>
     <div class="panel-body compact">
-      {% if by_user %}
-      <table class="table">
-        <thead>
-          <tr>
-            <th>用户</th>
-            <th>配置</th>
-            <th>模型</th>
-            <th>调用</th>
-            <th>成功 / 失败</th>
-            <th>Tokens (P+C)</th>
-            <th>花费 (USD)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {% for u in by_user %}
-          <tr>
-            <td><strong>{{ u.username }}</strong></td>
-            <td>{{ u.config_name }}</td>
-            <td class="mono">{{ u.model_name }}</td>
-            <td>{{ u.count }}</td>
-            <td><span class="pill active">{{ u.success }}</span> / <span class="pill disabled">{{ u.failed }}</span></td>
-            <td class="mono">{{ '{:,}'.format(u.prompt_tokens) }} + {{ '{:,}'.format(u.completion_tokens) }}</td>
-            <td class="mono">${{ '%.4f'|format(u.cost_usd) }}</td>
-          </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-      {% else %}
-        <div class="empty">还没有用户调用记录</div>
-      {% endif %}
+      {% for rows, key in [(by_user_day, 'day'), (by_user_month, 'month'), (by_user, 'all')] %}
+      <div class="stat-tabpane{% if key == 'day' %} active{% endif %}" data-scope="user" data-tab="{{ key }}">
+        {% if rows %}
+        <table class="table paged">
+          <thead>
+            <tr>
+              <th>用户</th><th>配置</th><th>模型</th><th>调用</th>
+              <th>成功 / 失败</th><th>Tokens (P+C)</th><th>花费 (USD)</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for u in rows %}
+            <tr>
+              <td><strong>{{ u.username }}</strong></td>
+              <td>{{ u.config_name }}</td>
+              <td class="mono">{{ u.model_name }}</td>
+              <td>{{ u.count }}</td>
+              <td><span class="pill active">{{ u.success }}</span> / <span class="pill disabled">{{ u.failed }}</span></td>
+              <td class="mono">{{ '{:,}'.format(u.prompt_tokens) }} + {{ '{:,}'.format(u.completion_tokens) }}</td>
+              <td class="mono">${{ '%.4f'|format(u.cost_usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="empty">
+            {% if key == 'day' %}今日还没有调用{% elif key == 'month' %}本月还没有调用{% else %}还没有用户调用记录{% endif %}
+          </div>
+        {% endif %}
+      </div>
+      {% endfor %}
     </div>
   </div>
+
+  {# ---- 近 7 天 / 近 6 月 趋势(纯表,无图表) ---- #}
+  {% if recent_days or recent_months %}
+  <div class="panel">
+    <div class="panel-header">
+      <h3>趋势</h3>
+      <div class="stat-tabs" data-scope="trend">
+        <button class="stat-tab active" data-tab="day">近 7 天</button>
+        <button class="stat-tab" data-tab="month">近 6 月</button>
+      </div>
+    </div>
+    <div class="panel-body compact">
+      <div class="stat-tabpane active" data-scope="trend" data-tab="day">
+        {% if recent_days %}
+        <table class="table">
+          <thead><tr><th>日期</th><th>调用</th><th>Tokens</th><th>花费 (USD)</th></tr></thead>
+          <tbody>
+            {% for d in recent_days %}
+            <tr>
+              <td class="mono">{{ d.date }}</td>
+              <td>{{ d.calls }}</td>
+              <td class="mono">{{ '{:,}'.format(d.tokens) }}</td>
+              <td class="mono">${{ '%.4f'|format(d.cost_usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="empty">还没有每日调用记录</div>
+        {% endif %}
+      </div>
+      <div class="stat-tabpane" data-scope="trend" data-tab="month">
+        {% if recent_months %}
+        <table class="table">
+          <thead><tr><th>月份</th><th>调用</th><th>Tokens</th><th>花费 (USD)</th></tr></thead>
+          <tbody>
+            {% for m in recent_months %}
+            <tr>
+              <td class="mono">{{ m.month }}</td>
+              <td>{{ m.calls }}</td>
+              <td class="mono">{{ '{:,}'.format(m.tokens) }}</td>
+              <td class="mono">${{ '%.4f'|format(m.cost_usd) }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        {% else %}
+          <div class="empty">还没有每月调用记录</div>
+        {% endif %}
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <script>
+    // -------- 分页:每个 .table.paged 后面挂一个 pager,默认每页 10 条 --------
+    const PAGE_SIZE = 10;
+
+    function setupPaged(table) {
+      const tbody = table.tBodies[0];
+      if (!tbody) return;
+      const rows = Array.from(tbody.rows);
+      if (rows.length <= PAGE_SIZE) return;  // 不到一页,不渲染 pager
+
+      // 创建 pager
+      const pager = document.createElement('div');
+      pager.className = 'stat-pager';
+      pager.innerHTML = `
+        <button class="pg-btn" data-pg="prev" aria-label="上一页">‹ 上一页</button>
+        <span class="pg-info"></span>
+        <button class="pg-btn" data-pg="next" aria-label="下一页">下一页 ›</button>
+      `;
+      table.parentNode.insertBefore(pager, table.nextSibling);
+
+      let page = 1;
+      const pages = Math.ceil(rows.length / PAGE_SIZE);
+
+      function render() {
+        const start = (page - 1) * PAGE_SIZE;
+        const end = start + PAGE_SIZE;
+        rows.forEach((r, i) => { r.style.display = (i >= start && i < end) ? '' : 'none'; });
+        pager.querySelector('.pg-info').textContent = `第 ${page} / ${pages} 页 · 共 ${rows.length} 条`;
+        pager.querySelector('[data-pg="prev"]').disabled = (page <= 1);
+        pager.querySelector('[data-pg="next"]').disabled = (page >= pages);
+      }
+      pager.addEventListener('click', e => {
+        const btn = e.target.closest('.pg-btn');
+        if (!btn || btn.disabled) return;
+        page += (btn.dataset.pg === 'next') ? 1 : -1;
+        page = Math.max(1, Math.min(pages, page));
+        render();
+      });
+      // 暴露给 tab 切换时复位
+      table._resetPage = () => { page = 1; render(); };
+      render();
+    }
+    document.querySelectorAll('.table.paged').forEach(setupPaged);
+
+    // -------- tab 切换:同 panel 内 .stat-tab 控制 .stat-tabpane 显隐 + 复位分页 --------
+    document.querySelectorAll('.stat-tabs').forEach(group => {
+      const scope = group.dataset.scope;
+      group.addEventListener('click', e => {
+        const btn = e.target.closest('.stat-tab');
+        if (!btn) return;
+        const key = btn.dataset.tab;
+        group.querySelectorAll('.stat-tab').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll(`.stat-tabpane[data-scope="${scope}"]`).forEach(p => {
+          const willShow = p.dataset.tab === key;
+          p.classList.toggle('active', willShow);
+          if (willShow) {
+            p.querySelectorAll('.table.paged').forEach(t => {
+              if (typeof t._resetPage === 'function') t._resetPage();
+            });
+          }
+        });
+      });
+    });
+  </script>
 
   <div class="panel">
     <div class="panel-header"><h3>系统状态</h3></div>

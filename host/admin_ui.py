@@ -83,14 +83,25 @@ def build_admin_router(
 
         # ---- LLM 配置 + 统计(代理可能尚未配置;留空即可)----
         configs = _safe(llm_config_store.list_all, [])
-        totals = _safe(
-            call_stats.totals,
-            {"calls": 0, "success": 0, "failed": 0,
-             "prompt_tokens": 0, "completion_tokens": 0,
-             "total_tokens": 0, "cost_usd": 0.0},
-        )
-        by_model = _safe(call_stats.by_model, [])
-        by_user = _safe(call_stats.by_user, [])
+        empty_totals = {
+            "calls": 0, "success": 0, "failed": 0,
+            "prompt_tokens": 0, "completion_tokens": 0,
+            "total_tokens": 0, "cost_usd": 0.0,
+        }
+        totals       = _safe(lambda: call_stats.totals("all"),        dict(empty_totals))
+        totals_day   = _safe(lambda: call_stats.totals("today"),      dict(empty_totals))
+        totals_month = _safe(lambda: call_stats.totals("this_month"), dict(empty_totals))
+
+        by_model       = _safe(lambda: call_stats.by_model("all"),        [])
+        by_model_day   = _safe(lambda: call_stats.by_model("today"),      [])
+        by_model_month = _safe(lambda: call_stats.by_model("this_month"), [])
+
+        by_user        = _safe(lambda: call_stats.by_user("all"),        [])
+        by_user_day    = _safe(lambda: call_stats.by_user("today"),      [])
+        by_user_month  = _safe(lambda: call_stats.by_user("this_month"), [])
+
+        recent_days   = _safe(lambda: call_stats.recent_days(7),    [])
+        recent_months = _safe(lambda: call_stats.recent_months(6),  [])
 
         unconfigured_users = [
             a.username for a in all_accounts
@@ -111,6 +122,13 @@ def build_admin_router(
             "llm_failed": totals.get("failed", 0),
             "llm_total_tokens": totals.get("total_tokens", 0),
             "llm_cost_usd": float(totals.get("cost_usd", 0.0) or 0.0),
+            # 当日 / 当月简报(KPI 卡的 hint 上展示)
+            "llm_calls_day":   totals_day.get("calls", 0),
+            "llm_calls_month": totals_month.get("calls", 0),
+            "llm_tokens_day":   totals_day.get("total_tokens", 0),
+            "llm_tokens_month": totals_month.get("total_tokens", 0),
+            "llm_cost_day":   float(totals_day.get("cost_usd", 0.0) or 0.0),
+            "llm_cost_month": float(totals_month.get("cost_usd", 0.0) or 0.0),
         }
 
         system = {
@@ -128,7 +146,13 @@ def build_admin_router(
                 "stats": stats,
                 "system": system,
                 "by_model": by_model,
+                "by_model_day": by_model_day,
+                "by_model_month": by_model_month,
                 "by_user": by_user,
+                "by_user_day": by_user_day,
+                "by_user_month": by_user_month,
+                "recent_days": recent_days,
+                "recent_months": recent_months,
                 "unconfigured_users": unconfigured_users,
                 "messages": _pop_messages(request),
             },
@@ -447,17 +471,34 @@ def build_admin_router(
         provider_type: str = Form(...),
         api_key: str = Form(""),
         base_url: str = Form(""),
+        config_id: str = Form(""),
     ):
-        """AJAX:根据 api_key 拉取可用模型列表(失败 → fallback)。"""
+        """AJAX:根据 api_key 拉取可用模型列表。
+
+        修改已有配置时,前端 api_key 是空(不显示明文)。这时如果带了
+        config_id,就用 store 里存的真实 key 去探测。
+        """
+        effective_key = api_key.strip()
+        used_stored = False
+        if not effective_key and config_id:
+            cfg = llm_config_store.get(config_id.strip())
+            if cfg and cfg.api_key:
+                effective_key = cfg.api_key
+                used_stored = True
+                # base_url 也补一下(用户没改的话用 store 里的)
+                if not base_url.strip():
+                    base_url = cfg.base_url or ""
+
         models, source = discover_models(
             provider_type.strip(),
-            api_key.strip(),
+            effective_key,
             base_url.strip(),
         )
         return JSONResponse({
             "models": models,
             "source": source,
             "count": len(models),
+            "used_stored_key": used_stored,
         })
 
     # ============================================================

@@ -217,7 +217,39 @@
       }
     }
 
-    async function discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp) {
+    // 把 source 翻成人话
+    const SOURCE_LABEL = {
+      'api':                       '✓ 实时拉取成功',
+      'fallback:no_provider':      '⚠ 离线列表 · provider 未知',
+      'fallback:stub_provider':    '⚠ 离线列表 · stub provider 无远端',
+      'fallback:no_api_key':       '⚠ 离线列表 · 未填 API Key',
+      'fallback:invalid_json':     '⚠ 离线列表 · 远端返回非 JSON',
+      'fallback:empty_response':   '⚠ 离线列表 · 远端无模型数据',
+    };
+    function explainSource(src) {
+      if (SOURCE_LABEL[src]) return SOURCE_LABEL[src];
+      if (src.startsWith('fallback:http_')) {
+        const code = src.split('_')[1];
+        const hint = ({
+          '401': 'API Key 无效',
+          '403': '权限不足',
+          '404': 'base_url 路径错',
+          '429': '调用频率被限',
+          '500': '远端故障',
+          '502': '远端网关错误',
+        })[code] || '';
+        return `⚠ 离线列表 · HTTP ${code}${hint ? ' · ' + hint : ''}`;
+      }
+      if (src.startsWith('fallback:net_')) {
+        return '⚠ 离线列表 · 网络:' + src.slice('fallback:net_'.length);
+      }
+      if (src.startsWith('fallback:exc_')) {
+        return '⚠ 离线列表 · 异常:' + src.slice('fallback:exc_'.length);
+      }
+      return '⚠ 离线列表(' + src + ')';
+    }
+
+    async function discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp, configId) {
       const provider = providerSel.value;
       const apiKey = apiKeyInp.value;
       statusEl.textContent = '探测中…';
@@ -226,12 +258,13 @@
         fd.append('provider_type', provider);
         fd.append('api_key', apiKey || '');
         fd.append('base_url', baseUrlInp.value || '');
+        if (configId) fd.append('config_id', configId);
         const r = await fetch('/admin/llm/discover', { method: 'POST', body: fd });
         const data = await r.json();
         const current = modelSel.value && modelSel.value !== '__custom__' ? modelSel.value : '';
         fillModelSelect(modelSel, data.models, current);
-        const tag = data.source === 'api' ? '✓ 实时' : '⚠ 离线列表(' + data.source + ')';
-        statusEl.textContent = tag + ' · 共 ' + data.count + ' 个模型';
+        const usingStored = data.used_stored_key ? ' · 用已保存 key' : '';
+        statusEl.textContent = explainSource(data.source) + usingStored + ' · 共 ' + data.count + ' 个模型';
       } catch (e) {
         statusEl.textContent = '探测失败:' + e.message;
       }
@@ -250,7 +283,8 @@
       providerSel.addEventListener('change', () => applyProvider(providerSel, modelSel, baseUrlInp, null));
       link.addEventListener('click', e => {
         e.preventDefault();
-        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp);
+        // 新建表单没有 config_id,传空字符串即可
+        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp, '');
       });
     })();
 
@@ -263,13 +297,15 @@
       const statusEl    = form.querySelector('.edit-discover-status');
       const link        = form.querySelector('.edit-discover');
       const current     = modelSel.dataset.current || '';
+      const cid         = form.dataset.cid || '';
       // 不覆盖用户已填的 base_url
       baseUrlInp.dataset.autofilled = '';
       applyProvider(providerSel, modelSel, baseUrlInp, current);
       providerSel.addEventListener('change', () => applyProvider(providerSel, modelSel, baseUrlInp, ''));
       link.addEventListener('click', e => {
         e.preventDefault();
-        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp);
+        // 编辑表单:把 config_id 也送上,后端会用已保存的 key
+        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp, cid);
       });
     });
   </script>

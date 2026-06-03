@@ -319,13 +319,43 @@ main {
   flex-shrink: 0;
 }
 
-/* 计算 trace(每步一行 · 不可展开) */
+/* 计算 trace(每步一行 · 可折叠) */
 .trace {
   margin: 0 0 8px;
+  font-size: 12.5px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: rgba(0,0,0,0.015);
+  overflow: hidden;
+}
+.trace > .trace-summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 8px 12px;
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 12.5px;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.trace > .trace-summary::-webkit-details-marker { display: none; }
+.trace > .trace-summary::before {
+  content: "▸";
+  font-size: 10px;
+  color: var(--text-muted);
+  transition: transform 0.15s;
+  display: inline-block;
+}
+.trace[open] > .trace-summary::before { transform: rotate(90deg); }
+.trace > .trace-summary:hover { color: var(--text); }
+.trace > .trace-steps {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  font-size: 12.5px;
+  padding: 6px 12px 10px;
+  border-top: 1px solid var(--border);
 }
 .trace .step {
   padding: 5px 10px;
@@ -344,6 +374,60 @@ main {
 .trace .step.result::before { content: "✓  "; color: #16a34a; font-weight: 600; }
 .trace .step.error::before  { content: "✗  "; color: var(--danger); font-weight: 600; }
 
+/* B6-1 解密授权浮卡 */
+.decrypt-card {
+  margin: 8px 0;
+  padding: 14px 16px;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 12px;
+  color: #7c2d12;
+}
+.decrypt-card .dc-title {
+  font-weight: 700; font-size: 13.5px;
+  color: #9a3412;
+}
+.decrypt-card .dc-body {
+  margin-top: 6px; font-size: 13px; line-height: 1.6;
+}
+.decrypt-card .dc-list {
+  margin: 6px 0 4px;
+  padding-left: 20px;
+  font-size: 12px;
+  color: #7c2d12;
+}
+.decrypt-card .dc-list li { margin: 2px 0; }
+.decrypt-card .dc-actions {
+  margin-top: 12px;
+  display: flex; flex-wrap: wrap; gap: 8px;
+}
+.decrypt-card .dc-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 14px;
+  font-size: 13px; font-weight: 600;
+  border-radius: 10px;
+  cursor: pointer;
+  border: 1px solid;
+  transition: all 0.12s;
+}
+.decrypt-card .dc-btn .dc-ic { width: 14px; height: 14px; }
+.decrypt-card .dc-btn.primary {
+  background: var(--blue); color: #fff;
+  border-color: var(--blue);
+}
+.decrypt-card .dc-btn.primary:hover:not(:disabled) { background: var(--blue-dark); }
+.decrypt-card .dc-btn.ghost {
+  background: #fff; color: #9a3412;
+  border-color: #fed7aa;
+}
+.decrypt-card .dc-btn.ghost:hover:not(:disabled) {
+  background: #ffedd5; border-color: #fdba74;
+}
+.decrypt-card .dc-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.decrypt-card .dc-hint {
+  margin-top: 10px; font-size: 11.5px; color: #b45309;
+}
+
 /* 询问气泡(needs_cipher) */
 .ask-card {
   margin: 6px 0;
@@ -358,14 +442,6 @@ main {
 }
 .ask-card .ic-inline { color: #c2410c; flex-shrink: 0; }
 
-/* 消息底栏 meta */
-.msg-meta {
-  margin-top: 6px;
-  font-size: 11.5px;
-  color: var(--text-muted);
-  font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-  line-height: 1.5;
-}
 
 /* ============================================================
  *  Composer (输入框 + 上下文条)
@@ -382,6 +458,13 @@ footer {
 }
 
 .attach-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.att-chip.text {
+  background: #ecfdf5;
+  color: #047857;
+  border-color: #a7f3d0;
+}
+.att-chip .ic-tiny { width: 12px; height: 12px; flex-shrink: 0; }
+.att-piece.text { color: #047857; }
 .attach-chips:empty { display: none; }
 .att-chip {
   display: flex; align-items: center; gap: 6px; max-width: 240px;
@@ -433,6 +516,51 @@ button.send {
 }
 button.send:hover { background: var(--blue-dark); }
 button.send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* 运行中 → 扁平浅灰"停止"图标按钮 */
+button.send.stop {
+  background: #f1f5f9;          /* 浅灰底 */
+  color: #64748b;                /* 灰色图标 */
+  border: 1px solid #e2e8f0;
+  min-width: 48px;
+  padding: 0 12px;
+}
+button.send.stop:hover {
+  background: #e2e8f0;
+  color: #475569;
+}
+button.send.stop .ic-stop {
+  width: 16px; height: 16px;
+  fill: currentColor;
+  display: block;
+}
+
+/* 打字机光标:闪烁竖条 */
+.type-cursor {
+  display: inline-block;
+  width: 0.6ch;
+  color: var(--blue);
+  animation: tw-blink 1s steps(2) infinite;
+  font-weight: 600;
+  margin-left: 1px;
+}
+@keyframes tw-blink { 50% { opacity: 0; } }
+
+/* 延迟显现的元素(打字机完成后才浮现) */
+[data-defer-reveal] {
+  opacity: 0;
+  transform: translateY(8px);
+  pointer-events: none;
+}
+[data-defer-reveal] * { visibility: hidden; }
+.revealed {
+  animation: tw-reveal 0.32s ease forwards;
+  pointer-events: auto;
+}
+@keyframes tw-reveal {
+  0%   { opacity: 0; transform: translateY(8px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
 
 /* drop overlay */
 .drop-overlay {

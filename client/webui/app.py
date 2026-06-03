@@ -40,6 +40,7 @@ from client.keystore import Keystore
 from client.local_storage import LocalStorage
 from client.tools.crypto import ZFHE
 from client.webui import pipeline as pipeline_mod
+from client.webui import text_extract
 from client.webui.sessions import ChatSession, Message, SessionStore
 from shared.prompts import load_system_prompt
 
@@ -55,6 +56,17 @@ CLIENT_CONFIG_FILE = APP_DATA_DIR / "client-config.json"
 
 _lock = threading.Lock()
 _session_state: dict[str, Any] = {"host_url": "", "username": "", "token": "", "expires_at": ""}
+
+# 用户取消标记 —— pipeline 线程在检查点读取此 set
+_cancelled_msgs: set[str] = set()
+_cancel_lock = threading.Lock()
+
+# 解密授权门(B6-1):
+#   mid → "decrypt" / "keep_encrypted" / "cancel"
+#   pipeline 线程阻塞等待 _decrypt_events[mid].set()
+_decrypt_decisions: dict[str, str] = {}
+_decrypt_events: dict[str, threading.Event] = {}
+_decrypt_lock = threading.Lock()
 
 
 def _load_config() -> dict[str, Any]:
@@ -495,6 +507,47 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         tmp_path.unlink(missing_ok=True)
 
 
+@app.post("/api/files/text_extract")
+async def api_files_text_extract(raw_file: UploadFile = File(...)):
+    """明文文本附件:在内存里抽文本,不落沙盒,直接随消息发给 LLM。"""
+    if not _is_logged_in():
+        return _need_login()
+    name = raw_file.filename or "attachment"
+    if not text_extract.is_text_attachment(name):
+        raise HTTPException(
+            400,
+            f"不支持该文本格式 · 支持:{', '.join(sorted(text_extract.SUPPORTED_EXTS))}",
+        )
+    data = await raw_file.read()
+    if not data:
+        raise HTTPException(400, "文件为空")
+    # 最大 10 MB(防止巨型 PDF/docx 把内存撑爆)
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(413, "文本文件超过 10 MB,请拆分后再传")
+
+    # 落到临时文件让 extractor 按路径工作
+    suffix = Path(name).suffix.lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data); tmp_path = Path(tmp.name)
+    try:
+        try:
+            text = text_extract.extract(tmp_path)
+        except Exception as e:
+            raise HTTPException(400, f"提取失败:{type(e).__name__}: {e}")
+        if not text.strip():
+            raise HTTPException(400, "文件解析后为空文本")
+        return {
+            "name": name,
+            "kind": "text",
+            "chars": len(text),
+            "preview": text[:300],
+            "content": text,
+            "size_kb": round(len(data) / 1024, 1),
+        }
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+
 @app.delete("/api/files/{name}")
 def api_files_delete(name: str):
     if not _is_logged_in():
@@ -627,11 +680,29 @@ async def api_messages_send(sid: str, request: Request):
     if not content:
         raise HTTPException(400, "消息为空")
     attached_cipher = (data.get("attached_cipher") or "").strip()
+    # 明文文本附件(每条 {name, content})— 客户端已通过 /api/files/text_extract 抽好文本
+    raw_text_atts = data.get("text_attachments") or []
+    text_attachments: list[dict[str, str]] = []
+    for t in raw_text_atts:
+        if isinstance(t, dict) and t.get("content"):
+            text_attachments.append({
+                "name": str(t.get("name") or "attachment"),
+                "content": str(t.get("content"))[:30_000],
+            })
 
-    # 1) 落用户消息 + assistant 占位
+    # 0) 抓"最近历史"作为上下文 —— 最多 6 条(3 轮 user/assistant 对)
+    history_for_llm: list[dict[str, str]] = []
+    for m in sess.messages[-6:]:
+        if m.role == "user" and m.content:
+            history_for_llm.append({"role": "user", "content": m.content})
+        elif m.role == "assistant" and m.status == "done" and m.summary:
+            history_for_llm.append({"role": "assistant", "content": m.summary})
+
+    # 1) 落用户消息 + assistant 占位(只持久化附件名,内容不落盘)
     user_msg = Message(
         id=secrets.token_hex(6), role="user",
         content=content, attached_cipher=attached_cipher,
+        text_attachment_names=[t["name"] for t in text_attachments],
     )
     _sessions.append_message(sid, user_msg)
     asst = Message(id=secrets.token_hex(6), role="assistant", status="pending")
@@ -640,13 +711,52 @@ async def api_messages_send(sid: str, request: Request):
     # 2) 后台跑 pipeline
     threading.Thread(
         target=_run_pipeline,
-        args=(sid, asst.id, content, attached_cipher),
+        args=(sid, asst.id, content, attached_cipher, history_for_llm, text_attachments),
         daemon=True, name=f"ask-{sid}-{asst.id}",
     ).start()
     return {"user_message": user_msg.to_dict(), "assistant_message": asst.to_dict()}
 
 
-def _run_pipeline(sid: str, asst_mid: str, user_query: str, attached_cipher: str) -> None:
+@app.post("/api/sessions/{sid}/messages/{mid}/cancel")
+def api_messages_cancel(sid: str, mid: str):
+    """用户点停止按钮 —— 标记该 mid 为已取消,pipeline 会在下一个检查点退出。"""
+    if not _is_logged_in():
+        return _need_login()
+    _sess_for_user(sid)
+    with _cancel_lock:
+        _cancelled_msgs.add(mid)
+    # 如果当前正卡在解密授权门 → 也把 event 唤醒
+    with _decrypt_lock:
+        _decrypt_decisions[mid] = "cancel"
+        evt = _decrypt_events.get(mid)
+    if evt:
+        evt.set()
+    return {"ok": True}
+
+
+@app.post("/api/sessions/{sid}/messages/{mid}/decrypt_decision")
+async def api_decrypt_decision(sid: str, mid: str, request: Request):
+    """B6-1 授权门:用户在浮卡上选了 decrypt / keep_encrypted。"""
+    if not _is_logged_in():
+        return _need_login()
+    _sess_for_user(sid)
+    data = await request.json()
+    choice = (data.get("choice") or "").strip()
+    if choice not in ("decrypt", "keep_encrypted", "cancel"):
+        raise HTTPException(400, "choice 必须是 decrypt / keep_encrypted / cancel")
+    with _decrypt_lock:
+        _decrypt_decisions[mid] = choice
+        evt = _decrypt_events.get(mid)
+    if evt:
+        evt.set()
+    return {"ok": True, "choice": choice}
+
+
+def _run_pipeline(
+    sid: str, asst_mid: str, user_query: str, attached_cipher: str,
+    history: list[dict[str, str]],
+    text_attachments: list[dict[str, str]],
+) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
     steps: list[dict[str, Any]] = []
@@ -678,6 +788,34 @@ def _run_pipeline(sid: str, asst_mid: str, user_query: str, attached_cipher: str
         )
         return
 
+    def _should_cancel() -> bool:
+        with _cancel_lock:
+            return asst_mid in _cancelled_msgs
+
+    def _prompt_decrypt() -> str:
+        """B6-1 授权门 · 阻塞等用户在浮卡上点选择(最长 5 分钟)。"""
+        evt = threading.Event()
+        with _decrypt_lock:
+            _decrypt_events[asst_mid] = evt
+            _decrypt_decisions.pop(asst_mid, None)
+        _sessions.update_message(sid, asst_mid, status="awaiting_decrypt")
+        waited = 0.0
+        try:
+            while waited < 300.0:
+                if evt.wait(timeout=0.5):
+                    break
+                if _should_cancel():
+                    return "cancel"
+                waited += 0.5
+            with _decrypt_lock:
+                choice = _decrypt_decisions.pop(asst_mid, "cancel")
+            # 拿到选择后把状态切回 running,前端轮询能看到 trace 继续
+            _sessions.update_message(sid, asst_mid, status="running")
+            return choice
+        finally:
+            with _decrypt_lock:
+                _decrypt_events.pop(asst_mid, None)
+
     try:
         result = pipeline_mod.ask(
             user_query=user_query,
@@ -686,6 +824,10 @@ def _run_pipeline(sid: str, asst_mid: str, user_query: str, attached_cipher: str
             token=_session_state["token"],
             system_prompt=system_prompt,
             on_step=on_step,
+            should_cancel=_should_cancel,
+            history=history,
+            text_attachments=text_attachments,
+            prompt_decrypt=_prompt_decrypt,
         )
     except Exception as e:
         _sessions.update_message(
@@ -695,12 +837,26 @@ def _run_pipeline(sid: str, asst_mid: str, user_query: str, attached_cipher: str
             used_cipher=used_cipher,
         )
         return
+    finally:
+        # 不管成功失败都把 cancel 标记清掉,避免泄漏
+        with _cancel_lock:
+            _cancelled_msgs.discard(asst_mid)
 
     status = result.get("status", "failed")
     if status == "needs_cipher":
         _sessions.update_message(
             sid, asst_mid, status="needs_cipher",
             summary=result.get("summary", ""),
+            duration_sec=round(time.time() - t0, 2),
+        )
+        return
+    if status == "cancelled":
+        _sessions.update_message(
+            sid, asst_mid, status="cancelled",
+            summary=result.get("summary", "") or "已停止 · 用户取消",
+            error="",
+            skill_calls=result.get("skill_calls", []),
+            used_cipher=used_cipher,
             duration_sec=round(time.time() - t0, 2),
         )
         return

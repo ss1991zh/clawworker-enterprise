@@ -26,6 +26,8 @@ class Message:
     content: str = ""
     # user-only:用户在这条消息附带的密文文件(可为空,自动沿用上一条 user 消息的)
     attached_cipher: str = ""
+    # user-only:本条消息附带的明文文本附件名(供前端 chip 展示;内容不持久化)
+    text_attachment_names: list[str] = field(default_factory=list)
     # assistant-only:
     summary: str = ""
     excel_path: str = ""
@@ -48,6 +50,7 @@ class Message:
             role=d.get("role", "user"),
             content=d.get("content", ""),
             attached_cipher=d.get("attached_cipher", "") or d.get("attached_cipher_path", ""),
+            text_attachment_names=list(d.get("text_attachment_names", []) or []),
             summary=d.get("summary", ""),
             excel_path=d.get("excel_path", ""),
             excel_name=d.get("excel_name", ""),
