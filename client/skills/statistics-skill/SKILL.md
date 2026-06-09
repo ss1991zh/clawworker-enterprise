@@ -51,9 +51,7 @@ results = [{"sheet_name": "相关性矩阵", "df": corr, "chart": None}]
 
 ### 异常检测(IQR)
 ```python
-df = ct.decrypt_df(cdf)
-meta = pd.DataFrame(metadata_rows)[[c for c in metadata_columns]]
-full = pd.concat([meta.reset_index(drop=True), df.reset_index(drop=True)], axis=1)
+full = ct.decrypt_df(cdf)                     # 完整明文表(身份列+数值列已自动拼好)
 
 col = "金额"     # 要检测的数值列
 q1, q3 = full[col].quantile(0.25), full[col].quantile(0.75)
@@ -61,8 +59,20 @@ iqr = q3 - q1
 lo, hi = q1 - 1.5*iqr, q3 + 1.5*iqr
 full["是否异常"] = ((full[col] < lo) | (full[col] > hi)).map({True: "异常", False: "正常"})
 outliers = full[full["是否异常"] == "异常"]
-results = [{"sheet_name": "异常明细", "df": outliers, "chart": None}]
+results = [{"sheet_name": "异常明细", "df": full, "tier_col": "是否异常",
+           "chart": {"type": "bar", "x": metadata_columns[0], "y": col, "title": "异常分布"}}]
 ```
+
+## 产品级呈现(结果 dict 可选键 —— 声明即美化,别自己写样式)
+
+除 sheet_name/df 外,每个结果 dict 可带:
+- `chart`: {"type":"bar"|"line","x":"身份列","y":"指标列"|["列1","列2"],"title":".."}
+- `tier_col`: "<档位文字列名>" —— 渲染端按语义自动上色(正常→绿 / 异常→红 / 预警→黄)
+- `total_row`: True —— 末尾自动「合计」行(金额求和、百分比取均值)
+- `note` / `number_formats` —— 表注 / 个别列格式覆盖
+
+默认动作:关键指标 `sort_values(降序)`;能配图就配图;关键结论给文字档位列。
+统计场景:异常检测 → 保留「是否异常」整列并设 `tier_col`(异常自动标红),别只留异常行。
 
 ## 硬性规则
 

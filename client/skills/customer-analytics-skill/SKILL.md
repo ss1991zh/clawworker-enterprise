@@ -42,9 +42,7 @@ LTV = 平均客单价 × 年复购频次 × 客户生命周期(年)
 ## 代码生成模板(cohort 留存为例)
 
 ```python
-df = ct.decrypt_df(cdf)
-meta = pd.DataFrame(metadata_rows)[[c for c in metadata_columns]]
-full = pd.concat([meta.reset_index(drop=True), df.reset_index(drop=True)], axis=1)
+full = ct.decrypt_df(cdf)                     # 完整明文表(身份列+数值列已自动拼好)
 
 # 假设 full 有:客户、购买月(YYYY-MM)
 full["首购月"] = full.groupby("客户")["购买月"].transform("min")
@@ -61,6 +59,17 @@ pivot = cohort.pivot(index="首购月", columns="月差", values="留存率").re
 
 results = [{"sheet_name": "同期群留存", "df": pivot, "chart": None}]
 ```
+
+## 产品级呈现(结果 dict 可选键 —— 声明即美化,别自己写样式)
+
+除 sheet_name/df 外,每个结果 dict 可带:
+- `chart`: {"type":"bar"|"line","x":"身份列","y":"指标列"|["列1","列2"],"title":".."}
+- `tier_col`: "<档位文字列名>" —— 渲染端按语义自动上色(重要价值/待挽留/流失/活跃…)
+- `total_row`: True —— 末尾自动「合计」行(金额求和、百分比取均值)
+- `note` / `number_formats` —— 表注 / 个别列格式覆盖
+
+默认动作:关键指标 `sort_values(降序)` + 加「排名」列;能配图就配图;关键结论给文字档位列。
+客户场景:RFM → 给「客户分群」文字档位列;留存 → 折线(line);LTV → 排名 + 排序。
 
 ## 硬性规则
 

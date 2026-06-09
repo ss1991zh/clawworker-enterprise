@@ -46,9 +46,7 @@ ROE = 净利率 × 总资产周转率 × 权益乘数
 ## 代码生成模板(杜邦为例)
 
 ```python
-df = ct.decrypt_df(cdf)                       # 解密(会触发授权)
-meta = pd.DataFrame(metadata_rows)[[c for c in metadata_columns]]
-full = pd.concat([meta.reset_index(drop=True), df.reset_index(drop=True)], axis=1)
+full = ct.decrypt_df(cdf)                     # 完整明文表(身份列+数值列已自动拼好;首次解密触发授权)
 
 full["净利率"]   = full["净利润"] / full["营业收入"]
 full["资产周转率"] = full["营业收入"] / full["总资产"]
@@ -61,6 +59,17 @@ results = [{
     "chart": {"type": "bar", "x": metadata_columns[0], "y": "ROE", "title": "ROE 杜邦分解"},
 }]
 ```
+
+## 产品级呈现(结果 dict 可选键 —— 声明即美化,别自己写样式)
+
+除 sheet_name/df 外,每个结果 dict 可带:
+- `chart`: {"type":"bar"|"line","x":"身份列","y":"指标列"|["列1","列2"],"title":".."}
+- `tier_col`: "<档位文字列名>" —— 渲染端按语义自动上色(达成/超支/节约/异常/A/B/C…)
+- `total_row`: True —— 末尾自动「合计」行(金额求和、百分比取均值)
+- `note` / `number_formats` —— 表注 / 个别列格式覆盖
+
+默认动作:关键指标 `sort_values(降序)` + 加「排名」列;能配图就配图;关键结论给文字档位列。
+财务场景:预算vs实际 → 补「差额 / 差异率」+「超支/节约」档位列;比率体系 → 排序 + total_row。
 
 ## 硬性规则
 

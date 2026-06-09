@@ -54,8 +54,11 @@ avg = cdf.mean()
 grouped = cdf.groupby(level=0).mean()
 
 # 解密查看结果
-print(ct.decrypt_df(cdf))
-print(ct.decrypt(result))
+# ⚠️ CipherDataFrame / CipherSeries(cdf 的列、cdf['a']+cdf['b'] 这类密态结果)
+#    一律用 ct.decrypt_df(...);ct.decrypt(...) 只解 ct.encrypt() 出来的数值数组。
+print(ct.decrypt_df(cdf))                  # 整表 → 明文 DataFrame
+print(ct.decrypt_df(result.to_cipherdataframe()))   # 单列密态结果 → 明文
+# 最稳:开头就 plain = ct.decrypt_df(cdf),之后全部用 pandas 处理。
 ```
 
 ## 常见计算模式
@@ -90,7 +93,10 @@ print(ct.decrypt(result))
 
 1. **必须初始化** — 每个脚本以 `hp.initDict()` + `ct.initSK()` 开头。
 2. **禁止编造 API** — `{baseDir}/INDEX.md` 中找不到的 API 不存在。
-3. **加解密方法区分** — 数值数组用 `ct.encrypt()` / `ct.decrypt()`；DataFrame/Series 用 `ct.encrypt_df()` / `ct.decrypt_df()`。
+3. **加解密方法区分(高频踩坑)** — `ct.decrypt()` 只解 `ct.encrypt()` 出来的数值数组;
+   **CipherDataFrame / CipherSeries(含 cdf 的列、`cdf['a']+cdf['b']` 等密态结果)绝不能传给 `ct.decrypt()`**
+   (会抛 `Unable to decrypt data of CipherSeries type`),一律用 `ct.decrypt_df()`。
+   单列结果先 `result.to_cipherdataframe()` 再 `ct.decrypt_df(...)`。
 4. **运算符已重载** — `+` `-` `*` `/` `>` `<` `>=` `<=` `==` `!=` 可直接在 CipherDataFrame/CipherSeries 上使用。
 5. **`_P` / `_L` 行是正常现象** — CipherDataFrame 打印时会显示 `_P`（加密参数）和 `_L`（长度）行，属于加密元数据，解密后不会出现。
 6. **fill_value 必须是密文** — 二元操作的 `fill_value` 参数需传入密文标量（如 `ct.encrypt(0)`），不能传明文。

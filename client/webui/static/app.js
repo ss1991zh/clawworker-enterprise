@@ -260,7 +260,7 @@ function renderMessage(m) {
         : "";
       content += `
         <div class="decrypt-card" data-mid="${esc(m.id)}">
-          <div class="dc-title">结果解密展示授权 · B6-1</div>
+          <div class="dc-title">解密授权 / 审批</div>
           <div class="dc-body">
             <strong>计算已在密态下完成</strong>,全程未暴露明文。
             各 skill 的密态运算路径不同,详见上方「计算追踪」。

@@ -104,31 +104,117 @@ def enforce_excel_path(path: Path) -> Path:
 
 
 # ----------------------------------------------------------------------------
-# Number format 推断
+# 产品级呈现:number_format 推断 + 语义调色板 + 列宽
 # ----------------------------------------------------------------------------
 
+# 逆向指标:数值越大越"坏",百分比色阶要反色(红高绿低)
+_REVERSE_METRIC = ("逾期", "超支", "流失", "异常", "缺货", "呆滞", "波动", "差异率", "降幅")
+
+
 def _infer_number_format(col_name: str) -> Optional[str]:
+    """按列名推断 Excel 数字格式 —— 覆盖销售/财务/库存/HR/客户常见指标。"""
     name = str(col_name)
     lower = name.lower()
-    # 百分比
-    if any(k in lower for k in ("rate", "ratio", "percentage")):
+    # 百分比(率 / 占比 / 同比环比 / 增长)
+    if any(k in lower for k in ("rate", "ratio", "percentage", "pct")):
         return "0.00%"
-    if any(k in name for k in ("率", "比例", "占比")):
+    if any(k in name for k in ("率", "比例", "占比", "百分比", "同比", "环比", "增长", "涨幅", "降幅")):
         return "0.00%"
-    # 金额
-    if any(k in lower for k in ("amount", "value", "price", "cost", "revenue", "profit")):
-        return "#,##0.00"
-    if any(k in name for k in ("金额", "(元)", "（元）", "成本", "收入")):
-        return "#,##0.00"
-    # 天数
-    if "days" in lower or "天数" in name or "周转" in name:
+    # 天数 / 账龄 / 周转
+    if "days" in lower or any(k in name for k in ("天数", "账龄", "周转")):
         return "0.0"
-    # 整数 / 计数
+    # 金额(财务/销售/HR 薪酬)
+    if any(k in lower for k in ("amount", "value", "price", "cost", "revenue", "profit", "sales", "budget")):
+        return "#,##0.00"
+    if any(k in name for k in (
+        "金额", "额", "收入", "成本", "利润", "营收", "回款", "应收", "应付", "余额",
+        "预算", "实际", "(元)", "（元）", "工资", "薪酬", "薪资", "提成", "奖金", "单价", "总价",
+    )):
+        return "#,##0.00"
+    # 计数 / 人数 / 排名(整数)
     if any(k in lower for k in ("count", "num", "qty")):
         return "0"
-    if any(k in name for k in ("订单数", "数量", "笔数", "次数", "排名")):
+    if any(k in name for k in ("数量", "笔数", "次数", "订单数", "人数", "件数", "排名", "名次", "人次", "户数")):
         return "0"
     return None
+
+
+# 语义档位 → (背景色, 字体色)。覆盖销售/财务/库存/HR/客户各场景的常见标签。
+_TIER_GOOD = ("C6EFCE", "006100")   # 绿:达成 / 正常 / 优 / 健康 / 活跃 / A / 节约 / 盈利
+_TIER_WARN = ("FFEB9C", "9C5700")   # 黄:预警 / 关注 / 中 / B / 临期 / 潜力
+_TIER_BAD  = ("FFC7CE", "9C0006")   # 红:未达成 / 异常 / 超支 / 逾期 / 呆滞 / 流失 / C / 亏损
+_TIER_INFO = ("DDEBF7", "1F4E78")   # 蓝:预测 / 新增 / 重点(中性强调)
+
+_TIER_MAP = {
+    # —— 绿(好)——
+    "达成": _TIER_GOOD, "已达成": _TIER_GOOD, "完成": _TIER_GOOD, "正常": _TIER_GOOD,
+    "优": _TIER_GOOD, "优秀": _TIER_GOOD, "健康": _TIER_GOOD, "活跃": _TIER_GOOD,
+    "盈利": _TIER_GOOD, "节约": _TIER_GOOD, "favorable": _TIER_GOOD, "a": _TIER_GOOD,
+    "a类": _TIER_GOOD, "a档": _TIER_GOOD, "重要价值": _TIER_GOOD, "高价值": _TIER_GOOD,
+    "高": _TIER_GOOD, "充足": _TIER_GOOD, "良": _TIER_GOOD,
+    # —— 黄(关注)——
+    "预警": _TIER_WARN, "关注": _TIER_WARN, "中": _TIER_WARN, "一般": _TIER_WARN,
+    "中等": _TIER_WARN, "临期": _TIER_WARN, "b": _TIER_WARN, "b类": _TIER_WARN,
+    "b档": _TIER_WARN, "潜力": _TIER_WARN, "待挽留": _TIER_WARN, "一般价值": _TIER_WARN,
+    # —— 红(差/风险)——
+    "未达成": _TIER_BAD, "未完成": _TIER_BAD, "异常": _TIER_BAD, "超支": _TIER_BAD,
+    "逾期": _TIER_BAD, "呆滞": _TIER_BAD, "流失": _TIER_BAD, "已流失": _TIER_BAD,
+    "差": _TIER_BAD, "亏损": _TIER_BAD, "高风险": _TIER_BAD, "unfavorable": _TIER_BAD,
+    "c": _TIER_BAD, "c类": _TIER_BAD, "c档": _TIER_BAD, "低": _TIER_BAD, "缺货": _TIER_BAD,
+    # —— 蓝(中性强调)——
+    "预测": _TIER_INFO, "新增": _TIER_INFO, "新客": _TIER_INFO, "重点": _TIER_INFO,
+    "历史": None,  # 历史不上色
+}
+
+# 自动识别"档位文字列"的列名关键词(各场景通用)
+_TIER_COL_HINTS = ("类型", "档位", "等级", "分类", "分群", "状态", "评级", "是否", "标签", "情况", "abc")
+
+
+def _tier_fill(value):
+    """档位文字 → (PatternFill, Font) 或 None。"""
+    from openpyxl.styles import Font, PatternFill
+    if value is None:
+        return None
+    key = str(value).strip().lower()
+    if not key:
+        return None
+    pal = _TIER_MAP.get(key)
+    if pal is None:
+        # 模糊包含匹配(如"达成率高"含"高"、"A类客户"含"a类")
+        for k, p in _TIER_MAP.items():
+            if p is not None and k in key:
+                pal = p
+                break
+    if not pal:
+        return None
+    bg, fg = pal
+    return PatternFill("solid", fgColor=bg), Font(color=fg, bold=True)
+
+
+def _disp_width(s) -> float:
+    """显示宽度:中文/全角算 1.8,其余算 1.0。"""
+    w = 0.0
+    for ch in str(s):
+        w += 1.8 if ord(ch) > 0x2E7F else 1.0
+    return w
+
+
+def _clean_val(v):
+    """numpy 标量 → python;NaN/NaT → None(避免 Excel 里出现 'nan')。"""
+    try:
+        import pandas as pd
+        if v is None:
+            return None
+        if not isinstance(v, (str, bytes, list, tuple, dict)) and pd.isna(v):
+            return None
+    except Exception:
+        pass
+    if hasattr(v, "item") and not isinstance(v, (str, bytes)):
+        try:
+            return v.item()
+        except Exception:
+            return v
+    return v
 
 
 # ----------------------------------------------------------------------------
@@ -141,79 +227,252 @@ def write_skill_results(
     stem: Optional[str] = None,
 ) -> Path:
     """
-    把 [{sheet_name, df, chart}] 列表写成多 sheet xlsx。
+    把 [{sheet_name, df, ...}] 列表写成产品级多 sheet xlsx。
 
-    Args:
-        results: 每个 dict 至少含 sheet_name + df,可选 chart(dict 或 None)
-        path: 落地路径(默认 ~/Downloads/analysis_<ts>.xlsx)
+    每个 result dict 至少含 sheet_name + df,以下键全部可选(声明即美化):
+        chart:          {"type":"bar"|"line","x":..,"y":..|[..],"title":..}
+        tier_col:       <档位文字列名> —— 该列按语义上色(不传则按列名自动识别)
+        total_row:      True | {"label":"合计","sum":[列..],"mean":[列..]}
+        note:           <表顶一行灰色说明>
+        number_formats: {"列名":"0.00%"} —— 显式覆盖某列格式
 
-    Returns:
-        最终落盘路径
+    渲染端统一施加:表头高亮 / 冻结首行 / 自动筛选 / 隔行底色 /
+    内容感知列宽 / 百分比列三色阶(逆向指标反色)/ 图表增强。
     """
     import openpyxl
-    from openpyxl.utils import get_column_letter
-    from openpyxl.chart import BarChart, LineChart, Reference
-    from openpyxl.styles import Alignment, Font, PatternFill
 
     dst = enforce_excel_path(path or make_excel_path(stem))
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     wb = openpyxl.Workbook()
-    # 删默认 sheet
-    default = wb.active
-    wb.remove(default)
-
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="2563EB")
-    center = Alignment(horizontal="center", vertical="center")
+    wb.remove(wb.active)  # 删默认 sheet
 
     for r in results:
-        sheet_name = str(r.get("sheet_name") or "Sheet")[:31]
         df = r.get("df")
-        chart_hint = r.get("chart")
-        if df is None or df.empty:
+        if df is None or getattr(df, "empty", True):
             continue
-
+        df = _dedup_columns(df)  # 防御:同名列(如误重复 merge 身份列)只留第一份
+        sheet_name = str(r.get("sheet_name") or "Sheet")[:31]
         ws = wb.create_sheet(title=sheet_name)
+        try:
+            _render_sheet(ws, df, r)
+        except Exception:
+            # 装饰失败 → 退回最简写法,保证数据不丢、文件可落盘
+            _render_plain(ws, df)
 
-        # 写表头
-        headers = [str(c) for c in df.columns]
-        for ci, h in enumerate(headers, 1):
-            cell = ws.cell(1, ci, h)
-            cell.font = header_font
-            cell.fill = header_fill
-            cell.alignment = center
-
-        # 写数据 + 每列推断 number_format
-        col_formats: dict[int, str] = {}
-        for ci, col in enumerate(headers, 1):
-            nf = _infer_number_format(col)
-            if nf:
-                col_formats[ci] = nf
-
-        for ri, row in enumerate(df.itertuples(index=False), 2):
-            for ci, val in enumerate(row, 1):
-                cell = ws.cell(ri, ci, val)
-                if ci in col_formats:
-                    cell.number_format = col_formats[ci]
-
-        # 列宽自动(简化:按表头长度 + 2)
-        for ci, h in enumerate(headers, 1):
-            width = max(len(h) * 2.1, 10) + 2
-            ws.column_dimensions[get_column_letter(ci)].width = min(width, 28)
-
-        # 冻结首行
-        ws.freeze_panes = "A2"
-
-        # 图表(可选)
-        if chart_hint:
-            try:
-                _add_chart(ws, df, chart_hint, headers)
-            except Exception:
-                pass  # 图表渲染失败不阻断 Excel 落盘
+    if not wb.sheetnames:  # 全空兜底(openpyxl 不允许零 sheet 保存)
+        wb.create_sheet(title="结果")
 
     wb.save(dst)
     return dst
+
+
+def _dedup_columns(df):
+    """同名列只留第一份(防 LLM 误把身份列 merge 两次导致重列)。"""
+    try:
+        if getattr(df, "columns", None) is not None and df.columns.duplicated().any():
+            return df.loc[:, ~df.columns.duplicated()]
+    except Exception:
+        pass
+    return df
+
+
+def _render_plain(ws, df) -> None:
+    """最简兜底:只写表头 + 数据,不做任何样式。"""
+    for ci, h in enumerate([str(c) for c in df.columns], 1):
+        ws.cell(1, ci, h)
+    for ri, row in enumerate(df.itertuples(index=False), 2):
+        for ci, val in enumerate(row, 1):
+            ws.cell(ri, ci, _clean_val(val))
+
+
+def _render_sheet(ws, df, r: dict) -> None:
+    """渲染单张产品级 sheet。"""
+    from openpyxl.utils import get_column_letter
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.formatting.rule import ColorScaleRule
+
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="2563EB")
+    band_fill = PatternFill("solid", fgColor="F2F6FC")
+    center = Alignment(horizontal="center", vertical="center")
+
+    # 图表规格(chart + charts)+ split_by 预排序:同组行连续 → 可按组拆成多张图
+    chart_specs = _collect_chart_specs(r)
+    split_col = next(
+        (s.get("split_by") for s in chart_specs
+         if s.get("split_by") and s.get("split_by") in df.columns),
+        None,
+    )
+    if split_col:
+        try:
+            df = df.sort_values(split_col, kind="stable").reset_index(drop=True)
+        except Exception:
+            pass
+
+    headers = [str(c) for c in df.columns]
+    n_cols = len(headers)
+    header_row = 1
+
+    # 可选:表顶说明 caption
+    note = r.get("note")
+    if note:
+        c = ws.cell(1, 1, str(note))
+        c.font = Font(italic=True, color="6B7280", size=10)
+        if n_cols > 1:
+            ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=n_cols)
+        header_row = 2
+
+    # 表头
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(header_row, ci, h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = center
+    ws.row_dimensions[header_row].height = 20
+
+    # 每列 number_format(+ 显式覆盖)
+    col_fmt: dict[int, str] = {}
+    for ci, h in enumerate(headers, 1):
+        nf = _infer_number_format(h)
+        if nf:
+            col_fmt[ci] = nf
+    for col, fmt in (r.get("number_formats") or {}).items():
+        if col in headers:
+            col_fmt[headers.index(col) + 1] = fmt
+
+    # 档位列(显式 tier_col 优先,否则按列名自动识别)
+    tier_col = r.get("tier_col")
+    if not tier_col:
+        for h in headers:
+            if any(k in str(h).lower() for k in _TIER_COL_HINTS):
+                tier_col = h
+                break
+    tier_ci = headers.index(tier_col) + 1 if tier_col in headers else None
+
+    # 数据行
+    data0 = header_row + 1
+    for ri, row in enumerate(df.itertuples(index=False), data0):
+        banded = (ri - data0) % 2 == 1
+        for ci, val in enumerate(row, 1):
+            cell = ws.cell(ri, ci, _clean_val(val))
+            if ci in col_fmt:
+                cell.number_format = col_fmt[ci]
+            if banded:
+                cell.fill = band_fill
+            if tier_ci and ci == tier_ci:
+                tf = _tier_fill(val)
+                if tf:
+                    cell.fill, cell.font = tf
+    n_data = len(df)
+    data_last = data0 + n_data - 1
+
+    # 可选合计行
+    if r.get("total_row"):
+        try:
+            _write_total_row(ws, df, headers, col_fmt, data0, data_last, r.get("total_row"))
+        except Exception:
+            pass
+
+    # 内容感知列宽
+    for ci, h in enumerate(headers, 1):
+        w = _disp_width(h)
+        try:
+            for v in df.iloc[:, ci - 1].astype(str).head(60):
+                w = max(w, _disp_width(v))
+        except Exception:
+            pass
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(w + 2.5, 10), 40)
+
+    # 冻结表头 + 自动筛选
+    ws.freeze_panes = ws.cell(data0, 1).coordinate
+    if n_cols and n_data:
+        ws.auto_filter.ref = (
+            f"{ws.cell(header_row, 1).coordinate}:{get_column_letter(n_cols)}{data_last}"
+        )
+
+    # 百分比列三色阶(逆向指标如逾期/超支自动反色)
+    if n_data >= 2:
+        for ci, h in enumerate(headers, 1):
+            if col_fmt.get(ci) != "0.00%":
+                continue
+            lo, mid, hi = "F8696B", "FFEB84", "63BE7B"  # 红→黄→绿
+            if any(k in str(h) for k in _REVERSE_METRIC):
+                lo, hi = hi, lo
+            col = get_column_letter(ci)
+            try:
+                ws.conditional_formatting.add(
+                    f"{col}{data0}:{col}{data_last}",
+                    ColorScaleRule(
+                        start_type="min", start_color=lo,
+                        mid_type="percentile", mid_value=50, mid_color=mid,
+                        end_type="max", end_color=hi,
+                    ),
+                )
+            except Exception:
+                pass
+
+    # 图表(单图 / 多图 / 按 split_by 自动拆成每组一张,竖直堆叠在数据右侧)
+    if chart_specs and n_data:
+        try:
+            _render_charts(ws, df, chart_specs, headers, header_row, n_cols)
+        except Exception:
+            pass  # 图表失败不阻断落盘
+
+
+def _write_total_row(ws, df, headers, col_fmt, data0, data_last, spec) -> None:
+    """在数据末尾追加一行合计/均值。spec=True 自动推断;dict 可指定 sum/mean 列。"""
+    import pandas as pd
+    from openpyxl.styles import Font, PatternFill
+
+    label = "合计"
+    sum_cols: list = []
+    mean_cols: list = []
+    if isinstance(spec, dict):
+        label = spec.get("label") or "合计"
+        sum_cols = list(spec.get("sum") or [])
+        mean_cols = list(spec.get("mean") or [])
+    if not sum_cols and not mean_cols:  # 自动:金额/计数列求和,百分比列取均值
+        for h in headers:
+            # 排名/序号是序数,求和无意义,跳过
+            if any(k in str(h) for k in ("排名", "名次", "序号")):
+                continue
+            fmt = _infer_number_format(h)
+            if fmt in ("#,##0.00", "0"):
+                sum_cols.append(h)
+            elif fmt == "0.00%":
+                mean_cols.append(h)
+
+    row_idx = data_last + 1
+    tot_font = Font(bold=True, color="1F2937")
+    tot_fill = PatternFill("solid", fgColor="E5EDFB")
+    for ci in range(1, len(headers) + 1):
+        ws.cell(row_idx, ci).font = tot_font
+        ws.cell(row_idx, ci).fill = tot_fill
+    # 标签放第一个"非汇总"列,避免覆盖数值
+    label_ci = 1
+    for ci, h in enumerate(headers, 1):
+        if h not in sum_cols and h not in mean_cols:
+            label_ci = ci
+            break
+    ws.cell(row_idx, label_ci, label)
+    for ci, h in enumerate(headers, 1):
+        if ci == label_ci:
+            continue
+        try:
+            if h in sum_cols and pd.api.types.is_numeric_dtype(df[h]):
+                val = float(df[h].sum())
+            elif h in mean_cols and pd.api.types.is_numeric_dtype(df[h]):
+                val = float(df[h].mean())
+            else:
+                continue
+        except Exception:
+            continue
+        cell = ws.cell(row_idx, ci, val)
+        cell.font = tot_font
+        cell.fill = tot_fill
+        if ci in col_fmt:
+            cell.number_format = col_fmt[ci]
 
 
 def export_cipher_as_is(
@@ -442,46 +701,120 @@ def _encrypt_numeric_columns(df):
     return merged
 
 
-def _add_chart(ws, df, chart_hint: dict, headers: list[str]) -> None:
-    """根据 chart_hint = {type, x, y, title} 加一个柱状/折线图。"""
-    from openpyxl.chart import BarChart, LineChart, Reference
+def _collect_chart_specs(r: dict) -> list:
+    """从 result dict 收集图表规格 —— 支持单个 chart 或 charts 列表(多图)。"""
+    specs: list = []
+    one = r.get("chart")
+    if isinstance(one, dict):
+        specs.append(one)
+    many = r.get("charts")
+    if isinstance(many, (list, tuple)):
+        specs.extend([c for c in many if isinstance(c, dict)])
+    return specs
 
-    typ = (chart_hint.get("type") or "bar").lower()
-    x = chart_hint.get("x")
-    y = chart_hint.get("y")
-    title = chart_hint.get("title") or ""
 
-    if not (x and y):
-        return
-    if isinstance(y, str):
-        y_cols = [y]
-    else:
-        y_cols = list(y)
+# 单图类别数超过此值仍不拆分时,只在日志层面是"可看性差";split_by 是推荐解法。
+_MAX_SPLIT_CHARTS = 12   # split_by 最多出多少张子图,防爆炸
 
-    if x not in headers:
-        return
+
+def _render_charts(ws, df, specs: list, headers: list, header_row: int, n_cols: int) -> None:
+    """
+    渲染所有图表,竖直堆叠在数据右侧。
+    每个 spec 可带 split_by="<列名>" —— 按该列把数据拆成每组一张图
+    (如 100 人按"销售大区"拆成 6 张、两个产品各出一张趋势图),
+    每张图都有完整标题 + 横纵轴。df 已在上游按 split_by 预排序 → 同组行连续。
+    """
+    from openpyxl.utils import get_column_letter
+
+    anchor_col = get_column_letter(n_cols + 2)
+    data0 = header_row + 1
+    anchor_row = header_row
+    for spec in specs:
+        for chart in _expand_chart_spec(ws, df, spec, headers, data0):
+            if chart is None:
+                continue
+            ws.add_chart(chart, f"{anchor_col}{anchor_row}")
+            anchor_row += 18   # 每张图竖直间隔约 18 行,互不遮挡
+
+
+def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
+    """一个 spec → 一张或多张 chart(有 split_by 时按组各一张)。"""
+    typ = (spec.get("type") or "bar").lower()
+    x = spec.get("x")
+    y = spec.get("y")
+    base_title = spec.get("title") or ""
+    split_by = spec.get("split_by")
+
+    if not (x and y) or x not in headers:
+        return []
+    y_cols = [y] if isinstance(y, str) else list(y)
     valid_y = [c for c in y_cols if c in headers]
     if not valid_y:
-        return
+        return []
+    x_idx = headers.index(x) + 1
+    y_idxs = [headers.index(c) + 1 for c in valid_y]
 
-    x_col_idx = headers.index(x) + 1
-    n_rows = len(df) + 1  # +1 因为表头
+    charts: list = []
+    if split_by and split_by in df.columns:
+        # df 已按 split_by 预排序 → 每组是连续行块
+        col = df[split_by].astype(str).tolist()
+        spans = []
+        start = 0
+        for j in range(1, len(col) + 1):
+            if j == len(col) or col[j] != col[start]:
+                spans.append((col[start], start, j - 1))
+                start = j
+        for gval, s, e in spans[:_MAX_SPLIT_CHARTS]:
+            title = f"{gval} · {base_title}" if base_title else str(gval)
+            charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
+                                      data0 + s, data0 + e, title))
+    else:
+        charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
+                                  data0, data0 + len(df) - 1, base_title))
+    return charts
 
-    chart_cls = LineChart if typ == "line" else BarChart
-    chart = chart_cls()
-    chart.title = title
-    chart.style = 11
-    chart.height = 10
-    chart.width = 18
 
-    cats = Reference(ws, min_col=x_col_idx, min_row=2, max_row=n_rows)
+def _make_chart(ws, typ: str, x_idx: int, y_idxs: list, headers: list,
+                first_row: int, last_row: int, title: str):
+    """
+    构建一张产品级图表(支持任意连续行子区间):
+    显式系列名(不依赖表头连续)/ 轴标题 / 图例底部 / 折线圆点 / Y 轴数字格式 / 网格。
+    """
+    from openpyxl.chart import BarChart, LineChart, Reference, Series
+
+    if last_row < first_row:
+        return None
+    chart = (LineChart if typ == "line" else BarChart)()
+    chart.title = title or None
+    chart.style = 12
+    chart.height = 8.5
+    chart.width = 20
+
+    cats = Reference(ws, min_col=x_idx, min_row=first_row, max_row=last_row)
+    for yi in y_idxs:
+        data = Reference(ws, min_col=yi, min_row=first_row, max_row=last_row)
+        chart.series.append(Series(data, title=headers[yi - 1]))  # 显式系列名
     chart.set_categories(cats)
 
-    for yc in valid_y:
-        y_col_idx = headers.index(yc) + 1
-        data = Reference(ws, min_col=y_col_idx, min_row=1, max_row=n_rows)
-        chart.add_data(data, titles_from_data=True)
+    try:
+        chart.x_axis.title = headers[x_idx - 1]
+        chart.y_axis.title = headers[y_idxs[0] - 1] if len(y_idxs) == 1 else None
+        chart.x_axis.delete = False
+        chart.y_axis.delete = False
+        from openpyxl.chart.axis import ChartLines
+        chart.y_axis.majorGridlines = ChartLines()
+        chart.y_axis.numFmt = _infer_number_format(headers[y_idxs[0] - 1]) or "General"
+        chart.legend.position = "b"
+    except Exception:
+        pass
 
-    # 放在最后一列右侧
-    anchor_col = chr(ord("A") + len(headers) + 1)
-    ws.add_chart(chart, f"{anchor_col}2")
+    if typ == "line":
+        try:
+            from openpyxl.chart.marker import Marker
+            for s in chart.series:
+                s.marker = Marker(symbol="circle", size=5)
+                s.smooth = False
+        except Exception:
+            pass
+
+    return chart

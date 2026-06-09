@@ -66,6 +66,18 @@ attr = pd.DataFrame({"因素": feats, "归一化系数(方向)": (ct.decrypt(coe
 results = [{"sheet_name": "回归归因", "df": attr, "chart": None}]
 ```
 
+## 产品级呈现(结果 dict 可选键 —— 声明即美化,别自己写样式)
+
+除 sheet_name/df 外,每个结果 dict 可带:
+- `chart`: {"type":"bar"|"line","x":"维度列","y":"指标列"|["列1","列2"],"title":".."}
+- `tier_col`: "<档位文字列名>" —— 渲染端按语义自动上色(高/中/低、高风险、簇标签…)
+- `total_row`: True —— 末尾自动「合计」行
+- `note` / `number_formats` —— 表注 / 个别列格式覆盖
+
+默认动作:能排序就 `sort_values(降序)`;能配图就配图;关键结论给文字档位列。
+ML 场景:聚类 → 给「客户簇 / 分群」文字档位列;归因 → 系数按绝对值排序 + 柱状图;
+流失预测 → 概率降序 + 加「风险等级(高/中/低)」档位列。
+
 ## 硬性规则
 
 1. 不写 import / 初始化(`hp.initDict()` / `ct.initSK()` 已做)。

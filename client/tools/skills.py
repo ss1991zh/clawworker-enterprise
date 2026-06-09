@@ -12,7 +12,7 @@ Skill 模板库 — LLM 的新执行接口。
 
 调用方(skill_workflow)负责:
   - 加载 cipher → CipherDataFrame
-  - 鉴权(B6-1)
+  - 鉴权(解密授权 / HITL)
   - 调度 skill_calls
   - 合并产出的 (sheet_name, df) 列表 → renderer
 """
@@ -50,6 +50,48 @@ def _decrypt(cdf):
     return ct.decrypt_df(cdf)
 
 
+def _apply_filter(full, params):
+    """
+    按 params['filter'] 过滤行,让"只看某个产品 / 大区 / 客户 / 员工"生效。
+    filter = {列名: 值} 或 {列名: [值, ...]};多列之间为 AND。
+
+    匹配策略:先精确匹配;精确无命中则退化为**不区分大小写的子串包含**
+    (应对用户只说 "DR-400" 而单元格是 "数控伺服驱动器 DR-400" 的情况)。
+    · 列不存在 → 跳过该条件(不致误删);
+    · 某条件最终零匹配 → 报错并列出样例值,**避免"点名筛选却返回全部数据"或静默空表**。
+    """
+    import re as _re
+    flt = params.get("filter")
+    if not flt or not isinstance(flt, dict):
+        return full
+    out = full
+    for col, val in flt.items():
+        if col not in out.columns:
+            continue
+        s = out[col].astype(str).str.strip()
+        if isinstance(val, (list, tuple, set)):
+            wanted = [str(v).strip() for v in val if str(v).strip()]
+            if not wanted:
+                continue
+            mask = s.isin(wanted)
+            if not mask.any():
+                mask = s.apply(lambda x: any(w.lower() in x.lower() for w in wanted))
+        else:
+            v = str(val).strip()
+            if not v:
+                continue
+            mask = s == v
+            if not mask.any():
+                mask = s.str.contains(_re.escape(v), case=False, na=False)
+        if not mask.any():
+            sample = sorted(set(s.dropna().tolist()))[:8]
+            raise ValueError(
+                f"filter: 列「{col}」中未找到匹配「{val}」的行 · 该列样例值: {sample}"
+            )
+        out = out[mask]
+    return out.reset_index(drop=True)
+
+
 # ----- skill 1: ratio_by_group --------------------------------------------
 
 def skill_ratio_by_group(cdf, params: dict, metadata_rows, metadata_columns):
@@ -74,6 +116,7 @@ def skill_ratio_by_group(cdf, params: dict, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     if group not in full.columns:
         raise ValueError(f"ratio_by_group: group_col 「{group}」不存在 · 可选: {list(full.columns)[:20]}")
@@ -119,6 +162,7 @@ def skill_row_ratio_then_group_mean(cdf, params, metadata_rows, metadata_columns
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     if num not in full.columns or den not in full.columns:
         raise ValueError(f"row_ratio_then_group_mean: 列缺失 num={num} den={den}")
@@ -159,6 +203,7 @@ def skill_top_n_by(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     if value_col not in full.columns:
         raise ValueError(f"top_n_by: value_col「{value_col}」不存在")
@@ -192,6 +237,7 @@ def skill_group_stats(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     if group not in full.columns:
         raise ValueError(f"group_stats: group_col 「{group}」不存在")
@@ -225,6 +271,10 @@ def skill_describe(cdf, params, metadata_rows, metadata_columns):
     import pandas as pd
 
     decrypted = _decrypt(cdf)
+    # 支持按指定实体筛选(filter 作用在身份列上,再对数值列做描述统计)
+    if params.get("filter"):
+        full = _apply_filter(_merge_meta(decrypted, metadata_rows, metadata_columns), params)
+        decrypted = full.select_dtypes(include="number")
     cols = params.get("value_cols")
     if cols:
         cols = [c for c in cols if c in decrypted.columns]
@@ -361,6 +411,7 @@ def skill_row_detail(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     # 派生列(按 compute 列表顺序执行 —— 后面的可以引用前面的派生列)
     for c in params.get("compute") or []:
@@ -457,6 +508,7 @@ def skill_forecast_linreg(cdf, params: dict, metadata_rows, metadata_columns):
     # ── ① pandas:解密 + 拼明文身份列 + 清洗 ──────────────────────
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
 
     if not value_col or value_col not in full.columns:
         raise ValueError(
@@ -560,6 +612,9 @@ def skill_forecast_linreg(cdf, params: dict, metadata_rows, metadata_columns):
         "type": "line", "x": time_col, "y": ["历史值", "预测值"],
         "title": f"{value_col} · HE 线性回归预测",
     }
+    # 多维度(多产品/多大区)→ 按维度拆图,每组各一张趋势图(避免挤一张没法看)
+    if group_col and group_col in out_df.columns and out_df[group_col].nunique() > 1:
+        chart_hint["split_by"] = group_col
     return str(sheet_name)[:31], out_df.reset_index(drop=True), chart_hint
 
 
@@ -591,6 +646,7 @@ def skill_yoy_mom(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in (time_col, value_col):
         if c not in full.columns:
             raise ValueError(f"yoy_mom: 列「{c}」不存在")
@@ -650,6 +706,7 @@ def skill_budget_variance(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in (budget_col, actual_col):
         if c not in full.columns:
             raise ValueError(f"budget_variance: 列「{c}」不存在")
@@ -701,6 +758,7 @@ def skill_rfm_segment(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in (cust, r_col, f_col, m_col):
         if c not in full.columns:
             raise ValueError(f"rfm_segment: 列「{c}」不存在")
@@ -766,6 +824,7 @@ def skill_ar_aging(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in (amount_col, age_col):
         if c not in full.columns:
             raise ValueError(f"ar_aging: 列「{c}」不存在")
@@ -820,6 +879,7 @@ def skill_pareto_abc(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in (label_col, value_col):
         if c not in full.columns:
             raise ValueError(f"pareto_abc: 列「{c}」不存在")
@@ -864,6 +924,7 @@ def skill_pivot_summary(cdf, params, metadata_rows, metadata_columns):
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)  # 按 params['filter'] 只看指定实体(产品/大区/客户…)
     for c in [row_col, value_col] + ([col_col] if col_col else []):
         if c not in full.columns:
             raise ValueError(f"pivot_summary: 列「{c}」不存在")
@@ -893,81 +954,81 @@ SKILLS: dict[str, dict[str, Any]] = {
         "tool": "pandaseal",
         "fn": skill_ratio_by_group,
         "desc": "按维度分组算每组 sum(num)/sum(den) 比率(基数加权 · 回款率/完成率/库存周转)",
-        "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "sheet_name"],
+        "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "filter", "sheet_name"],
     },
     "row_ratio_then_group_mean": {
         "tool": "pandaseal",
         "fn": skill_row_ratio_then_group_mean,
         "desc": "先算每行 num/den 行级率,再按维度取均值(等权平均率)",
-        "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "sheet_name"],
+        "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "filter", "sheet_name"],
     },
     "top_n_by": {
         "tool": "pandaseal",
         "fn": skill_top_n_by,
         "desc": "按值取 TOP / BOTTOM N(ascending=true 为 BOTTOM)· 带身份列",
-        "params": ["value_col", "n", "ascending", "sheet_name"],
+        "params": ["value_col", "n", "ascending", "filter", "sheet_name"],
     },
     "group_stats": {
         "tool": "pandaseal",
         "fn": skill_group_stats,
         "desc": "按维度分组,对多个数字列算多个聚合(mean/max/min/count/sum/std)",
-        "params": ["group_col", "value_cols", "aggs", "sheet_name"],
+        "params": ["group_col", "value_cols", "aggs", "filter", "sheet_name"],
     },
     "describe": {
         "tool": "pandaseal",
         "fn": skill_describe,
         "desc": "整体描述统计 count/mean/std/min/max",
-        "params": ["value_cols", "sheet_name"],
+        "params": ["value_cols", "filter", "sheet_name"],
     },
     "row_detail": {
         "tool": "pandaseal",
         "fn": skill_row_detail,
         "desc": "逐行明细 + 可选派生比率列 · 适合「展示每位员工目标完成率」",
-        "params": ["value_cols", "compute", "sort_by", "ascending", "n", "sheet_name"],
+        "params": ["value_cols", "compute", "sort_by", "ascending", "n", "filter", "sheet_name"],
     },
     "forecast_linreg": {
         "tool": "pandaseal+henumpy+helearn",
         "fn": skill_forecast_linreg,
         "desc": "时间序列预测 · pandas 清洗 → henumpy 加密数组 → helearn HE 线性回归 fit+predict",
         "params": ["value_col", "time_col", "group_col", "n_periods", "agg",
-                   "iterations", "learning_rate", "sheet_name"],
+                   "iterations", "learning_rate", "filter", "sheet_name"],
     },
     # ---- 业务分析(第一梯队) ----
     "yoy_mom": {
         "tool": "pandaseal",
         "fn": skill_yoy_mom,
         "desc": "同比(YoY)/ 环比(MoM)增长分析 · 月度/年度增长额 + 增长率",
-        "params": ["time_col", "value_col", "group_col", "mode", "agg", "sheet_name"],
+        "params": ["time_col", "value_col", "group_col", "mode", "agg", "filter", "sheet_name"],
     },
     "budget_variance": {
         "tool": "pandaseal",
         "fn": skill_budget_variance,
         "desc": "预算 vs 实际差异分析 · 差异额 + 差异率 + 超支/节约评价",
-        "params": ["budget_col", "actual_col", "group_col", "favorable", "sheet_name"],
+        "params": ["budget_col", "actual_col", "group_col", "favorable", "filter", "sheet_name"],
     },
     "rfm_segment": {
         "tool": "pandaseal",
         "fn": skill_rfm_segment,
         "desc": "RFM 客户分群 · 最近/频次/金额五分位打分 → 重要价值/挽留/流失等分群",
-        "params": ["customer_col", "recency_col", "frequency_col", "monetary_col", "sheet_name"],
+        "params": ["customer_col", "recency_col", "frequency_col", "monetary_col", "filter", "sheet_name"],
     },
     "ar_aging": {
         "tool": "pandaseal",
         "fn": skill_ar_aging,
         "desc": "应收账款账龄分析 · 按逾期天数分桶(0-30/30-60/...)+ 逾期占比",
-        "params": ["amount_col", "age_col", "group_col", "bins", "sheet_name"],
+        "params": ["amount_col", "age_col", "group_col", "bins", "filter", "sheet_name"],
     },
     "pareto_abc": {
         "tool": "pandaseal",
         "fn": skill_pareto_abc,
         "desc": "帕累托(80/20)/ ABC 分类 · 按金额降序累计占比分 A/B/C 三类",
-        "params": ["label_col", "value_col", "a_cut", "b_cut", "sheet_name"],
+        "params": ["label_col", "value_col", "a_cut", "b_cut", "filter", "sheet_name"],
     },
     "pivot_summary": {
         "tool": "pandaseal",
         "fn": skill_pivot_summary,
         "desc": "多维交叉透视(行维 × 列维 → 聚合)· 如 大区×产品线 销售额",
-        "params": ["row_col", "col_col", "value_col", "agg", "sheet_name"],
+        "params": ["row_col", "col_col", "value_col", "agg", "filter", "sheet_name"],
     },
 }
 

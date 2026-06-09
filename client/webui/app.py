@@ -73,7 +73,7 @@ _session_state: dict[str, Any] = {"host_url": "", "username": "", "token": "", "
 _cancelled_msgs: set[str] = set()
 _cancel_lock = threading.Lock()
 
-# 解密授权门(B6-1):
+# 解密授权门(Human-in-the-Loop / HITL):
 #   mid → "decrypt" / "keep_encrypted" / "cancel"
 #   pipeline 线程阻塞等待 _decrypt_events[mid].set()
 _decrypt_decisions: dict[str, str] = {}
@@ -929,7 +929,7 @@ def api_messages_cancel(sid: str, mid: str):
 
 @app.post("/api/sessions/{sid}/messages/{mid}/decrypt_decision")
 async def api_decrypt_decision(sid: str, mid: str, request: Request):
-    """B6-1 授权门:用户在浮卡上选了 decrypt / keep_encrypted。"""
+    """解密授权门:用户在浮卡上选了 decrypt / keep_encrypted。"""
     if not _is_logged_in():
         return _need_login()
     _sess_for_user(sid)
@@ -991,7 +991,7 @@ def _run_pipeline(
             return asst_mid in _cancelled_msgs
 
     def _prompt_decrypt() -> str:
-        """B6-1 授权门 · 阻塞等用户在浮卡上点选择(最长 5 分钟)。"""
+        """解密授权门 · 阻塞等用户在浮卡上点选择(最长 5 分钟)。"""
         evt = threading.Event()
         with _decrypt_lock:
             _decrypt_events[asst_mid] = evt
@@ -1422,7 +1422,7 @@ def api_task_decrypt(task_id: str):
 
 @app.post("/api/scheduled_tasks/pending/{pid}/approve")
 def api_pending_approve(pid: str):
-    """批准一个待批运行 → 注入会话并跑(此时人在场,走正常 B6-1 卡)。"""
+    """批准一个待批运行 → 注入会话并跑(此时人在场,走正常解密授权卡)。"""
     if not _is_logged_in():
         return _need_login()
     p = _pending_store.get(pid)

@@ -53,7 +53,7 @@ pytest -m security
 | B3 Skill 工作流 | `tests/test_workflow.py` | 场景 1/2 端到端、过滤重试、授权拒绝 |
 | B4 工具集 | `tests/test_tools.py` | 五个工具的加解密 + 计算正确性 |
 | B5 Excel 输出 | `tests/test_excel.py` | 文件命名、不覆盖、多 sheet、路径白名单 |
-| B6-1 解密授权 | `tests/test_permissions.py` | AutoApprove / Deny / Session(只问一次) |
+| 解密授权(HITL) | `tests/test_permissions.py` | AutoApprove / Deny / Session(只问一次) |
 | B6-2 路径白名单 | `tests/test_permissions.py` + `test_excel.py` | 接受 ~/Downloads 内、拒绝外部路径 |
 | B6-3 summary 过滤 | `tests/test_permissions.py` | 12 类明文模式覆盖 |
 | C1 computation_plan | `tests/test_contract.py` | 6 个场景的字段约束 |

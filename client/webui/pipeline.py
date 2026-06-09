@@ -391,7 +391,7 @@ def _run_codegen_path(
     cancelled / keep_encrypted 是终态,直接返回(不回退)。
 
     output_mode:
-      "interactive"        —— 正常:算完弹 B6-1,解密/保留密文/取消
+      "interactive"        —— 正常:算完弹解密授权(HITL),解密/保留密文/取消
       "encrypted_sandbox"  —— 定时密态:自动允许计算,结果**加密暂存沙盒**,
                               不写明文 Excel,返回 encrypted_run(供批量解密)
     """
@@ -438,7 +438,7 @@ def _run_codegen_path(
         log("error", f"密文加载失败:{e} · 回退固化 skill")
         return None
 
-    # 5) 受限执行(decrypt 首次触发 B6-1)
+    # 5) 受限执行(decrypt 首次触发解密授权)
     log("call", "受限执行生成代码 · 密态计算")
     try:
         results = codegen_mod.run_generated_code(
@@ -460,6 +460,20 @@ def _run_codegen_path(
             "status": "done",
             "summary": "已按要求保留密文展示 · 数值列保持同态密文形式。若要明文结果请重新提问并选择「解密展示」。",
             "excel_path": str(excel_path), "skill_calls": ["codegen"], "error": "",
+        }
+    except codegen_mod.DecryptionFailed as e:
+        # 解密失败是终态:密钥/密文不匹配、维度不符、密文损坏等。
+        # 固化 skill 用同一套密钥/密文,回退只会再失败一次且掩盖真因 ——
+        # 直接把原因报给用户,不回退。
+        log("error", f"解密失败:{e} · 已停止(不回退固化 skill)")
+        return {
+            "status": "failed",
+            "error": (
+                f"解密失败:{e}。计算已在密态完成,但结果解密这一步出错。"
+                "可重试一次;若反复出现,可能是密钥与该密文不是同一套 —— "
+                "到「同态密钥」tab 重新拉取证书,或重新上传数据后再试。"
+            ),
+            "summary": "", "excel_path": "", "skill_calls": ["codegen"],
         }
     except Exception as e:
         log("error", f"代码执行失败:{e} · 回退固化 skill")
@@ -618,6 +632,17 @@ def ask(
         return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
     except PermissionError:
         return {"status": "failed", "error": "登录已过期 · 请重新登录", "summary": ""}
+    except codegen_mod.DecryptionFailed as e:
+        # 防御:解密失败是终态,绝不回退固化 skill
+        log("error", f"解密失败:{e} · 已停止(不回退固化 skill)")
+        return {
+            "status": "failed",
+            "error": (
+                f"解密失败:{e}。通常是密钥/密文不匹配或密文损坏 —— "
+                "请确认本机密钥与该密文是同一套后重试。"
+            ),
+            "summary": "", "excel_path": "", "skill_calls": ["codegen"],
+        }
     except Exception as e:
         log("error", f"代码生成路径异常:{e} · 回退固化 skill")
         cg = None
@@ -732,7 +757,7 @@ def ask(
                 "summary": summary_raw,
             }
 
-    # 定时密态模式(固化兜底也支持):结果加密暂存,不弹 B6-1
+    # 定时密态模式(固化兜底也支持):结果加密暂存,不弹解密授权
     if output_mode == "encrypted_sandbox":
         from client.webui import sched_results
         log("call", "结果加密暂存(不解密)· 待批量解密")
@@ -749,7 +774,7 @@ def ask(
         }
 
     # ──────────────────────────────────────────────
-    # B6-1 解密展示授权:计算已在密态完成,问用户结果是否解密展示
+    # 解密授权(Human-in-the-Loop):计算已在密态完成,问用户结果是否解密展示
     # 选项:decrypt(解密后写 Excel)/ keep_encrypted(导出密文文件)/ cancel
     # ──────────────────────────────────────────────
     decision = "decrypt"

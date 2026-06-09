@@ -8,7 +8,7 @@
   ④ run_generated_code     —— 受限 exec:
         - 只暴露 ps / ct / hp / hl / pd / np + cdf + metadata + results
         - 自定义 __import__,把 crypto_toolkit 换成"解密门控代理"
-        - 首次 ct.decrypt* → 触发 B6-1 授权(prompt_decrypt)
+        - 首次 ct.decrypt* → 触发解密授权(prompt_decrypt)
         - 代码把结果写进 results = [{sheet_name, df, chart}]
 
 安全模型:同进程受限 exec。威胁是"LLM 写错/越界代码",不是恶意用户
@@ -27,11 +27,19 @@ from typing import Any, Callable, Optional
 # ---------------------------------------------------------------------------
 
 class CodegenCancelled(Exception):
-    """用户在 B6-1 授权门点了取消 / 停止。"""
+    """用户在解密授权门点了取消 / 停止。"""
 
 
 class KeepEncrypted(Exception):
-    """用户在 B6-1 授权门选了「保留密文」—— 不解密,导出源密文。"""
+    """用户在解密授权门选了「保留密文」—— 不解密,导出源密文。"""
+
+
+class DecryptionFailed(Exception):
+    """
+    用户已授权解密,但真实 ct.decrypt* 报错(密钥/密文不匹配、维度不符、
+    密文损坏等)。这是**终态错误**,不是「代码写错了」—— 不应回退固化 skill
+    (固化路径用同一套密钥/密文,只会再失败一次),应直接把原因报给用户。
+    """
 
 
 class UnsafeCode(Exception):
@@ -55,18 +63,96 @@ hp.initDict() / ct.initSK()(已初始化):
   - ps  = pandaseal   ct = crypto_toolkit   hp = henumpy   hl = helearn
   - pd  = pandas      np = numpy
 
+  ct 加解密**只有这 4 个方法**(别臆造 encrypt_ndarray / decrypt_array 之类):
+    · ct.encrypt(x)      —— 加密数值 / list / numpy 数组(ndarray 直接传)
+    · ct.encrypt_df(df)  —— 加密 pandas DataFrame
+    · ct.decrypt(c)      —— 解密 ct.encrypt 出来的数值密文 → ndarray
+    · ct.decrypt_df(c)   —— 解密 CipherDataFrame / CipherSeries → 明文 DataFrame
+
+═══════════ 第 0 步:意图补全(先想清楚"要呈现什么",再写代码) ═══════════
+用户的话经常只说"算什么",省略"怎么呈现"。你必须先从【问题 + schema】推断**完整意图**,
+默认补齐下面这些(除非用户已明确指定别的):
+  · 排序     —— 凡涉及排名 / 达成 / 比率 / 金额对比 → 按关键指标 sort_values(降序),
+                并加一列「排名」= range(1, n+1)。
+  · 配图     —— 凡有可对比维度 → 必配 chart。趋势/预测→line;构成/对比→bar;占比→bar。
+  · 图表可看性(站在"人看 Excel"的角度想)——一张图塞太多类别就没法看:
+      ① 类别 > ~20 个(如 100 个人)→ 别挤一张图,chart 加 `split_by="<上一层维度>"`
+         (如按"销售大区"拆),渲染端会按该列每组各出一张图、都带完整标题+横纵轴;
+         表格也会先按该维度排序(先大区、组内再按指标降序)。
+      ② 用户点名**多个实体**(如 DR-400 和 SM-200 两个产品的预测)→ 结果含一列区分实体,
+         chart 用 `split_by="<实体列>"` → 每个实体各出一张图(两产品=两张趋势图)。
+      ③ 也可给 `charts:[多个 chart 规格]` 一张表配多张不同的图。
+      ④ 退一步:用 TOP-N 只画前 N,别无脑全画。
+  · 历史背景 —— 预测/趋势类**绝不能只给未来值**:把「历史实际 + 未来预测」放进同一张表,
+                历史值/预测值各一列(另一列留空 None),用折线连起来(有维度则多条线)。
+  · 派生指标 —— 只给原始值不够,按业务补:达成率 / 同比环比 / 占比 / 差额 / 人均 等。
+  · 档位标签 —— 给关键结果加一列**文字档位**(达成/未达成、超支/节约、A/B/C、正常/预警/异常、
+                重要价值/待挽留…),渲染端会自动按语义上色。
+
+═══════════ 场景 → 呈现配方(按数据领域套用) ═══════════
+  销售:完成率/回款率排名(降序+排名列+柱状+达成档位)、区域对比柱状、趋势预测(历史+预测折线)。
+  财务:预算vs实际(差额+差异率+超支/节约标签)、同比环比、杜邦/财务比率体系。
+  库存:周转天数、ABC 分类(A/B/C 文字档位)、呆滞标记、缺货预警。
+  HR  :人数构成与占比、绩效分级(优/良/中/差档位)、薪酬分布、人效对比。
+  客户:RFM 分群(分群文字档位)、留存曲线(折线)、LTV 排名、流失名单。
+  通用口诀:能排序就排序,能配图就配图,能加占比/合计就加,关键列给文字档位。
+
 ═══════════ 你的代码必须遵守 ═══════════
 1. 不要写 import 语句,不要写初始化(环境已就绪)。
-2. 把最终**已解密**的结果表写进 `results` 列表,每个元素:
-     {"sheet_name": "中文表名", "df": <pandas.DataFrame 明文>, "chart": {...}|None}
-   chart 可选,格式 {"type":"bar"|"line", "x":"列名", "y":"列名"|["列1","列2"], "title":"标题"}
-3. 解密用 ct.decrypt_df(cdf) / ct.decrypt(...);**首次解密会触发用户授权**,
-   是正常流程,直接调用即可。
-4. 身份列合并:解密后的 df 行序与 metadata_rows 一致,可
-     meta = pd.DataFrame(metadata_rows)[[c for c in metadata_columns]]
-     full = pd.concat([meta.reset_index(drop=True), decrypted.reset_index(drop=True)], axis=1)
-5. 派生指标用 pandas/numpy 算(如 回款率 = 回款金额 / 实际销售额)。
-6. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性。
+2. 把最终**已解密**的结果表写进 `results` 列表。每个元素是一个 dict,
+   除 sheet_name/df 外的键**全部可选,声明即美化**(渲染端统一做表头高亮/冻结/
+   自动筛选/隔行底色/百分比色阶/列宽自适应,你**不要**自己写样式):
+     {
+       "sheet_name": "中文表名",
+       "df": <pandas.DataFrame 明文>,
+       "chart": {"type":"bar"|"line", "x":"列名", "y":"列名"|["列1","列2"], "title":"标题",
+                 "split_by":"<可选·按此列每组拆一张图,治"100人挤一图">"},
+       "charts": [ {…}, {…} ],             # 可选:一张表配多张图
+
+       "tier_col": "<档位文字列名,如 达成情况 / ABC分类 / 客户分群>",  # 该列按语义上色
+       "total_row": True,                  # 末尾自动加「合计」行(金额求和/百分比取均值)
+       "note": "<表顶一行说明,如 实线为历史、后6期为预测>",
+       "number_formats": {"列名":"0.00%"}  # 仅在列名推断不准时才显式覆盖
+     }
+3. 解密**只认 ct.decrypt_df**:对 cdf / 任何 CipherDataFrame / CipherSeries
+   (cdf 的列、`cdf['a']+cdf['b']`、密态聚合等结果)一律 `ct.decrypt_df(...)` 取明文;
+   `ct.decrypt(...)` **仅**用于 `ct.encrypt(...)` 出来的数值数组——把 CipherSeries 喂给
+   `ct.decrypt` 会报 `Unable to decrypt data of CipherSeries type`。
+   **最稳写法:开头就 `df = ct.decrypt_df(cdf)`,之后全程用 pandas/numpy 处理。**
+   首次解密会触发用户授权,是正常流程,直接调用即可。
+4. 身份列已自动拼好:`df = ct.decrypt_df(cdf)` 返回的就是**完整明文表**——
+   身份列(姓名/大区/月份/物料名…)在前,数值列在后,可直接
+   `df.groupby("销售大区")` / `df["销售月份"]`,**不要再手动 merge metadata_rows**
+   (会重复列)。metadata_rows / metadata_columns 仅在你需要单独取身份列时备用。
+5. 派生指标用 pandas/numpy 算(如 回款率 = 回款金额 / 实际销售额);比率列保留小数(渲染端转百分比)。
+6. 列名严格用 schema 里的字段名(含括号单位);字段缺失就在 summary 说明缺什么,别硬编造数。
+7. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性。
+8. **数值稳健(避免崩溃)**:任何拟合 / 回归 / 相关性 / 分位数前,先清洗——
+   `s = s[np.isfinite(s)]` 去掉 NaN/inf;除法防 0(分母 `.replace(0, np.nan)` 或先判);
+   `np.polyfit`/`lstsq`/`corr` 的输入**绝不能含 NaN**(否则报 "SVD did not converge")。
+   样本不足(<3 点)或数据为常数(`np.ptp(x)==0`)时跳过拟合、只给已有结果并在 summary 说明。
+
+═══════════ 趋势 / 预测 稳健写法(照抄此骨架,别自由发挥) ═══════════
+预测要"历史实际 + 未来预测"放同一张表 + 折线。用下面这套**防弹**写法
+(明文最小二乘,已清洗 NaN、守卫退化;字段名按 schema 替换):
+
+  full = ct.decrypt_df(cdf)                                   # 完整表(身份列已拼)
+  ts = full.groupby("<时间列>")["<数值列>"].sum().sort_index() # 历史时间序列
+  hist = ts.values.astype(float)
+  mask = np.isfinite(hist); ts = ts[mask]; hist = hist[mask]  # 去 NaN/inf —— 关键!
+  n = len(hist)
+  rows = [{"<时间列>": str(m), "历史值": float(v), "预测值": None, "类型":"历史"} for m, v in ts.items()]
+  if n >= 3 and np.ptp(hist) > 0:                             # 够点且非常数才预测
+      x = np.arange(n, dtype=float); k, b = np.polyfit(x, hist, 1)
+      last = str(ts.index[-1])
+      for i in range(1, 7):                                   # 未来 6 期(按需改)
+          rows.append({"<时间列>": f"{last}+{i}", "历史值": None,
+                       "预测值": float(k*(n-1+i)+b), "类型":"预测"})
+  out = pd.DataFrame(rows)
+  results = [{"sheet_name":"<x>预测", "df": out, "note":"前为历史、后为预测",
+              "chart":{"type":"line","x":"<时间列>","y":["历史值","预测值"],"title":"趋势:历史+预测"}}]
+  # 多个实体(如 DR-400 + SM-200 两个产品):对每个实体重复上面、给 out 加一列"<实体列>",
+  # 然后 chart 加 "split_by":"<实体列>" → 每个产品各出一张趋势图(而不是挤在一张)。
 
 ═══════════ 输出格式 ═══════════
 先写一段 ```python ... ``` 代码块(只一段,自包含),
@@ -143,11 +229,17 @@ def extract_code(text: str) -> tuple[str, str]:
 # ③ AST 安全扫描
 # ---------------------------------------------------------------------------
 
-# 允许 import 的模块(以及别名)
+# 允许 import 的模块(以及别名)。
+# 原则:只放**纯计算 / 无副作用**的库与 stdlib(无文件/网络/进程/exec 能力);
+# 危险模块(os/sys/subprocess/socket/shutil/pathlib/io/importlib/pickle…)永不入列。
 _ALLOWED_IMPORTS = {
+    # HE 工具链 + 数据分析
     "henumpy", "pandaseal", "crypto_toolkit", "helearn", "hetorch",
-    "pandas", "numpy", "math", "datetime", "re", "json",
-    "statistics", "collections", "itertools", "functools",
+    "pandas", "numpy",
+    # 安全 stdlib(纯计算 / 时间 / 文本 / 容器算法)
+    "math", "datetime", "time", "calendar", "re", "json",
+    "statistics", "decimal", "fractions", "random", "string",
+    "collections", "itertools", "functools", "operator", "bisect", "heapq",
 }
 
 # 禁止调用的内建名
@@ -198,21 +290,115 @@ def ast_safety_check(code: str) -> None:
 # ④ 受限执行
 # ---------------------------------------------------------------------------
 
-# crypto_toolkit 解密门控代理 —— 首次 decrypt 触发 B6-1
+def _attach_identity(plain_df, cipher_arg, original_cdf, meta_df):
+    """
+    整表解密时,把身份列(姓名/大区/月份等明文)拼回明文 DataFrame 前面。
+
+    `ct.decrypt_df(cdf)` 只还原加密的数值列;身份列在加密时被剥离存进 metadata。
+    解密整表(cipher_arg 就是原始 cdf)时自动拼回,使 `df = ct.decrypt_df(cdf)`
+    直接得到"身份列 + 数值列"的完整表,LLM 可直接 groupby("销售月份") 而不必手动 merge。
+    只对原始整表生效;子表 / 单列解密不动。行数不匹配或无新增列则原样返回。
+    """
+    if meta_df is None or original_cdf is None or plain_df is None:
+        return plain_df
+    if cipher_arg is not original_cdf:
+        return plain_df
+    try:
+        import pandas as pd
+        if not hasattr(plain_df, "columns") or len(meta_df) != len(plain_df):
+            return plain_df
+        add = [c for c in meta_df.columns if c not in plain_df.columns]
+        if not add:
+            return plain_df
+        return pd.concat(
+            [meta_df[add].reset_index(drop=True), plain_df.reset_index(drop=True)],
+            axis=1,
+        )
+    except Exception:
+        return plain_df
+
+
+def _gated_decrypt(real_ct, name, args, kwargs, original_cdf=None, meta_df=None):
+    """
+    调真实解密 + 对 pandaseal 类型自动纠偏 + 整表解密自动拼回身份列。
+
+    LLM 常误用 `ct.decrypt(CipherSeries)` / `ct.decrypt(CipherDataFrame)` ——
+    但 `ct.decrypt` 只接受 `ct.encrypt(...)` 出来的数值密文数组,喂 pandaseal
+    类型会抛 "Unable to decrypt data of CipherSeries type"。这里把 pandaseal
+    类型转成正确入参再解密,等价于"用户本意是解密这一列/这张表"。
+    正确映射(已用真实密文验证):
+      ct.decrypt(CipherSeries)      → ct.decrypt(cs.to_cipherarray())      → ndarray
+      ct.decrypt(CipherDataFrame)   → ct.decrypt_df(cdf)                   → DataFrame(+身份列)
+      ct.decrypt_df(CipherSeries)   → ct.decrypt_df(cs.to_cipherdataframe())→ DataFrame
+      ct.decrypt_df(cdf)            → DataFrame + 自动拼回身份列
+    """
+    fn = getattr(real_ct, name)
+    if args:
+        first, rest = args[0], args[1:]
+        tname = type(first).__name__
+        if name == "decrypt":
+            if tname == "CipherSeries" and hasattr(first, "to_cipherarray"):
+                return fn(first.to_cipherarray(), *rest, **kwargs)
+            if tname == "CipherDataFrame" and hasattr(real_ct, "decrypt_df"):
+                return _attach_identity(real_ct.decrypt_df(first), first, original_cdf, meta_df)
+        elif name == "decrypt_df":
+            if tname == "CipherSeries" and hasattr(first, "to_cipherdataframe"):
+                return real_ct.decrypt_df(first.to_cipherdataframe())
+            return _attach_identity(fn(*args, **kwargs), first, original_cdf, meta_df)
+    return fn(*args, **kwargs)
+
+
+# LLM 常臆造的 ct 方法名 → 真实方法。真实 API 只有:
+#   加密:ct.encrypt(数值/list/ndarray) · ct.encrypt_df(DataFrame)
+#   解密:ct.decrypt(数值密文数组) · ct.decrypt_df(CipherDataFrame/CipherSeries)
+# 不存在 encrypt_ndarray / encrypt_array / decrypt_ndarray 这些。
+_CT_ALIASES = {
+    "encrypt_ndarray": "encrypt", "encrypt_array": "encrypt",
+    "encrypt_numpy": "encrypt", "encrypt_np": "encrypt", "encrypt_arr": "encrypt",
+    "encrypt_list": "encrypt", "encrypt_vector": "encrypt", "encrypt_value": "encrypt",
+    "decrypt_ndarray": "decrypt", "decrypt_array": "decrypt",
+    "decrypt_numpy": "decrypt", "decrypt_np": "decrypt", "decrypt_arr": "decrypt",
+    "decrypt_list": "decrypt", "decrypt_vector": "decrypt", "decrypt_value": "decrypt",
+    "encrypt_dataframe": "encrypt_df", "decrypt_dataframe": "decrypt_df",
+    "encrypt_series": "encrypt_df", "decrypt_series": "decrypt_df",
+}
+
+_GATED_DECRYPT_NAMES = ("decrypt", "decrypt_df", "decrypt_ndarray", "decrypt_csv")
+
+
+# crypto_toolkit 解密门控代理 —— 首次 decrypt 触发解密授权
 class _CtGate:
-    def __init__(self, real_ct, on_first_decrypt: Callable[[], None]):
+    def __init__(self, real_ct, on_first_decrypt: Callable[[], None],
+                 original_cdf=None, meta_df=None):
         object.__setattr__(self, "_ct", real_ct)
         object.__setattr__(self, "_on_first", on_first_decrypt)
         object.__setattr__(self, "_authorized", False)
+        # 整表解密时自动拼回身份列用
+        object.__setattr__(self, "_orig_cdf", original_cdf)
+        object.__setattr__(self, "_meta_df", meta_df)
 
     def __getattr__(self, name):
-        attr = getattr(object.__getattribute__(self, "_ct"), name)
-        if name in ("decrypt", "decrypt_df", "decrypt_ndarray", "decrypt_csv"):
+        real_ct = object.__getattribute__(self, "_ct")
+        orig_cdf = object.__getattribute__(self, "_orig_cdf")
+        meta_df = object.__getattribute__(self, "_meta_df")
+        # 方法名纠偏:LLM 臆造 encrypt_ndarray / decrypt_array 等不存在的名字时,
+        # 映射到真实 API(ct.encrypt 本就吃 ndarray)。仍找不到才真 AttributeError。
+        canonical = name if hasattr(real_ct, name) else _CT_ALIASES.get(name, name)
+        attr = getattr(real_ct, canonical)
+        if canonical in _GATED_DECRYPT_NAMES:
             def wrapped(*a, **k):
                 if not object.__getattribute__(self, "_authorized"):
-                    object.__getattribute__(self, "_on_first")()  # 可能 raise
+                    object.__getattribute__(self, "_on_first")()  # 可能 raise(取消/保留密文)
                     object.__setattr__(self, "_authorized", True)
-                return attr(*a, **k)
+                # 已授权解密 —— 真实解密若报错,是「解密失败」终态,
+                # 包成 DecryptionFailed,避免上层误判为代码 bug 去回退固化 skill
+                try:
+                    return _gated_decrypt(real_ct, canonical, a, k,
+                                          original_cdf=orig_cdf, meta_df=meta_df)
+                except (CodegenCancelled, KeepEncrypted):
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    raise DecryptionFailed(f"{type(e).__name__}: {e}") from e
             return wrapped
         return attr
 
@@ -249,7 +435,7 @@ def run_generated_code(
 ) -> list[dict]:
     """
     受限 exec 生成代码,返回 results 列表 [{sheet_name, df, chart}]。
-    decrypt 首次调用触发 B6-1。
+    decrypt 首次调用触发解密授权。
     """
     import numpy as np
     import pandas as pd
@@ -264,7 +450,7 @@ def run_generated_code(
     except Exception:
         hl = None
 
-    # B6-1 门控回调
+    # 解密授权门控回调
     def _on_first_decrypt():
         if should_cancel and should_cancel():
             raise CodegenCancelled("用户已停止")
@@ -277,7 +463,18 @@ def run_generated_code(
             raise KeepEncrypted("用户选择保留密文")
         # decrypt → 放行
 
-    ct_gate = _CtGate(ct, _on_first_decrypt)
+    # 身份列(明文)→ DataFrame,供整表解密时自动拼回
+    meta_df = None
+    try:
+        if metadata_rows and metadata_columns:
+            _mdf = pd.DataFrame(metadata_rows)
+            _keep = [c for c in metadata_columns if c in _mdf.columns]
+            if _keep:
+                meta_df = _mdf[_keep]
+    except Exception:
+        meta_df = None
+
+    ct_gate = _CtGate(ct, _on_first_decrypt, original_cdf=cdf, meta_df=meta_df)
 
     # 自定义 import:只放白名单,crypto_toolkit 换成门控代理
     real_modules = {
