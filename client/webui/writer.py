@@ -216,6 +216,71 @@ def write_skill_results(
     return dst
 
 
+def export_cipher_as_is(
+    cipher_path: Path,
+    metadata_rows: list[dict],
+    metadata_columns: list[str],
+    stem: Optional[str] = None,
+) -> Path:
+    """
+    用户在解密前就选「保留密文」(尚无计算结果)时的输出 —— 直接导出源密文:
+      - 数值列保持源 cipher(base64),身份列(姓名/大区/月份)明文可见
+      - 顶部一张「说明」sheet
+    """
+    import openpyxl
+    import pandas as pd
+    from openpyxl.styles import Alignment, Font, PatternFill
+    from openpyxl.utils import get_column_letter
+
+    dst = enforce_excel_path(make_excel_path(stem))
+    dst.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        cipher_df = pd.read_excel(cipher_path, index_col=0)
+    except Exception:
+        cipher_df = pd.read_excel(cipher_path)
+    cipher_df = cipher_df.reset_index(drop=True)
+    if metadata_rows and len(metadata_rows) == len(cipher_df):
+        meta_df = pd.DataFrame(metadata_rows)
+        keep = [c for c in (metadata_columns or list(meta_df.columns)) if c not in cipher_df.columns]
+        if keep:
+            cipher_df = pd.concat(
+                [meta_df[keep].reset_index(drop=True), cipher_df], axis=1
+            )
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+    notice = wb.create_sheet(title="说明")
+    notice["A1"] = "保留密文 · 未授权解密"
+    notice["A1"].font = Font(bold=True, size=13, color="9A3412")
+    notice["A1"].fill = PatternFill("solid", fgColor="FFEDD5")
+    for i, t in enumerate(
+        ["", "用户选择保留密文,未解密 · 数值列保持同态密文形式。",
+         "明文身份列(姓名 / 大区 / 月份 等)保留以便核对。",
+         f"源密文文件:{cipher_path.name}"], 2):
+        notice.cell(i, 1, t)
+    notice.column_dimensions["A"].width = 80
+
+    ws = wb.create_sheet(title="数据(密文保留)")
+    header_font = Font(bold=True, color="FFFFFF")
+    header_fill = PatternFill("solid", fgColor="2563EB")
+    headers = [str(c) for c in cipher_df.columns]
+    for ci, h in enumerate(headers, 1):
+        cell = ws.cell(1, ci, h)
+        cell.font = header_font
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+    for ri, row in enumerate(cipher_df.itertuples(index=False), 2):
+        for ci, val in enumerate(row, 1):
+            ws.cell(ri, ci, val)
+    for ci, h in enumerate(headers, 1):
+        ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
+    ws.freeze_panes = "A2"
+
+    wb.save(dst)
+    return dst
+
+
 def export_skill_results_encrypted(
     results: list[dict],
     cipher_path: Path,

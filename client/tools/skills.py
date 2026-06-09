@@ -563,6 +563,327 @@ def skill_forecast_linreg(cdf, params: dict, metadata_rows, metadata_columns):
     return str(sheet_name)[:31], out_df.reset_index(drop=True), chart_hint
 
 
+# ===========================================================================
+# 业务分析固化 skill(第一梯队 · 几乎通用)
+# ===========================================================================
+
+# ----- skill: 同比/环比分析 -------------------------------------------------
+
+def skill_yoy_mom(cdf, params, metadata_rows, metadata_columns):
+    """
+    同比(YoY)/ 环比(MoM)增长分析。
+    params:
+      time_col   : 时间列(YYYY-MM 月 / YYYY 年,meta 列)
+      value_col  : 数值列(encrypted)
+      group_col? : 可选维度,分组各自算
+      mode?      : "mom"(环比·上一期)/ "yoy"(同比·去年同期,月数据=12期前)/ "both"(默认)
+      agg?       : 同一时间多行时的聚合 "sum"(默认)/ "mean"
+    输出:time [group] 值 环比 环比率 同比 同比率
+    """
+    import pandas as pd
+    import numpy as np
+
+    time_col = params["time_col"]
+    value_col = params["value_col"]
+    group_col = params.get("group_col") or None
+    mode = (params.get("mode") or "both").lower()
+    agg = "mean" if (params.get("agg") or "sum").lower() == "mean" else "sum"
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in (time_col, value_col):
+        if c not in full.columns:
+            raise ValueError(f"yoy_mom: 列「{c}」不存在")
+
+    keys = [group_col, time_col] if group_col else [time_col]
+    ts = full.groupby(keys)[value_col].agg(agg).reset_index()
+
+    out_frames = []
+    groups = [None] if not group_col else sorted(ts[group_col].astype(str).unique())
+    for g in groups:
+        sub = ts if g is None else ts[ts[group_col].astype(str) == g]
+        sub = sub.sort_values(time_col).reset_index(drop=True)
+        sub = sub.rename(columns={value_col: "本期值"})
+        # 环比:上一期
+        sub["环比增长"] = sub["本期值"].diff()
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sub["环比率"] = sub["环比增长"] / sub["本期值"].shift(1)
+        # 同比:12 期前(月)/ 1 期前兜底
+        lag = 12 if len(sub) > 12 else max(1, len(sub) - 1)
+        sub["同比增长"] = sub["本期值"] - sub["本期值"].shift(lag)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            sub["同比率"] = sub["同比增长"] / sub["本期值"].shift(lag)
+        out_frames.append(sub)
+
+    res = pd.concat(out_frames, ignore_index=True)
+    # 按 mode 裁列
+    cols = ([group_col] if group_col else []) + [time_col, "本期值"]
+    if mode in ("mom", "both"):
+        cols += ["环比增长", "环比率"]
+    if mode in ("yoy", "both"):
+        cols += ["同比增长", "同比率"]
+    res = res[[c for c in cols if c in res.columns]]
+
+    sheet = params.get("sheet_name") or f"{value_col}_同比环比"
+    chart = {"type": "line", "x": time_col, "y": "本期值", "title": sheet}
+    return str(sheet)[:31], res, chart
+
+
+# ----- skill: 预算差异分析 --------------------------------------------------
+
+def skill_budget_variance(cdf, params, metadata_rows, metadata_columns):
+    """
+    预算 vs 实际 差异分析。
+    params:
+      budget_col, actual_col : 预算列 / 实际列(encrypted)
+      group_col?             : 可选分组维度(不给=逐行)
+      favorable?             : "higher"(实际越高越好,如收入·默认)/ "lower"(越低越好,如成本)
+    输出:[group] 预算 实际 差异 差异率 评价(超支/达标/节约)
+    """
+    import pandas as pd
+    import numpy as np
+
+    budget_col = params["budget_col"]
+    actual_col = params["actual_col"]
+    group_col = params.get("group_col") or None
+    favorable = (params.get("favorable") or "higher").lower()
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in (budget_col, actual_col):
+        if c not in full.columns:
+            raise ValueError(f"budget_variance: 列「{c}」不存在")
+
+    if group_col and group_col in full.columns:
+        g = full.groupby(group_col)[[budget_col, actual_col]].sum().reset_index()
+    else:
+        keep = [c for c in (metadata_columns or []) if c in full.columns]
+        g = full[keep + [budget_col, actual_col]].copy()
+
+    g["差异"] = g[actual_col].to_numpy() - g[budget_col].to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        g["差异率"] = np.divide(g["差异"].to_numpy(), g[budget_col].to_numpy())
+
+    def _eval(diff):
+        if favorable == "lower":
+            diff = -diff
+        if diff > 0:
+            return "超额达标" if favorable == "higher" else "节约"
+        if diff < 0:
+            return "未达标" if favorable == "higher" else "超支"
+        return "持平"
+    g["评价"] = g["差异"].apply(_eval)
+
+    sheet = params.get("sheet_name") or "预算差异分析"
+    xcol = group_col if (group_col and group_col in g.columns) else g.columns[0]
+    chart = {"type": "bar", "x": xcol, "y": [budget_col, actual_col], "title": sheet}
+    return str(sheet)[:31], g, chart
+
+
+# ----- skill: RFM 客户分群 --------------------------------------------------
+
+def skill_rfm_segment(cdf, params, metadata_rows, metadata_columns):
+    """
+    RFM 客户分群(Recency 最近 / Frequency 频次 / Monetary 金额)。
+    params:
+      customer_col : 客户标识(meta 列)
+      recency_col  : 最近一次距今天数(越小越好,encrypted)
+      frequency_col: 购买频次(越大越好)
+      monetary_col : 消费金额(越大越好)
+    输出:客户 R F M R得分 F得分 M得分 RFM 分群
+    """
+    import pandas as pd
+
+    cust = params["customer_col"]
+    r_col = params["recency_col"]
+    f_col = params["frequency_col"]
+    m_col = params["monetary_col"]
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in (cust, r_col, f_col, m_col):
+        if c not in full.columns:
+            raise ValueError(f"rfm_segment: 列「{c}」不存在")
+
+    df = full.groupby(cust).agg({r_col: "min", f_col: "sum", m_col: "sum"}).reset_index()
+
+    def _score(s, ascending):
+        # 五分位打分 1-5;recency 越小越好 → ascending=True 给高分要反转
+        try:
+            q = pd.qcut(s.rank(method="first"), 5, labels=[1, 2, 3, 4, 5])
+            sc = q.astype(int)
+        except Exception:
+            sc = pd.Series([3] * len(s), index=s.index)
+        return (6 - sc) if ascending else sc
+
+    df["R得分"] = _score(df[r_col], ascending=True)    # recency 小=好=高分
+    df["F得分"] = _score(df[f_col], ascending=False)
+    df["M得分"] = _score(df[m_col], ascending=False)
+    df["RFM"] = df["R得分"].astype(str) + df["F得分"].astype(str) + df["M得分"].astype(str)
+
+    def _seg(row):
+        r, f, m = row["R得分"], row["F得分"], row["M得分"]
+        if r >= 4 and f >= 4 and m >= 4:
+            return "重要价值客户"
+        if r >= 4 and (f >= 3 or m >= 3):
+            return "重要发展客户"
+        if r <= 2 and f >= 4 and m >= 4:
+            return "重要挽留客户"
+        if r <= 2 and f <= 2:
+            return "流失客户"
+        if r >= 3:
+            return "一般保持客户"
+        return "一般客户"
+    df["分群"] = df.apply(_seg, axis=1)
+
+    df = df.rename(columns={r_col: "最近(天)", f_col: "频次", m_col: "金额"})
+    df = df.sort_values(["M得分", "F得分"], ascending=False).reset_index(drop=True)
+
+    sheet = params.get("sheet_name") or "RFM客户分群"
+    chart = {"type": "bar", "x": cust, "y": "金额", "title": sheet}
+    return str(sheet)[:31], df, chart
+
+
+# ----- skill: 账龄分析 ------------------------------------------------------
+
+def skill_ar_aging(cdf, params, metadata_rows, metadata_columns):
+    """
+    应收账款账龄分析(按逾期天数分桶)。
+    params:
+      amount_col : 金额列(encrypted)
+      age_col    : 账龄/逾期天数列(encrypted)
+      group_col? : 可选维度(如客户/大区),不给=整体
+      bins?      : 分桶边界(默认 [0,30,60,90,180])
+    输出:[group] 各账龄桶金额 + 合计 + 逾期占比
+    """
+    import pandas as pd
+    import numpy as np
+
+    amount_col = params["amount_col"]
+    age_col = params["age_col"]
+    group_col = params.get("group_col") or None
+    bins = params.get("bins") or [0, 30, 60, 90, 180]
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in (amount_col, age_col):
+        if c not in full.columns:
+            raise ValueError(f"ar_aging: 列「{c}」不存在")
+
+    edges = list(bins) + [float("inf")]
+    labels = []
+    for i in range(len(edges) - 1):
+        lo, hi = edges[i], edges[i + 1]
+        labels.append(f"{int(lo)}-{int(hi)}天" if hi != float("inf") else f"{int(lo)}天以上")
+    full = full.copy()
+    full["_账龄桶"] = pd.cut(full[age_col], bins=edges, labels=labels, right=False, include_lowest=True)
+
+    grp_keys = [group_col] if (group_col and group_col in full.columns) else []
+    piv = full.pivot_table(index=grp_keys or None, columns="_账龄桶",
+                           values=amount_col, aggfunc="sum", observed=False).fillna(0)
+    if grp_keys:
+        piv = piv.reset_index()
+    else:
+        piv = piv.sum().to_frame().T
+    # 合计 + 逾期占比(第一个桶视作未逾期)
+    bucket_cols = [c for c in labels if c in piv.columns]
+    piv["合计"] = piv[bucket_cols].sum(axis=1)
+    overdue = [c for c in bucket_cols[1:]]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        piv["逾期占比"] = piv[overdue].sum(axis=1) / piv["合计"].replace(0, np.nan)
+    piv["逾期占比"] = piv["逾期占比"].fillna(0)
+
+    sheet = params.get("sheet_name") or "账龄分析"
+    xcol = grp_keys[0] if grp_keys else None
+    chart = ({"type": "bar", "x": xcol, "y": bucket_cols, "title": sheet} if xcol else None)
+    return str(sheet)[:31], piv.reset_index(drop=True), chart
+
+
+# ----- skill: 帕累托 / ABC 分析 ---------------------------------------------
+
+def skill_pareto_abc(cdf, params, metadata_rows, metadata_columns):
+    """
+    帕累托(80/20)/ ABC 分类。
+    params:
+      label_col : 分析对象(物料/客户/产品,meta 列)
+      value_col : 金额/销量(encrypted)
+      a_cut?    : A 类累计阈值(默认 0.80) b_cut?(默认 0.95)
+    输出:对象 值 占比 累计占比 ABC类
+    """
+    import pandas as pd
+    import numpy as np
+
+    label_col = params["label_col"]
+    value_col = params["value_col"]
+    a_cut = float(params.get("a_cut", 0.80))
+    b_cut = float(params.get("b_cut", 0.95))
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in (label_col, value_col):
+        if c not in full.columns:
+            raise ValueError(f"pareto_abc: 列「{c}」不存在")
+
+    g = full.groupby(label_col)[value_col].sum().reset_index()
+    g = g.sort_values(value_col, ascending=False).reset_index(drop=True)
+    total = g[value_col].sum() or 1.0
+    g["占比"] = g[value_col] / total
+    g["累计占比"] = g["占比"].cumsum()
+
+    def _abc(cum):
+        if cum <= a_cut:
+            return "A"
+        if cum <= b_cut:
+            return "B"
+        return "C"
+    g["ABC类"] = g["累计占比"].apply(_abc)
+
+    sheet = params.get("sheet_name") or "帕累托ABC分析"
+    chart = {"type": "bar", "x": label_col, "y": value_col, "title": sheet}
+    return str(sheet)[:31], g, chart
+
+
+# ----- skill: 多维交叉透视 --------------------------------------------------
+
+def skill_pivot_summary(cdf, params, metadata_rows, metadata_columns):
+    """
+    多维交叉透视表(行维 × 列维 → 聚合值)。
+    params:
+      row_col   : 行维度(meta 列,如 销售大区)
+      col_col?  : 列维度(meta 列,如 产品线;不给=单维汇总)
+      value_col : 数值列(encrypted)
+      agg?      : sum(默认)/ mean / count / max / min
+    输出:行维 × 列维 交叉表 + 行合计
+    """
+    import pandas as pd
+
+    row_col = params["row_col"]
+    col_col = params.get("col_col") or None
+    value_col = params["value_col"]
+    agg = (params.get("agg") or "sum").lower()
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    for c in [row_col, value_col] + ([col_col] if col_col else []):
+        if c not in full.columns:
+            raise ValueError(f"pivot_summary: 列「{c}」不存在")
+
+    piv = full.pivot_table(
+        index=row_col, columns=col_col, values=value_col,
+        aggfunc=agg, observed=False, fill_value=0,
+    )
+    piv = piv.reset_index()
+    # 行合计
+    num_cols = [c for c in piv.columns if c != row_col]
+    if col_col and num_cols:
+        piv["合计"] = piv[num_cols].sum(axis=1)
+
+    sheet = params.get("sheet_name") or f"{row_col}×{col_col or value_col}透视"
+    ycol = "合计" if "合计" in piv.columns else (num_cols[0] if num_cols else None)
+    chart = ({"type": "bar", "x": row_col, "y": ycol, "title": sheet} if ycol else None)
+    return str(sheet)[:31], piv, chart
+
+
 # ---------------------------------------------------------------------------
 # Skill 注册表 — LLM 必须从这里选
 # ---------------------------------------------------------------------------
@@ -610,6 +931,43 @@ SKILLS: dict[str, dict[str, Any]] = {
         "desc": "时间序列预测 · pandas 清洗 → henumpy 加密数组 → helearn HE 线性回归 fit+predict",
         "params": ["value_col", "time_col", "group_col", "n_periods", "agg",
                    "iterations", "learning_rate", "sheet_name"],
+    },
+    # ---- 业务分析(第一梯队) ----
+    "yoy_mom": {
+        "tool": "pandaseal",
+        "fn": skill_yoy_mom,
+        "desc": "同比(YoY)/ 环比(MoM)增长分析 · 月度/年度增长额 + 增长率",
+        "params": ["time_col", "value_col", "group_col", "mode", "agg", "sheet_name"],
+    },
+    "budget_variance": {
+        "tool": "pandaseal",
+        "fn": skill_budget_variance,
+        "desc": "预算 vs 实际差异分析 · 差异额 + 差异率 + 超支/节约评价",
+        "params": ["budget_col", "actual_col", "group_col", "favorable", "sheet_name"],
+    },
+    "rfm_segment": {
+        "tool": "pandaseal",
+        "fn": skill_rfm_segment,
+        "desc": "RFM 客户分群 · 最近/频次/金额五分位打分 → 重要价值/挽留/流失等分群",
+        "params": ["customer_col", "recency_col", "frequency_col", "monetary_col", "sheet_name"],
+    },
+    "ar_aging": {
+        "tool": "pandaseal",
+        "fn": skill_ar_aging,
+        "desc": "应收账款账龄分析 · 按逾期天数分桶(0-30/30-60/...)+ 逾期占比",
+        "params": ["amount_col", "age_col", "group_col", "bins", "sheet_name"],
+    },
+    "pareto_abc": {
+        "tool": "pandaseal",
+        "fn": skill_pareto_abc,
+        "desc": "帕累托(80/20)/ ABC 分类 · 按金额降序累计占比分 A/B/C 三类",
+        "params": ["label_col", "value_col", "a_cut", "b_cut", "sheet_name"],
+    },
+    "pivot_summary": {
+        "tool": "pandaseal",
+        "fn": skill_pivot_summary,
+        "desc": "多维交叉透视(行维 × 列维 → 聚合)· 如 大区×产品线 销售额",
+        "params": ["row_col", "col_col", "value_col", "agg", "sheet_name"],
     },
 }
 

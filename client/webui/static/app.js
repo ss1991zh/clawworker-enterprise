@@ -25,11 +25,16 @@ const state = {
   pendingCipher: null,   // {name, path, size, uploading?}
   pendingTexts: [],      // [{name, content, chars, uploading?}]
   files: [],
+  skills: { skill_md: [], builtin: [], custom: [] },
+  tasks: [], tasksPending: [], tasksHistory: [], tasksPendingCount: 0,
+  histFilter: { date: "" },
   // 运行状态:有 assistant 消息在跑时锁住发送按钮 / 变停止
   running: false,
   runningMid: null,
   // 已经播过打字机动画的 mid(防止重渲时再次动画)
   typedMids: new Set(),
+  // 正在轮询的 mid(防止 sync + selectSession 重复起 interval)
+  pollingMids: new Set(),
 };
 
 // ============ API helpers ============
@@ -72,19 +77,23 @@ function renderSessionList() {
     el.innerHTML = '<div class="session-empty">还没有会话<br>点击上方"新建会话"</div>';
     return;
   }
-  el.innerHTML = state.sessions.map(s => `
-    <div class="session ${s.id === state.currentSid ? "active" : ""}" data-id="${s.id}">
-      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-      </svg>
-      <span class="session__title">${esc(s.title)}</span>
+  const SESS_CLOCK_SVG = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`;
+  const SESS_CHAT_SVG = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>`;
+  el.innerHTML = state.sessions.map(s => {
+    const isSched = (s.title || "").startsWith("⏰");
+    const title = isSched ? s.title.replace(/^⏰\s*/, "") : s.title;
+    return `
+    <div class="session ${s.id === state.currentSid ? "active" : ""} ${isSched ? "sched" : ""}" data-id="${s.id}">
+      ${isSched ? SESS_CLOCK_SVG : SESS_CHAT_SVG}
+      <span class="session__title">${esc(title)}</span>
       <button class="session__del" data-del="${s.id}" title="删除会话">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
         </svg>
       </button>
     </div>
-  `).join("");
+  `;
+  }).join("");
   el.querySelectorAll(".session").forEach(node => {
     node.addEventListener("click", e => {
       if (e.target.closest("[data-del]")) return;
@@ -426,6 +435,8 @@ async function stopRunning() {
 //   ② 滚动位置(只有真新内容到底部时才滚)
 // 状态终结时(done/failed/needs_cipher)再一次性整体重渲。
 function pollMessage(sid, mid) {
+  if (state.pollingMids.has(mid)) return;   // 已在轮询,别重复起 interval
+  state.pollingMids.add(mid);
   const since = Date.now();
   let renderedSteps = 0;
   const intv = setInterval(async () => {
@@ -456,6 +467,7 @@ function pollMessage(sid, mid) {
           $("main").scrollTop = $("main").scrollHeight;
         }
         clearInterval(intv);
+        state.pollingMids.delete(mid);
         setRunning(false);
         loadSessions();
         return;
@@ -498,8 +510,45 @@ function pollMessage(sid, mid) {
       }
     } catch (e) {
       clearInterval(intv);
+      state.pollingMids.delete(mid);
     }
   }, 1200);
+}
+
+// ============ 当前会话后台同步 ============
+// 定时任务在服务端往会话加消息,前端不是发起方 → 无法感知。
+// 这里每 4s 拉一次当前会话,发现新消息 / 状态变化就接住并补轮询。
+async function syncCurrentSession() {
+  const sid = state.currentSid;
+  if (!sid || !state.currentSession) return;
+  // 本地有消息正在轮询 → 那条 pollMessage 自己驱动更新,sync 让路不打架
+  if (state.pollingMids.size) return;
+  let data;
+  try { data = await api("GET", `/api/sessions/${sid}/messages`); }
+  catch { return; }
+  const fresh = data.messages || [];
+  const cur = state.currentSession.messages || [];
+
+  const curIds = new Set(cur.map(m => m.id));
+  const newOnes = fresh.filter(m => !curIds.has(m.id));
+  // 状态变了的(如某条从 pending 变 running / done)
+  const curById = Object.fromEntries(cur.map(m => [m.id, m]));
+  const changed = fresh.some(m => curById[m.id] && curById[m.id].status !== m.status);
+
+  if (!newOnes.length && !changed) return;   // 无变化,不动
+
+  // 已完成的 assistant 标记为"无需打字机"(避免同步时重播旧消息),
+  // 但**新冒出来的**仍允许打字机(它们确实是新的)。
+  cur.forEach(m => { if (m.role === "assistant" && m.status === "done") state.typedMids.add(m.id); });
+
+  state.currentSession.messages = fresh;
+  renderChat();
+  // 给所有运行中的消息补轮询(pollMessage 自带去重)
+  fresh.forEach(m => {
+    if (m.role === "assistant" && (m.status === "pending" || m.status === "running" || m.status === "awaiting_decrypt")) {
+      pollMessage(sid, m.id);
+    }
+  });
 }
 
 // ============ 发送消息 ============
@@ -662,13 +711,15 @@ async function _attachTextFile(file) {
 function pickExistingCipher(path, name) {
   state.pendingCipher = { name: name || path.split("/").pop(), path, uploading: false };
   renderAttachChips();
-  closeModal();
+  closeFilesModal();
+  $("input")?.focus();
 }
 
 // ============ 设置 Modal ============
 const TABS = {
   general: { title: "连接 / 计算", render: renderGeneralTab },
-  files:   { title: "密文文件管理", render: renderFilesTab },
+  tasks:   { title: "定时任务", render: renderTasksTab },
+  skills:  { title: "Skill 管理", render: renderSkillsTab },
   keys:    { title: "同态密钥", render: renderKeysTab },
   account: { title: "账户", render: renderAccountTab },
 };
@@ -716,10 +767,619 @@ async function renderGeneralTab() {
   });
 }
 
-async function renderFilesTab() {
-  await loadFiles();
+// ============ 定时任务 Tab ============
+async function renderTasksTab() {
   $("modalBody").innerHTML = `
-    <h2>${TABS.files.title}</h2>
+    <h2>${TABS.tasks.title}</h2>
+    <p class="sub">到点自动触发 · 无密文任务在你登录时直接跑 · 带密文的分析进待批队列(你回来批准才解密)</p>
+    <div id="tasksAlert"></div>
+
+    <h3 style="font-size:14px; margin:18px 0 8px;">待批运行 <span id="pendBadge" class="badge no" style="display:none;">0</span></h3>
+    <div id="pendingList"></div>
+
+    <h3 style="font-size:14px; margin:22px 0 8px;">我的任务</h3>
+    <div id="taskList"></div>
+
+    <h3 style="font-size:14px; margin:22px 0 8px;">新建任务</h3>
+    <div class="skill-form">
+      <div class="form-grid">
+        <div class="field"><label>任务名</label><input type="text" id="tkName" placeholder="每日回款率日报"></div>
+        <div class="field"><label>周期</label>
+          <select id="tkKind">
+            <option value="daily">每天</option>
+            <option value="weekly">每周</option>
+            <option value="monthly">每月</option>
+            <option value="interval">间隔</option>
+            <option value="cron">自定义</option>
+          </select>
+        </div>
+      </div>
+      <div class="form-grid" id="tkTimeRow">
+        <div class="field" id="tkWeekdayWrap" style="display:none;"><label>星期</label>
+          <select id="tkWeekday">
+            <option value="0">周一</option><option value="1">周二</option><option value="2">周三</option>
+            <option value="3">周四</option><option value="4">周五</option><option value="5">周六</option><option value="6">周日</option>
+          </select>
+        </div>
+        <div class="field" id="tkMonthDayWrap" style="display:none;"><label>每月几号</label>
+          <input type="number" id="tkMonthDay" value="1" min="1" max="28">
+        </div>
+        <div class="field" id="tkClockWrap"><label>时间</label>
+          <input type="time" id="tkTime" value="09:00">
+        </div>
+        <div class="field" id="tkIntervalWrap" style="display:none;"><label>每隔(分钟)</label>
+          <input type="number" id="tkInterval" value="60" min="1">
+        </div>
+      </div>
+      <div class="field" id="tkCronWrap" style="display:none;">
+        <label>描述 <span class="hint-inline">如:每月1号、每周一三五9点、每天晚上8点</span></label>
+        <input type="text" id="tkCronNL" placeholder="每月1号9点">
+        <div class="cron-presets">
+          <button type="button" class="cron-chip" data-nl="每月1号9点">每月1号</button>
+          <button type="button" class="cron-chip" data-nl="工作日上午9点">工作日</button>
+          <button type="button" class="cron-chip" data-nl="每周一三五9点">周一三五</button>
+          <button type="button" class="cron-chip" data-nl="每天晚上8点">每天晚上8点</button>
+          <button type="button" class="cron-chip" data-nl="每2小时">每2小时</button>
+        </div>
+        <div id="cronResult" class="cron-result">识别结果会显示在这里</div>
+        <input type="hidden" id="tkCron" value="">
+      </div>
+      <div class="field"><label>数据源</label>
+        <select id="tkSource">
+          <option value="none">不绑定(自由问答 · 自动跑)</option>
+          <option value="folder">绑定文件夹(每次取最新 · 数据自动刷新)</option>
+        </select>
+      </div>
+      <div class="field" id="tkFolderWrap" style="display:none;">
+        <label>数据文件夹 <span class="hint-inline">到点取最新 CSV/XLSX 自动加密再分析</span></label>
+        <div class="folder-pick">
+          <input type="text" id="tkFolder" placeholder="点右侧选择,或粘贴绝对路径">
+          <button type="button" class="btn-ghost btn-sm" id="tkFolderBtn">选择文件夹</button>
+        </div>
+        <p class="hint">把每期新数据丢进这个文件夹,任务永远处理最新那份(密态计算 · 结果加密暂存待解密)</p>
+      </div>
+      <div class="field"><label>问题 / 指令</label>
+        <textarea id="tkQuestion" rows="2" placeholder="按大区统计每位代表的回款率,降序导 Excel"></textarea>
+      </div>
+      <button class="btn-primary" id="tkAdd">创建任务</button>
+    </div>
+
+    <details class="hist-details" style="margin-top:22px;">
+      <summary class="hist-summary">运行历史 <span id="histCount" class="badge ok"></span></summary>
+      <div class="hist-filter">
+        <label class="hint-inline" style="margin:0;">按日期</label>
+        <input type="date" id="histDate" class="hist-sel">
+        <button class="btn-ghost btn-sm" id="histClear">清除</button>
+      </div>
+      <div id="tkHistory"></div>
+    </details>
+  `;
+
+  // 周期切换显隐
+  const kindSel = $("tkKind");
+  function syncKind() {
+    const k = kindSel.value;
+    $("tkWeekdayWrap").style.display = k === "weekly" ? "" : "none";
+    $("tkMonthDayWrap").style.display = k === "monthly" ? "" : "none";
+    $("tkClockWrap").style.display = ["daily", "weekly", "monthly"].includes(k) ? "" : "none";
+    $("tkIntervalWrap").style.display = k === "interval" ? "" : "none";
+    $("tkCronWrap").style.display = k === "cron" ? "" : "none";
+    $("tkTimeRow").style.display = k === "cron" ? "none" : "";
+  }
+  kindSel.addEventListener("change", syncKind); syncKind();
+
+  // 自定义(大白话)→ cron:实时解析(防抖)
+  let cronTimer = null;
+  async function parseCronNL() {
+    const text = $("tkCronNL").value.trim();
+    const box = $("cronResult");
+    if (!text) { box.className = "cron-result"; box.textContent = "识别结果会显示在这里"; $("tkCron").value = ""; return; }
+    try {
+      const r = await api("POST", "/api/scheduled_tasks/parse_schedule", { text });
+      if (r.ok) {
+        box.className = "cron-result ok";
+        box.innerHTML = `✓ <strong>${esc(r.readable)}</strong> <span class="cron-code">${esc(r.cron)}</span>`;
+        $("tkCron").value = r.cron;
+      } else {
+        box.className = "cron-result bad";
+        box.textContent = r.error || "没识别出来";
+        $("tkCron").value = "";
+      }
+    } catch (e) {
+      box.className = "cron-result bad"; box.textContent = "解析失败:" + e.message; $("tkCron").value = "";
+    }
+  }
+  $("tkCronNL").addEventListener("input", () => {
+    clearTimeout(cronTimer); cronTimer = setTimeout(parseCronNL, 350);
+  });
+  $("tkCronWrap").querySelectorAll(".cron-chip").forEach(b => {
+    b.addEventListener("click", () => { $("tkCronNL").value = b.dataset.nl; parseCronNL(); });
+  });
+
+  // 数据源切换
+  const srcSel = $("tkSource");
+  function syncSource() {
+    $("tkFolderWrap").style.display = srcSel.value === "folder" ? "" : "none";
+  }
+  srcSel.addEventListener("change", syncSource); syncSource();
+
+  // 原生选择文件夹(macOS / Windows / Linux)
+  $("tkFolderBtn").addEventListener("click", async () => {
+    const btn = $("tkFolderBtn");
+    btn.disabled = true; btn.textContent = "选择中…";
+    try {
+      const r = await api("POST", "/api/pick_folder");
+      if (!r.cancelled && r.path) $("tkFolder").value = r.path;
+    } catch (e) {
+      $("tasksAlert").innerHTML = `<div class="alert-box">选择失败:${esc(e.message)} · 可手动粘贴路径</div>`;
+    } finally {
+      btn.disabled = false; btn.textContent = "选择文件夹";
+    }
+  });
+
+  await loadTasksData();
+  renderPendingList();
+  renderTaskList();
+  renderTaskHistory();
+
+  // 运行历史:按日期筛选(空 = 全部)
+  const histDate = $("histDate");
+  histDate.value = state.histFilter.date || "";
+  histDate.addEventListener("change", () => { state.histFilter.date = histDate.value; renderTaskHistory(); });
+  $("histClear").addEventListener("click", () => {
+    state.histFilter.date = ""; histDate.value = ""; renderTaskHistory();
+  });
+
+  $("tkAdd").addEventListener("click", async () => {
+    const name = $("tkName").value.trim();
+    const question = $("tkQuestion").value.trim();
+    if (!name || !question) { $("tasksAlert").innerHTML = '<div class="alert-box">任务名和问题都要填</div>'; return; }
+    const kind = $("tkKind").value;
+    const [hh, mm] = ($("tkTime").value || "09:00").split(":").map(x => parseInt(x, 10));
+    const src = $("tkSource").value;
+    if (src === "folder" && !$("tkFolder").value.trim()) {
+      $("tasksAlert").innerHTML = '<div class="alert-box">请填文件夹路径</div>'; return;
+    }
+    if (kind === "cron" && !$("tkCron").value.trim()) {
+      $("tasksAlert").innerHTML = '<div class="alert-box">请输入能识别的排程描述(如「每月1号」)</div>'; return;
+    }
+    const body = {
+      name, question, schedule_kind: kind,
+      source_folder: src === "folder" ? $("tkFolder").value.trim() : "",
+      at_hour: hh || 0, at_minute: mm || 0,
+      weekday: parseInt($("tkWeekday").value, 10) || 0,
+      day_of_month: parseInt($("tkMonthDay").value, 10) || 1,
+      interval_minutes: parseInt($("tkInterval").value, 10) || 60,
+      cron_expr: kind === "cron" ? $("tkCron").value.trim() : "",
+      cron_readable: kind === "cron" ? ($("cronResult").querySelector("strong")?.textContent || "") : "",
+    };
+    try {
+      await api("POST", "/api/scheduled_tasks", body);
+      $("tkName").value = ""; $("tkQuestion").value = ""; $("tkFolder").value = "";
+      if ($("tkCronNL")) { $("tkCronNL").value = ""; $("tkCron").value = ""; const cr=$("cronResult"); if(cr){cr.className="cron-result";cr.textContent="识别结果会显示在这里";} }
+      $("tasksAlert").innerHTML = '<div class="alert-box success">任务已创建</div>';
+      await loadTasksData(); renderTaskList();
+    } catch (e) {
+      $("tasksAlert").innerHTML = `<div class="alert-box">创建失败:${esc(e.message)}</div>`;
+    }
+  });
+}
+
+async function loadTasksData() {
+  try {
+    const r = await api("GET", "/api/scheduled_tasks");
+    state.tasks = r.tasks || [];
+    state.tasksPendingCount = r.pending_count || 0;
+  } catch { state.tasks = []; state.tasksPendingCount = 0; }
+  try { state.tasksPending = await api("GET", "/api/scheduled_tasks/pending"); }
+  catch { state.tasksPending = { runs: [], encrypted: [] }; }
+  try { state.tasksHistory = await api("GET", "/api/scheduled_tasks/history"); }
+  catch { state.tasksHistory = []; }
+}
+
+const WEEK_CN = ["周一","周二","周三","周四","周五","周六","周日"];
+function scheduleText(t) {
+  const hm = `${String(t.at_hour).padStart(2,"0")}:${String(t.at_minute).padStart(2,"0")}`;
+  if (t.schedule_kind === "cron") return t.cron_readable || `自定义 (${t.cron_expr})`;
+  if (t.schedule_kind === "interval") return `每 ${t.interval_minutes} 分钟`;
+  if (t.schedule_kind === "weekly") return `每${WEEK_CN[t.weekday]||"周一"} ${hm}`;
+  if (t.schedule_kind === "monthly") return `每月 ${t.day_of_month} 号 ${hm}`;
+  return `每天 ${hm}`;
+}
+
+function renderPendingList() {
+  const box = $("pendingList"); if (!box) return;
+  const data = state.tasksPending || { runs: [], encrypted: [] };
+  const runs = data.runs || [];
+  const enc = data.encrypted || [];
+  const total = runs.length + enc.length;
+  const badge = $("pendBadge");
+  if (badge) { badge.style.display = total ? "" : "none"; badge.textContent = total; }
+  if (!total) { box.innerHTML = '<div class="alert-box info">没有待批运行</div>'; return; }
+
+  let html = "";
+  // 密态任务聚合(1 任务 1 条,无论跑了几次)
+  enc.forEach(a => {
+    html += `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(a.task_name)} <span class="badge warn">密态 · ${a.count} 次待解密</span></div>
+        <div class="d">${esc((a.question||"").slice(0,80))}${(a.question||"").length>80?'…':''}</div>
+        <div class="d" style="font-size:11px;">最近:${esc((a.latest_run||"").slice(0,16).replace("T"," "))}</div>
+      </div>
+      <button class="btn-primary btn-sm" data-decrypt="${esc(a.task_id)}">解密 → 文件夹</button>
+    </div>`;
+  });
+  // 自由问答待跑
+  runs.forEach(p => {
+    html += `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(p.task_name)} <span class="badge ok">待运行</span></div>
+        <div class="d">${esc((p.question||"").slice(0,80))}${(p.question||"").length>80?'…':''}</div>
+      </div>
+      <button class="btn-primary btn-sm" data-approve="${esc(p.id)}">运行</button>
+      <button class="btn-ghost btn-sm" data-dismiss="${esc(p.id)}">忽略</button>
+    </div>`;
+  });
+  box.innerHTML = html;
+
+  box.querySelectorAll("[data-decrypt]").forEach(b => b.addEventListener("click", async () => {
+    b.disabled = true; b.textContent = "解密中…";
+    try {
+      const r = await api("POST", `/api/scheduled_tasks/decrypt/${b.dataset.decrypt}`);
+      $("tasksAlert").innerHTML = `<div class="alert-box success">✓ 已解密 ${r.count} 次运行 → 文件夹:<span class="mono">${esc(r.folder)}</span></div>`;
+      await loadTasksData(); renderPendingList(); renderTaskHistory(); refreshTasksBadge();
+    } catch (e) {
+      $("tasksAlert").innerHTML = `<div class="alert-box">解密失败:${esc(e.message)}</div>`;
+      b.disabled = false; b.textContent = "解密 → 文件夹";
+    }
+  }));
+  box.querySelectorAll("[data-approve]").forEach(b => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", `/api/scheduled_tasks/pending/${b.dataset.approve}/approve`);
+      closeModal();
+      await loadSessions();
+      if (r.session_id) await selectSession(r.session_id);
+      refreshTasksBadge();
+    } catch (e) { $("tasksAlert").innerHTML = `<div class="alert-box">运行失败:${esc(e.message)}</div>`; }
+  }));
+  box.querySelectorAll("[data-dismiss]").forEach(b => b.addEventListener("click", async () => {
+    await api("POST", `/api/scheduled_tasks/pending/${b.dataset.dismiss}/dismiss`);
+    await loadTasksData(); renderPendingList(); refreshTasksBadge();
+  }));
+}
+
+function renderTaskList() {
+  const box = $("taskList"); if (!box) return;
+  const list = state.tasks || [];
+  if (!list.length) { box.innerHTML = '<div class="alert-box info">还没有定时任务</div>'; return; }
+  box.innerHTML = list.map(t => `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(t.name)}
+          ${t.needs_approval ? '<span class="badge warn">密态·需批准</span>' : '<span class="badge ok">自由问答</span>'}
+          ${t.enabled ? '' : '<span class="badge no">已停用</span>'}</div>
+        <div class="d">${esc(scheduleText(t))} · 下次:${esc((t.next_run||"").slice(0,16).replace("T"," "))}</div>
+        ${t.source_folder
+          ? `<div class="d mono" style="font-size:11px;">📁 文件夹(取最新):${esc(t.source_folder)}</div>`
+          : (t.cipher_path ? `<div class="d mono" style="font-size:11px;">密文:${esc(t.cipher_path.split("/").pop())}</div>` : "")}
+        <div class="d" style="white-space:normal;">${esc(t.question.slice(0,80))}${t.question.length>80?'…':''}</div>
+      </div>
+      <button class="btn-ghost btn-sm" data-run="${esc(t.id)}">立即跑</button>
+      <button class="btn-ghost btn-sm" data-toggle="${esc(t.id)}" data-en="${t.enabled?1:0}">${t.enabled?'停用':'启用'}</button>
+      <button class="btn-danger" data-del="${esc(t.id)}">删除</button>
+    </div>
+  `).join("");
+  box.querySelectorAll("[data-run]").forEach(b => b.addEventListener("click", async () => {
+    try {
+      const r = await api("POST", `/api/scheduled_tasks/${b.dataset.run}/run_now`);
+      if (r.session_id) {
+        // 不论自由问答 / 密态,都已在「⏰」会话开跑 → 切过去看实时运行
+        // (密态会算完后显示"结果已加密暂存",在待批里批量解密)
+        closeModal();
+        await loadSessions();
+        await selectSession(r.session_id);
+        refreshTasksBadge();
+      } else {
+        $("tasksAlert").innerHTML = '<div class="alert-box info">已触发 · 见「待批运行」</div>';
+        await loadTasksData(); renderPendingList(); renderTaskHistory(); refreshTasksBadge();
+      }
+    } catch (e) { $("tasksAlert").innerHTML = `<div class="alert-box">触发失败:${esc(e.message)}</div>`; }
+  }));
+  box.querySelectorAll("[data-toggle]").forEach(b => b.addEventListener("click", async () => {
+    await api("PATCH", `/api/scheduled_tasks/${b.dataset.toggle}`, { enabled: b.dataset.en !== "1" });
+    await loadTasksData(); renderTaskList();
+  }));
+  box.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("删除这个定时任务?")) return;
+    await api("DELETE", `/api/scheduled_tasks/${b.dataset.del}`);
+    await loadTasksData(); renderTaskList();
+  }));
+}
+
+const HIST_STATUS_BADGE = {
+  launched: "ok", decrypted: "ok", queued: "warn", skipped: "no", failed: "no",
+};
+function renderTaskHistory() {
+  const box = $("tkHistory"); if (!box) return;
+  const all = state.tasksHistory || [];
+  const f = state.histFilter;
+
+  // 只按日期筛选(空 = 全部)
+  let list = all;
+  if (f.date) {
+    list = all.filter(r => (r.ran_at || "").slice(0, 10) === f.date);
+  }
+
+  const cnt = $("histCount");
+  if (cnt) cnt.textContent = String(list.length);
+
+  if (!list.length) {
+    box.innerHTML = '<div class="alert-box info">没有匹配的运行记录</div>';
+    return;
+  }
+  box.innerHTML = list.slice(0, 60).map(r => `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(r.task_name)} <span class="badge ${HIST_STATUS_BADGE[r.status]||'no'}">${esc(r.status)}</span></div>
+        <div class="d">${esc((r.ran_at||"").slice(0,16).replace("T"," "))} · ${esc(r.summary||"")}</div>
+      </div>
+    </div>
+  `).join("");
+}
+
+// 顶栏待批红点
+async function refreshTasksBadge() {
+  try {
+    const r = await api("GET", "/api/scheduled_tasks");
+    const n = r.pending_count || 0;
+    const badge = $("tasksBadge");
+    if (badge) { badge.style.display = n ? "" : "none"; badge.textContent = n > 99 ? "99+" : n; }
+  } catch {}
+}
+
+// ============ Skill 管理 Tab ============
+async function renderSkillsTab() {
+  $("modalBody").innerHTML = `
+    <h2>${TABS.skills.title}</h2>
+    <p class="sub">SKILL.md 技能教 AI 写密态计算代码 · 拖入技能包(SKILL.md + INDEX / docs / examples)即可添加</p>
+    <div id="skillsAlert"></div>
+
+    <div id="skillMdList"><div class="alert-box info">加载中…</div></div>
+
+    <h3 style="font-size:14px; margin: 22px 0 8px;">添加技能</h3>
+    <div class="sk-drop" id="skillDropZone" tabindex="0">
+      <div class="sk-drop__t">拖入技能<strong>文件夹</strong> / <strong>.zip</strong> / <strong>SKILL.md</strong></div>
+      <div class="sk-drop__s" id="skillDropHint">支持多文件嵌套包(SKILL.md + INDEX.md + docs/ + examples/)· 点击选文件夹</div>
+      <input type="file" id="skillDirInput" webkitdirectory directory multiple hidden>
+      <input type="file" id="skillFileInput" accept=".md,.zip" hidden>
+    </div>
+    <div id="skillUpStatus" style="margin-top:12px;"></div>
+  `;
+
+  await loadSkills();
+  renderSkillMdList();
+  bindSkillDrop();
+}
+
+async function loadSkills() {
+  try { state.skills = await api("GET", "/api/skills"); }
+  catch { state.skills = { skill_md: [], builtin: [], custom: [] }; }
+}
+
+// ── 拖拽 / 选择技能包上传 ──
+function bindSkillDrop() {
+  const zone = $("skillDropZone");
+  const dirInp = $("skillDirInput");
+  const fileInp = $("skillFileInput");
+  if (!zone) return;
+
+  // 点击:优先弹文件夹选择(webkitdirectory)
+  zone.addEventListener("click", e => {
+    if (e.target.closest("button, a")) return;
+    dirInp.click();
+  });
+  zone.addEventListener("keydown", e => {
+    if (e.key === "Enter" || e.key === " ") { e.preventDefault(); dirInp.click(); }
+  });
+  dirInp.addEventListener("change", e => {
+    const fs = Array.from(e.target.files || []);
+    if (fs.length) uploadSkillFiles(fs.map(f => ({ file: f, path: f.webkitRelativePath || f.name })));
+    e.target.value = "";
+  });
+  fileInp.addEventListener("change", e => {
+    const f = e.target.files?.[0];
+    if (f) uploadSkillFiles([{ file: f, path: f.name }]);
+    e.target.value = "";
+  });
+
+  ["dragenter", "dragover"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.add("dragover"); })
+  );
+  ["dragleave"].forEach(ev =>
+    zone.addEventListener(ev, e => { e.preventDefault(); e.stopPropagation(); zone.classList.remove("dragover"); })
+  );
+  zone.addEventListener("drop", async e => {
+    e.preventDefault(); e.stopPropagation(); zone.classList.remove("dragover");
+    const items = e.dataTransfer.items;
+    let collected = [];
+    if (items && items.length && items[0].webkitGetAsEntry) {
+      // 递归读目录树(支持文件夹嵌套)
+      for (const it of items) {
+        const entry = it.webkitGetAsEntry();
+        if (entry) collected = collected.concat(await walkEntry(entry, ""));
+      }
+    }
+    if (!collected.length && e.dataTransfer.files?.length) {
+      collected = Array.from(e.dataTransfer.files).map(f => ({ file: f, path: f.name }));
+    }
+    if (collected.length) uploadSkillFiles(collected);
+  });
+}
+
+// 递归读 FileSystemEntry → [{file, path}]
+function walkEntry(entry, prefix) {
+  return new Promise(resolve => {
+    if (entry.isFile) {
+      entry.file(f => resolve([{ file: f, path: prefix + entry.name }]), () => resolve([]));
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      const all = [];
+      const readBatch = () => reader.readEntries(async entries => {
+        if (!entries.length) {
+          const nested = await Promise.all(all.map(en => walkEntry(en, prefix + entry.name + "/")));
+          resolve(nested.flat());
+        } else {
+          all.push(...entries);
+          readBatch();
+        }
+      }, () => resolve([]));
+      readBatch();
+    } else resolve([]);
+  });
+}
+
+async function uploadSkillFiles(items) {
+  // items: [{file, path}]
+  const hasSkillMd = items.some(it => /(^|\/)SKILL\.md$/i.test(it.path) || /\.zip$/i.test(it.path));
+  if (!hasSkillMd) {
+    $("skillUpStatus").innerHTML = '<div class="alert-box">技能包里必须有 SKILL.md(或拖一个 .zip)</div>';
+    return;
+  }
+  $("skillUpStatus").innerHTML = `<div class="alert-box info">上传中 · ${items.length} 个文件…</div>`;
+  const fd = new FormData();
+  items.forEach(it => {
+    fd.append("files", it.file, it.file.name);
+    fd.append("paths", it.path);
+  });
+  try {
+    const res = await api("POST", "/api/skills/upload", fd, true);
+    $("skillUpStatus").innerHTML = `<div class="alert-box success">✓ 已添加技能「${esc(res.name)}」· 下次提问 AI 可用</div>`;
+    await loadSkills();
+    renderSkillMdList();
+  } catch (e) {
+    $("skillUpStatus").innerHTML = `<div class="alert-box">添加失败:${esc(e.message)}</div>`;
+  }
+}
+
+function renderSkillMdList() {
+  const box = $("skillMdList");
+  if (!box) return;
+  const list = state.skills?.skill_md || [];
+  if (!list.length) { box.innerHTML = '<div class="alert-box info">还没有技能 · 拖入技能包添加</div>'; return; }
+  box.innerHTML = list.map(s => `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(s.name)}
+          ${s.has_index ? '<span class="mono-tag">INDEX</span>' : ''}
+          ${s.example_count ? `<span class="mono-tag">${s.example_count} 示例</span>` : ''}</div>
+        <div class="d" style="white-space:normal;">${esc((s.description || '').slice(0, 160))}${(s.description||'').length>160?'…':''}</div>
+      </div>
+      <button class="btn-ghost btn-sm" data-view-md="${esc(s.slug)}">查看</button>
+      ${s.is_user
+        ? `<button class="btn-danger" data-del-md="${esc(s.slug)}">删除</button>`
+        : `<span class="badge ok">内置</span>`}
+    </div>
+  `).join("");
+  box.querySelectorAll("[data-view-md]").forEach(b => b.addEventListener("click", () => {
+    showSkillMd(b.dataset.viewMd);
+  }));
+  box.querySelectorAll("[data-del-md]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("删除这个技能?")) return;
+    try {
+      await api("DELETE", `/api/skills/md/${encodeURIComponent(b.dataset.delMd)}`);
+      await loadSkills();
+      renderSkillMdList();
+    } catch (e) {
+      $("skillsAlert").innerHTML = `<div class="alert-box">删除失败:${esc(e.message)}</div>`;
+    }
+  }));
+}
+
+async function showSkillMd(slug) {
+  const wrap = document.createElement("div");
+  wrap.className = "modal-mask open"; wrap.style.zIndex = 40;
+  wrap.innerHTML = `
+    <div class="modal modal--single" style="position:relative; max-width:820px; height:auto; max-height:84vh;">
+      <button class="modal__close" id="smClose">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <div class="modal__body" style="padding:24px 30px;">
+        <h2>${esc(slug)}</h2>
+        <pre id="smBody" style="white-space:pre-wrap; font-size:12px; line-height:1.6; font-family:ui-monospace,Menlo,monospace; color:var(--text);">加载中…</pre>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  wrap.querySelector("#smClose").addEventListener("click", () => wrap.remove());
+  wrap.addEventListener("click", e => { if (e.target === wrap) wrap.remove(); });
+  try {
+    const r = await api("GET", `/api/skills/md/${encodeURIComponent(slug)}`);
+    wrap.querySelector("#smBody").textContent = r.body || "(空)";
+  } catch (e) {
+    wrap.querySelector("#smBody").textContent = "加载失败:" + e.message;
+  }
+}
+
+function renderBuiltinSkills() {
+  const box = $("builtinSkills");
+  if (!box) return;
+  const list = state.skills?.builtin || [];
+  box.innerHTML = list.map(s => `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(s.name)} <span class="mono-tag">${esc(s.tool)}</span></div>
+        <div class="d">${esc(s.desc)}</div>
+        ${s.params && s.params.length
+          ? `<div class="d mono" style="font-size:11px; white-space:normal; color:var(--text-muted);">params: ${s.params.map(esc).join(" · ")}</div>`
+          : ""}
+      </div>
+      <span class="badge ok">内置</span>
+    </div>
+  `).join("");
+}
+
+function renderCustomSkills() {
+  const box = $("customSkills");
+  if (!box) return;
+  const list = state.skills?.custom || [];
+  if (!list.length) {
+    box.innerHTML = '<div class="alert-box info">还没有自定义指标 · 在下方添加(如「边际贡献率」「人效比」等本企业口径)</div>';
+    return;
+  }
+  box.innerHTML = list.map(s => `
+    <div class="list-item">
+      <div class="grow">
+        <div class="t">${esc(s.name)}</div>
+        ${s.description ? `<div class="d">${esc(s.description)}</div>` : ""}
+        ${s.formula ? `<div class="d mono" style="white-space:normal;">公式:${esc(s.formula)}</div>` : ""}
+      </div>
+      <button class="btn-danger" data-del-skill="${esc(s.id)}">删除</button>
+    </div>
+  `).join("");
+  box.querySelectorAll("[data-del-skill]").forEach(b => b.addEventListener("click", async () => {
+    if (!confirm("删除这个自定义指标?")) return;
+    try {
+      await api("DELETE", `/api/skills/${encodeURIComponent(b.dataset.delSkill)}`);
+      await loadSkills();
+      renderCustomSkills();
+    } catch (e) {
+      $("skillsAlert").innerHTML = `<div class="alert-box">删除失败:${esc(e.message)}</div>`;
+    }
+  }));
+}
+
+// ============ 密文文件管理 Modal(顶栏入口) ============
+function openFilesModal() {
+  $("filesMask").classList.add("open");
+  renderFilesModal();
+}
+function closeFilesModal() { $("filesMask").classList.remove("open"); }
+
+async function renderFilesModal() {
+  await loadFiles();
+  $("filesBody").innerHTML = `
+    <h2>密文文件管理</h2>
     <p class="sub">已加密的本地文件 · 数字列加密 / 字符串列保留为身份标识</p>
     <div id="filesList"></div>
 
@@ -1047,6 +1707,16 @@ function bindEvents() {
     b.addEventListener("click", () => openModal(b.dataset.tab));
   });
 
+  // 密文文件管理(顶栏入口)
+  $("filesBtn")?.addEventListener("click", openFilesModal);
+  $("filesClose")?.addEventListener("click", closeFilesModal);
+  $("filesMask")?.addEventListener("click", e => {
+    if (e.target === $("filesMask")) closeFilesModal();
+  });
+
+  // 定时任务(顶栏入口)
+  $("tasksBtn")?.addEventListener("click", () => openModal("tasks"));
+
   // mobile menu
   $("menuBtn")?.addEventListener("click", () => {
     $("sidebar").classList.add("open");
@@ -1065,4 +1735,11 @@ function bindEvents() {
   await loadFiles();
   showWelcome();
   if (state.sessions.length) await selectSession(state.sessions[0].id);
+  // 定时任务待批红点:首刷 + 每 30s 轮询
+  refreshTasksBadge();
+  setInterval(refreshTasksBadge, 30000);
+  // 当前会话后台同步:每 4s 接住服务端(定时任务)注入的新消息
+  setInterval(syncCurrentSession, 4000);
+  // 侧栏每 15s 刷一次,捕获定时任务新建的「⏰」会话
+  setInterval(() => { if (!state.running && !state.pollingMids.size) loadSessions(); }, 15000);
 })();

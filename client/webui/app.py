@@ -42,6 +42,18 @@ from client.tools.crypto import ZFHE
 from client.webui import pipeline as pipeline_mod
 from client.webui import text_extract
 from client.webui.sessions import ChatSession, Message, SessionStore
+from client.webui.scheduler import (
+    EncryptedResultStore,
+    HistoryStore,
+    PendingStore,
+    Scheduler,
+    TaskStore,
+)
+from client.webui.skills_store import (
+    CustomSkillStore,
+    build_custom_skills_prompt_block,
+    builtin_skills,
+)
 from shared.prompts import load_system_prompt
 
 # ----------------------------------------------------------------------------
@@ -93,6 +105,11 @@ _config = _load_config()
 _storage = LocalStorage()
 _keystore = Keystore()
 _sessions = SessionStore()
+_custom_skills = CustomSkillStore()
+_task_store = TaskStore()
+_pending_store = PendingStore()
+_run_history = HistoryStore()
+_enc_results = EncryptedResultStore()
 
 
 # ----------------------------------------------------------------------------
@@ -411,15 +428,99 @@ def _smart_read(path: Path, suffix: str):
     return df, str(best_name), header_row
 
 
-@app.post("/api/files/upload")
-async def api_files_upload(raw_file: UploadFile = File(...)):
-    if not _is_logged_in():
-        return _need_login()
+def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Optional[str] = None) -> dict:
+    """
+    把一个本地明文 CSV/XLSX 文件加密入库 —— 上传端点 + 定时任务源文件夹 共用。
+    返回 {name, path, encrypted_columns, plaintext_columns, row_count, ...}。
+    抛 ValueError 表示解析/校验失败。
+    """
+    import pandas as pd
+
     username = _session_state["username"]
     keys = _keystore.get_paths(username)
     sk_path = keys.sk_path if keys else None
     evk_path = keys.evk_path if keys else None
     backend = _config.get("backend", "real")
+
+    raw_suffix = src_path.suffix.lower() or ".csv"
+    if raw_suffix not in (".csv", ".xlsx", ".xls"):
+        raise ValueError(f"暂不支持的格式:{raw_suffix} · 仅 CSV / XLSX")
+
+    try:
+        df, sheet_name, header_row = _smart_read(src_path, raw_suffix)
+    except Exception as e:
+        raise ValueError(f"无法解析文件:{type(e).__name__}: {e}")
+    if df.empty or df.shape[1] == 0:
+        raise ValueError("文件没有任何列")
+
+    all_cols = df.columns.tolist()
+    if all(str(c).startswith("Unnamed:") for c in all_cols):
+        raise ValueError("无法识别表头(所有列都是 Unnamed)")
+    string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+
+    stem = dst_stem or Path(original_name).stem
+    cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
+    dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
+
+    nan_counts = {}
+    if numeric_cols:
+        num_df = df[numeric_cols].copy()
+        for col in numeric_cols:
+            cnt = int(num_df[col].isna().sum())
+            if cnt > 0:
+                nan_counts[col] = cnt
+        num_df = num_df.fillna(0)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
+            num_tmp = Path(t2.name)
+        try:
+            if raw_suffix == ".csv":
+                num_df.to_csv(num_tmp, index=False)
+            else:
+                num_df.to_excel(num_tmp, index=False)
+            zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
+            zfhe.encrypt_file(num_tmp, dst)
+        finally:
+            num_tmp.unlink(missing_ok=True)
+    else:
+        dst.write_bytes(b"")
+
+    meta_path = ""
+    if string_cols:
+        meta_dst = dst.with_suffix(dst.suffix + ".meta.csv")
+        df[string_cols].to_csv(meta_dst, index=False)
+        meta_path = str(meta_dst)
+
+    schema = {
+        "scenario": "auto",
+        "columns": [
+            {"name": c, "encrypted": c in numeric_cols,
+             "type": "float" if c in numeric_cols else "string"}
+            for c in all_cols
+        ],
+        "metadata_columns": string_cols,
+        "primary_key": string_cols[0] if string_cols else (numeric_cols[0] if numeric_cols else ""),
+    }
+    schema_dst = dst.with_suffix(dst.suffix + ".schema.json")
+    schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    return {
+        "name": dst.name, "path": str(dst),
+        "size_kb": round(dst.stat().st_size / 1024, 1) if dst.exists() else 0,
+        "backend": backend,
+        "meta_path": meta_path, "schema_path": str(schema_dst),
+        "encrypted_columns": numeric_cols, "plaintext_columns": string_cols,
+        "row_count": len(df),
+        "sheet_name": sheet_name, "header_row": header_row,
+        "column_preview": all_cols[:8],
+        "nan_filled": nan_counts,
+    }
+
+
+@app.post("/api/files/upload")
+async def api_files_upload(raw_file: UploadFile = File(...)):
+    if not _is_logged_in():
+        return _need_login()
 
     raw_bytes = await raw_file.read()
     if not raw_bytes:
@@ -430,81 +531,87 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as tmp:
         tmp.write(raw_bytes); tmp_path = Path(tmp.name)
-
     try:
-        import pandas as pd
-        try:
-            df, sheet_name, header_row = _smart_read(tmp_path, raw_suffix)
-        except Exception as e:
-            raise HTTPException(400, f"无法解析文件:{type(e).__name__}: {e}")
-        if df.empty or df.shape[1] == 0:
-            raise HTTPException(400, "文件没有任何列")
-
-        all_cols = df.columns.tolist()
-        if all(str(c).startswith("Unnamed:") for c in all_cols):
-            raise HTTPException(400, "无法识别表头(所有列都是 Unnamed)")
-        string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
-        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
-
-        stem = Path(raw_file.filename or "data").stem
-        cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
-        dst = _storage.ciphertext_dir / (stem + "_enc" + cipher_suffix)
-
-        nan_counts = {}
-        if numeric_cols:
-            num_df = df[numeric_cols].copy()
-            for col in numeric_cols:
-                cnt = int(num_df[col].isna().sum())
-                if cnt > 0:
-                    nan_counts[col] = cnt
-            num_df = num_df.fillna(0)
-            with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as t2:
-                num_tmp = Path(t2.name)
-            try:
-                if raw_suffix == ".csv":
-                    num_df.to_csv(num_tmp, index=False)
-                else:
-                    num_df.to_excel(num_tmp, index=False)
-                zfhe = ZFHE(backend=backend, sk_path=sk_path, evk_path=evk_path)
-                zfhe.encrypt_file(num_tmp, dst)
-            finally:
-                num_tmp.unlink(missing_ok=True)
-        else:
-            dst.write_bytes(b"")
-
-        meta_path = ""
-        if string_cols:
-            meta_dst = dst.with_suffix(dst.suffix + ".meta.csv")
-            df[string_cols].to_csv(meta_dst, index=False)
-            meta_path = str(meta_dst)
-
-        # 自动 schema
-        schema = {
-            "scenario": "auto",
-            "columns": [
-                {"name": c, "encrypted": c in numeric_cols,
-                 "type": "float" if c in numeric_cols else "string"}
-                for c in all_cols
-            ],
-            "metadata_columns": string_cols,
-            "primary_key": string_cols[0] if string_cols else (numeric_cols[0] if numeric_cols else ""),
-        }
-        schema_dst = dst.with_suffix(dst.suffix + ".schema.json")
-        schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
-
-        return {
-            "name": dst.name, "path": str(dst),
-            "size_kb": round(dst.stat().st_size / 1024, 1) if dst.exists() else 0,
-            "backend": backend,
-            "meta_path": meta_path, "schema_path": str(schema_dst),
-            "encrypted_columns": numeric_cols, "plaintext_columns": string_cols,
-            "row_count": len(df),
-            "sheet_name": sheet_name, "header_row": header_row,
-            "column_preview": all_cols[:8],
-            "nan_filled": nan_counts,
-        }
+        return _ingest_plaintext_path(tmp_path, raw_file.filename or "data")
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     finally:
         tmp_path.unlink(missing_ok=True)
+
+
+def _native_pick_folder() -> tuple[Optional[str], bool, str]:
+    """
+    调系统原生「选择文件夹」对话框(跨平台)。
+    返回 (path 或 None, cancelled, error)。浏览器拿不到绝对路径,只能走系统对话框。
+    """
+    import subprocess
+    import sys
+
+    prompt = "选择数据文件夹(每次取最新文件分析)"
+    plat = sys.platform
+
+    try:
+        if plat == "darwin":
+            script = f'POSIX path of (choose folder with prompt "{prompt}")'
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                if "-128" in (r.stderr or "") or "User canceled" in (r.stderr or ""):
+                    return None, True, ""
+                return None, False, (r.stderr or "").strip()[:120]
+            return (r.stdout or "").strip().rstrip("/"), False, ""
+
+        if plat == "win32":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
+                f"$d.Description = '{prompt}';"
+                "$r = $d.ShowDialog();"
+                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }"
+            )
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-STA", "-Command", ps],
+                capture_output=True, text=True, timeout=300,
+            )
+            path = (r.stdout or "").strip()
+            if not path:
+                return None, True, ""   # 取消 = 空输出
+            return path.rstrip("\\/"), False, ""
+
+        # Linux:zenity / kdialog
+        for cmd in (
+            ["zenity", "--file-selection", "--directory", f"--title={prompt}"],
+            ["kdialog", "--getexistingdirectory", os.path.expanduser("~")],
+        ):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except FileNotFoundError:
+                continue
+            if r.returncode != 0:
+                return None, True, ""   # 取消
+            path = (r.stdout or "").strip()
+            if path:
+                return path.rstrip("/"), False, ""
+            return None, True, ""
+        return None, False, "未找到 zenity/kdialog · 请手动粘贴路径"
+
+    except subprocess.TimeoutExpired:
+        return None, False, "选择超时"
+    except FileNotFoundError:
+        return None, False, "未找到系统文件选择器 · 请手动粘贴路径"
+
+
+@app.post("/api/pick_folder")
+def api_pick_folder():
+    """原生「选择文件夹」对话框(macOS / Windows / Linux),返回绝对路径。"""
+    if not _is_logged_in():
+        return _need_login()
+    path, cancelled, err = _native_pick_folder()
+    if cancelled:
+        return {"cancelled": True}
+    if err:
+        raise HTTPException(500, err)
+    return {"path": path, "cancelled": False}
 
 
 @app.post("/api/files/text_extract")
@@ -593,6 +700,92 @@ def api_files_preview(name: str):
     else:
         info["schema"] = None
     return info
+
+
+# ----------------------------------------------------------------------------
+# /api/skills —— 内置(只读) + 自定义(可增删)
+# ----------------------------------------------------------------------------
+
+
+@app.get("/api/skills")
+def api_skills_list():
+    if not _is_logged_in():
+        return _need_login()
+    from client import skills_loader
+    return {
+        "skill_md": skills_loader.list_meta(),   # SKILL.md 教学技能(代码生成主路径)
+        "builtin": builtin_skills(),             # 固化 skill(兜底)
+        "custom": _custom_skills.list_all(),     # 用户自定义指标
+    }
+
+
+@app.get("/api/skills/md/{slug}")
+def api_skill_md_body(slug: str):
+    """读某个 SKILL.md 的正文(给 UI「查看」用)。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client import skills_loader
+    body = skills_loader.get_body(slug)
+    if body is None:
+        raise HTTPException(404, "skill 不存在")
+    return {"slug": slug, "body": body}
+
+
+@app.post("/api/skills/upload")
+async def api_skills_upload(
+    files: list[UploadFile] = File(...),
+    paths: list[str] = Form(default=[]),
+):
+    """
+    拖拽添加技能包(支持多文件嵌套):
+      - 单个 .md      → 当 SKILL.md
+      - 单个 .zip     → 解压整包
+      - 多文件 + paths → 保留目录结构(SKILL.md + INDEX.md + docs/ + examples/)
+    """
+    if not _is_logged_in():
+        return _need_login()
+    from client import skills_loader
+
+    if not files:
+        raise HTTPException(400, "没有文件")
+
+    try:
+        # 单 zip
+        if len(files) == 1 and (files[0].filename or "").lower().endswith(".zip"):
+            data = await files[0].read()
+            doc = skills_loader.add_user_skill_zip(data)
+        # 单 md
+        elif len(files) == 1 and (files[0].filename or "").lower().endswith(".md") and not paths:
+            data = await files[0].read()
+            doc = skills_loader.add_user_skill_md(
+                data.decode("utf-8", errors="replace"),
+                fallback_name=Path(files[0].filename or "skill").stem,
+            )
+        # 多文件嵌套包
+        else:
+            collected: list[tuple] = []
+            for i, f in enumerate(files):
+                data = await f.read()
+                rel = paths[i] if i < len(paths) and paths[i] else (f.filename or f"file_{i}")
+                collected.append((rel, data))
+            doc = skills_loader.add_user_skill_files(collected)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(400, f"技能包解析失败:{type(e).__name__}: {e}")
+
+    return doc.to_meta()
+
+
+@app.delete("/api/skills/md/{slug}")
+def api_skills_md_delete(slug: str):
+    """删除用户拖拽添加的 SKILL.md 技能(内置不可删)。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client import skills_loader
+    if not skills_loader.delete_user_skill(slug):
+        raise HTTPException(404, "用户技能不存在(内置技能不可删)")
+    return {"ok": True}
 
 
 # ----------------------------------------------------------------------------
@@ -756,6 +949,8 @@ def _run_pipeline(
     sid: str, asst_mid: str, user_query: str, attached_cipher: str,
     history: list[dict[str, str]],
     text_attachments: list[dict[str, str]],
+    output_mode: str = "interactive",
+    sched_task: Optional[Any] = None,   # 定时密态任务对象(用于回填 EncryptedResult)
 ) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
@@ -779,7 +974,10 @@ def _run_pipeline(
             used_cipher = last
 
     try:
-        system_prompt = load_system_prompt()
+        base_prompt = load_system_prompt()
+        # 用户自定义指标 / 公式(企业口径)—— 固化路径追加到 prompt;codegen 路径单独传
+        custom_block = build_custom_skills_prompt_block(_custom_skills.list_all())
+        system_prompt = base_prompt + ("\n" + custom_block if custom_block else "")
     except Exception as e:
         _sessions.update_message(
             sid, asst_mid, status="failed",
@@ -816,6 +1014,7 @@ def _run_pipeline(
             with _decrypt_lock:
                 _decrypt_events.pop(asst_mid, None)
 
+    run_id = secrets.token_hex(6)
     try:
         result = pipeline_mod.ask(
             user_query=user_query,
@@ -828,6 +1027,9 @@ def _run_pipeline(
             history=history,
             text_attachments=text_attachments,
             prompt_decrypt=_prompt_decrypt,
+            custom_block=custom_block,
+            output_mode=output_mode,
+            run_id=run_id,
         )
     except Exception as e:
         _sessions.update_message(
@@ -873,6 +1075,25 @@ def _run_pipeline(
         )
         return
 
+    # 定时密态:结果加密暂存 → 累积成 EncryptedResult(按任务聚合,待批量解密)
+    if status == "encrypted_pending":
+        enc = result.get("encrypted_run") or {}
+        if sched_task is not None and enc.get("manifest"):
+            _enc_results.add(
+                username=sched_task.username, task_id=sched_task.id,
+                task_name=sched_task.name, run_id=enc.get("run_id", run_id),
+                run_at=datetime.now().isoformat(timespec="seconds"),
+                question=sched_task.question, manifest=enc.get("manifest", []),
+            )
+        _sessions.update_message(
+            sid, asst_mid, status="done",
+            summary=result.get("summary", ""),
+            skill_calls=result.get("skill_calls", []),
+            used_cipher=used_cipher,
+            duration_sec=round(time.time() - t0, 2),
+        )
+        return
+
     excel_path = result.get("excel_path", "")
     _sessions.update_message(
         sid, asst_mid, status="done",
@@ -883,6 +1104,361 @@ def _run_pipeline(
         used_cipher=used_cipher,
         duration_sec=round(time.time() - t0, 2),
     )
+
+
+# ----------------------------------------------------------------------------
+# 定时任务(MVP)
+# ----------------------------------------------------------------------------
+
+
+def _ensure_task_session(task) -> str:
+    """确保任务有一个聊天会话(累积它的历次运行);返回 session_id。"""
+    sid = task.session_id
+    sess = _sessions.get(sid) if sid else None
+    if not sess:
+        sess = _sessions.create(username=task.username, title=f"⏰ {task.name}")
+        _task_store.update(task.id, session_id=sess.id)
+        sid = sess.id
+    return sid
+
+
+def _launch_run(*, username: str, task_name: str, question: str,
+                cipher_path: str, session_id: str,
+                output_mode: str = "interactive", sched_task=None) -> None:
+    """把一次运行注入聊天会话并跑 pipeline。output_mode=encrypted_sandbox 时密态结果加密暂存。"""
+    sess = _sessions.get(session_id)
+    if not sess:
+        return
+    history_for_llm: list[dict[str, str]] = []
+    for m in sess.messages[-6:]:
+        if m.role == "user" and m.content:
+            history_for_llm.append({"role": "user", "content": m.content})
+        elif m.role == "assistant" and m.status == "done" and m.summary:
+            history_for_llm.append({"role": "assistant", "content": m.summary})
+
+    user_msg = Message(id=secrets.token_hex(6), role="user",
+                       content=question, attached_cipher=cipher_path or "")
+    _sessions.append_message(session_id, user_msg)
+    asst = Message(id=secrets.token_hex(6), role="assistant", status="pending")
+    _sessions.append_message(session_id, asst)
+    threading.Thread(
+        target=_run_pipeline,
+        args=(session_id, asst.id, question, cipher_path or "", history_for_llm, []),
+        kwargs={"output_mode": output_mode, "sched_task": sched_task},
+        daemon=True, name=f"sched-{session_id}-{asst.id}",
+    ).start()
+
+
+# 源文件夹加密入库缓存:同一文件(路径+mtime)只加密一次,供同文件夹的多个任务复用
+_folder_ingest_cache: dict[tuple, str] = {}
+_folder_ingest_lock = threading.Lock()
+
+
+def _pick_latest_in_folder(folder: str, pattern: str = "") -> Optional[Path]:
+    """挑文件夹里最新的 CSV/XLSX(按修改时间)。"""
+    d = Path(folder).expanduser()
+    if not d.is_dir():
+        return None
+    pats = [pattern] if pattern else ["*.csv", "*.xlsx", "*.xls"]
+    files: list[Path] = []
+    for p in pats:
+        files.extend(d.glob(p))
+    files = [f for f in files if f.is_file() and not f.name.startswith("~$")]
+    if not files:
+        return None
+    return max(files, key=lambda f: f.stat().st_mtime)
+
+
+def _resolve_task_cipher(task) -> tuple[Optional[str], str]:
+    """
+    解析任务这次运行该用哪份密文。
+    返回 (cipher_path 或 None, 说明/错误)。
+    - 绑源文件夹:取最新明文 → 加密入库(带 mtime 缓存)→ 返回密文路径
+    - 绑固定密文:直接返回
+    """
+    if task.source_folder:
+        latest = _pick_latest_in_folder(task.source_folder, task.source_pattern or "")
+        if latest is None:
+            return None, f"源文件夹无可处理文件:{task.source_folder}"
+        key = (str(latest.resolve()), latest.stat().st_mtime)
+        with _folder_ingest_lock:
+            cached = _folder_ingest_cache.get(key)
+        if cached and Path(cached).exists():
+            return cached, f"复用已加密的最新文件:{latest.name}"
+        try:
+            info = _ingest_plaintext_path(latest, latest.name)
+        except Exception as e:
+            return None, f"最新文件加密入库失败:{e}"
+        with _folder_ingest_lock:
+            _folder_ingest_cache[key] = info["path"]
+        return info["path"], f"已加密最新文件:{latest.name}"
+    if task.cipher_path:
+        return task.cipher_path, ""
+    return None, ""
+
+
+def _on_scheduler_fire(task) -> None:
+    """调度器到点回调(在 scheduler 线程里)。"""
+    # 密态分析(有数据:固定密文 / 源文件夹)→ 正常计算,结果加密暂存,累积待批量解密
+    if task.needs_approval:
+        if not (_is_logged_in() and _session_state.get("username") == task.username):
+            # 仅活跃会话:没登录就不跑(下次到点再说)
+            _run_history.add(
+                username=task.username, task_id=task.id, task_name=task.name,
+                ran_at=datetime.now().isoformat(timespec="seconds"),
+                status="skipped", summary="到点时未登录 · 跳过(仅活跃会话)",
+            )
+            return
+        cipher_path, note = _resolve_task_cipher(task)
+        if not cipher_path:
+            _run_history.add(
+                username=task.username, task_id=task.id, task_name=task.name,
+                ran_at=datetime.now().isoformat(timespec="seconds"),
+                status="skipped", summary=note or "无可用数据 · 跳过",
+            )
+            return
+        sid = _ensure_task_session(task)
+        _launch_run(username=task.username, task_name=task.name,
+                    question=task.question, cipher_path=cipher_path,
+                    session_id=sid, output_mode="encrypted_sandbox", sched_task=task)
+        _run_history.add(
+            username=task.username, task_id=task.id, task_name=task.name,
+            ran_at=datetime.now().isoformat(timespec="seconds"),
+            status="launched",
+            summary=f"密态计算 · 结果加密暂存 · 待批量解密{(' · ' + note) if note else ''}",
+        )
+        return
+    # 自由问答(无密文)→ 仅在当前已登录且是该用户时直接跑;否则也入队
+    if _is_logged_in() and _session_state.get("username") == task.username:
+        sid = _ensure_task_session(task)
+        _launch_run(username=task.username, task_name=task.name,
+                    question=task.question, cipher_path="", session_id=sid)
+        _run_history.add(
+            username=task.username, task_id=task.id, task_name=task.name,
+            ran_at=datetime.now().isoformat(timespec="seconds"),
+            status="launched", summary="已自动运行 · 见会话",
+        )
+    else:
+        sid = _ensure_task_session(task)
+        _pending_store.add(
+            username=task.username, task_id=task.id, task_name=task.name,
+            question=task.question, cipher_path="",
+            session_id=sid, due_at=task.next_run or "",
+        )
+        _run_history.add(
+            username=task.username, task_id=task.id, task_name=task.name,
+            ran_at=datetime.now().isoformat(timespec="seconds"),
+            status="queued", summary="到点时未登录 · 已入待批队列",
+        )
+
+
+_scheduler = Scheduler(_task_store, _on_scheduler_fire, poll_seconds=30)
+
+
+@app.on_event("startup")
+def _arm_scheduler():
+    _scheduler.start()
+
+
+@app.get("/api/scheduled_tasks")
+def api_tasks_list():
+    if not _is_logged_in():
+        return _need_login()
+    u = _session_state["username"]
+    return {
+        "tasks": [t.to_dict() for t in _task_store.list_for(u)],
+        "pending_count": _pending_store.count_pending(u) + _enc_results.count_pending(u),
+    }
+
+
+@app.post("/api/scheduled_tasks/parse_schedule")
+async def api_parse_schedule(request: Request):
+    """自然语言排程 → cron(普通用户用大白话,实时转换)。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui.scheduler import parse_natural_schedule
+    data = await request.json()
+    return parse_natural_schedule(data.get("text", ""))
+
+
+@app.post("/api/scheduled_tasks")
+async def api_tasks_create(request: Request):
+    if not _is_logged_in():
+        return _need_login()
+    data = await request.json()
+    name = (data.get("name") or "").strip()
+    question = (data.get("question") or "").strip()
+    if not name or not question:
+        raise HTTPException(400, "任务名和问题都不能为空")
+    kind = data.get("schedule_kind", "daily")
+    if kind not in ("interval", "daily", "weekly", "monthly", "cron"):
+        raise HTTPException(400, "schedule_kind 只能是 interval/daily/weekly/monthly/cron")
+    cron_expr = (data.get("cron_expr") or "").strip()
+    if kind == "cron":
+        if not cron_expr:
+            raise HTTPException(400, "cron 模式必须填 cron 表达式")
+        try:
+            from croniter import croniter
+            if not croniter.is_valid(cron_expr):
+                raise ValueError("非法 cron 表达式")
+        except ImportError:
+            raise HTTPException(500, "未安装 croniter")
+        except Exception:
+            raise HTTPException(400, "cron 表达式不合法(标准 5 段:分 时 日 月 周)")
+    cipher_path = (data.get("cipher_path") or "").strip()
+    source_folder = (data.get("source_folder") or "").strip()
+    source_pattern = (data.get("source_pattern") or "").strip()
+    if cipher_path and not Path(cipher_path).exists():
+        raise HTTPException(400, "指定的密文文件不存在")
+    if source_folder:
+        d = Path(source_folder).expanduser()
+        if not d.is_dir():
+            raise HTTPException(400, f"源文件夹不存在:{source_folder}")
+        source_folder = str(d)
+    t = _task_store.create(
+        username=_session_state["username"], name=name, question=question,
+        cipher_path=cipher_path, source_folder=source_folder, source_pattern=source_pattern,
+        schedule_kind=kind, cron_expr=cron_expr,
+        cron_readable=(data.get("cron_readable") or "").strip(),
+        interval_minutes=int(data.get("interval_minutes", 60) or 60),
+        at_hour=int(data.get("at_hour", 9) or 0),
+        at_minute=int(data.get("at_minute", 0) or 0),
+        weekday=int(data.get("weekday", 0) or 0),
+        day_of_month=int(data.get("day_of_month", 1) or 1),
+        enabled=bool(data.get("enabled", True)),
+    )
+    return t.to_dict()
+
+
+@app.patch("/api/scheduled_tasks/{tid}")
+async def api_tasks_patch(tid: str, request: Request):
+    if not _is_logged_in():
+        return _need_login()
+    t = _task_store.get(tid)
+    if not t or t.username != _session_state["username"]:
+        raise HTTPException(404, "任务不存在")
+    data = await request.json()
+    patch = {k: data[k] for k in ("name", "question", "enabled", "schedule_kind",
+                                  "interval_minutes", "at_hour", "at_minute", "weekday",
+                                  "day_of_month", "cron_expr", "cron_readable",
+                                  "cipher_path", "source_folder", "source_pattern") if k in data}
+    t = _task_store.update(tid, **patch)
+    return t.to_dict()
+
+
+@app.delete("/api/scheduled_tasks/{tid}")
+def api_tasks_delete(tid: str):
+    if not _is_logged_in():
+        return _need_login()
+    t = _task_store.get(tid)
+    if not t or t.username != _session_state["username"]:
+        raise HTTPException(404, "任务不存在")
+    _task_store.delete(tid)
+    return {"ok": True}
+
+
+@app.post("/api/scheduled_tasks/{tid}/run_now")
+def api_tasks_run_now(tid: str):
+    """手动立即跑一次(等同到点触发)。"""
+    if not _is_logged_in():
+        return _need_login()
+    t = _task_store.get(tid)
+    if not t or t.username != _session_state["username"]:
+        raise HTTPException(404, "任务不存在")
+    _on_scheduler_fire(t)
+    # fire 后 task 已被 _ensure_task_session 绑上 session_id;自由问答任务已在该会话开跑
+    t2 = _task_store.get(tid)
+    return {
+        "ok": True,
+        "needs_approval": t.needs_approval,
+        "session_id": (t2.session_id if t2 else "") or "",
+    }
+
+
+@app.get("/api/scheduled_tasks/pending")
+def api_pending_list():
+    if not _is_logged_in():
+        return _need_login()
+    u = _session_state["username"]
+    # 两类待批:① 自由问答的待跑(PendingRun)② 密态任务的加密结果(按任务聚合)
+    runs = [dict(p.to_dict(), kind="run") for p in _pending_store.list_pending(u)]
+    encrypted = [dict(a, kind="decrypt") for a in _enc_results.aggregate_by_task(u)]
+    return {"runs": runs, "encrypted": encrypted}
+
+
+@app.post("/api/scheduled_tasks/decrypt/{task_id}")
+def api_task_decrypt(task_id: str):
+    """批量解密一个密态任务累积的所有加密结果 → 落到一个文件夹。"""
+    if not _is_logged_in():
+        return _need_login()
+    u = _session_state["username"]
+    items = _enc_results.pending_for_task(task_id)
+    items = [r for r in items if r.username == u]
+    if not items:
+        raise HTTPException(404, "该任务没有待解密的结果")
+    task = _task_store.get(task_id)
+    folder_name = (task.name if task else items[0].task_name) or "定时任务结果"
+    runs = [{"run_id": r.run_id, "run_at": r.run_at, "manifest": r.manifest,
+             "question": r.question} for r in items]
+    try:
+        from client.webui import sched_results
+        out_dir = sched_results.decrypt_runs_to_folder(runs, folder_name)
+    except Exception as e:
+        raise HTTPException(500, f"批量解密失败:{type(e).__name__}: {e}")
+    # 标记已解密 + 清沙盒密文
+    _enc_results.mark_decrypted([r.id for r in items])
+    try:
+        from client.webui import sched_results as _sr
+        _sr.cleanup_runs([r.run_id for r in items])
+    except Exception:
+        pass
+    _run_history.add(
+        username=u, task_id=task_id, task_name=folder_name,
+        ran_at=datetime.now().isoformat(timespec="seconds"),
+        status="decrypted", summary=f"已批量解密 {len(items)} 次运行 → 文件夹 {out_dir.name}",
+    )
+    return {"ok": True, "folder": str(out_dir), "count": len(items)}
+
+
+@app.post("/api/scheduled_tasks/pending/{pid}/approve")
+def api_pending_approve(pid: str):
+    """批准一个待批运行 → 注入会话并跑(此时人在场,走正常 B6-1 卡)。"""
+    if not _is_logged_in():
+        return _need_login()
+    p = _pending_store.get(pid)
+    if not p or p.username != _session_state["username"] or p.status != "pending":
+        raise HTTPException(404, "待批运行不存在")
+    sid = p.session_id or ""
+    if not _sessions.get(sid):
+        sess = _sessions.create(username=p.username, title=f"⏰ {p.task_name}")
+        sid = sess.id
+    _launch_run(username=p.username, task_name=p.task_name,
+                question=p.question, cipher_path=p.cipher_path, session_id=sid)
+    _pending_store.set_status(pid, "approved")
+    _run_history.add(
+        username=p.username, task_id=p.task_id, task_name=p.task_name,
+        ran_at=datetime.now().isoformat(timespec="seconds"),
+        status="launched", summary="已批准运行 · 见会话",
+    )
+    return {"ok": True, "session_id": sid}
+
+
+@app.post("/api/scheduled_tasks/pending/{pid}/dismiss")
+def api_pending_dismiss(pid: str):
+    if not _is_logged_in():
+        return _need_login()
+    p = _pending_store.get(pid)
+    if not p or p.username != _session_state["username"]:
+        raise HTTPException(404, "待批运行不存在")
+    _pending_store.set_status(pid, "dismissed")
+    return {"ok": True}
+
+
+@app.get("/api/scheduled_tasks/history")
+def api_tasks_history():
+    if not _is_logged_in():
+        return _need_login()
+    return [r.to_dict() for r in _run_history.list_for(_session_state["username"])]
 
 
 # ----------------------------------------------------------------------------

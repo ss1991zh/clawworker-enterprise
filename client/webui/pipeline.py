@@ -24,11 +24,14 @@ from typing import Any, Callable, Optional
 
 import httpx
 
+from client import skills_loader
 from client.tools.runtime import Runtime
 from client.tools.skills import run_skill, SKILLS
+from client.webui import codegen as codegen_mod
 from client.webui.plan_validator import validate_and_repair_plan
 from client.webui.writer import (
     derive_excel_stem,
+    export_cipher_as_is,
     export_skill_results_encrypted,
     write_skill_results,
 )
@@ -250,6 +253,27 @@ def call_llm_for_plan_repair(
     raise ValueError(f"repair LLM 返回未知格式: {list(body.keys())[:5]}")
 
 
+def call_llm_for_codegen(
+    host_url: str, token: str, system: str, user: str,
+    history: Optional[list[dict]] = None,
+    should_cancel: Optional[Callable[[], bool]] = None,
+    timeout: float = 1800.0,
+) -> str:
+    """调 host /llm/freechat 拿原始文本(含 ```python``` 代码块 + summary)。"""
+    r = _post_cancellable(
+        f"{host_url}/llm/freechat",
+        headers={"Authorization": f"Bearer {token}"},
+        json_body={"system": system, "user": user, "history": history or []},
+        timeout=timeout,
+        should_cancel=should_cancel,
+    )
+    if r.status_code == 401:
+        raise PermissionError("登录已过期")
+    r.raise_for_status()
+    body = r.json()
+    return body.get("text", "") or ""
+
+
 def call_llm_for_plan(
     host_url: str, token: str, system_prompt: str, user_query: str, schema: dict,
     history: Optional[list[dict]] = None,
@@ -356,6 +380,129 @@ def _fold_text_attachments(user_query: str, atts: Optional[list[dict]]) -> str:
     return "\n\n".join(parts)
 
 
+def _run_codegen_path(
+    *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
+    host_url, token, history, custom_block, excel_stem,
+    log, chk, prompt_decrypt, output_mode="interactive", run_id="",
+) -> Optional[dict]:
+    """
+    代码生成主路径:LLM 读 SKILL.md → 写代码 → AST 扫描 → 受限 exec → Excel。
+    成功返回结果 dict;若任何环节失败,返回 None 让上层回退到固化 skill 路径。
+    cancelled / keep_encrypted 是终态,直接返回(不回退)。
+
+    output_mode:
+      "interactive"        —— 正常:算完弹 B6-1,解密/保留密文/取消
+      "encrypted_sandbox"  —— 定时密态:自动允许计算,结果**加密暂存沙盒**,
+                              不写明文 Excel,返回 encrypted_run(供批量解密)
+    """
+    # 定时密态模式:计算阶段自动放行解密(在本机内存算),结果保持密文
+    exec_prompt_decrypt = prompt_decrypt
+    if output_mode == "encrypted_sandbox":
+        exec_prompt_decrypt = lambda: "decrypt"  # noqa: E731
+    # 1) 意图路由选 SKILL.md
+    skill_docs = skills_loader.route(effective_query)
+    if not skill_docs:
+        return None
+    log("think", f"代码生成 · 加载技能文档:{' / '.join(d.name for d in skill_docs)}")
+
+    # 2) LLM 写代码
+    system, user = codegen_mod.build_codegen_messages(
+        skill_docs, schema, metadata_columns, effective_query, custom_block,
+    )
+    log("call", "调用 LLM 生成密态分析代码")
+    if chk():
+        raise CancelledError("用户已停止")
+    raw = call_llm_for_codegen(host_url, token, system, user, history=history, should_cancel=chk)
+    if chk():
+        raise CancelledError("用户已停止")
+
+    try:
+        code, summary_raw = codegen_mod.extract_code(raw)
+    except Exception as e:
+        log("error", f"代码生成解析失败:{e} · 回退固化 skill")
+        return None
+
+    # 3) AST 安全扫描
+    try:
+        codegen_mod.ast_safety_check(code)
+    except codegen_mod.UnsafeCode as e:
+        log("error", f"生成代码未通过安全扫描:{e} · 回退固化 skill")
+        return None
+    log("result", "代码安全扫描通过")
+
+    # 4) 加载 cipher
+    log("call", f"加载密文 {cipher_path.name}")
+    try:
+        cdf = load_cipher_df(cipher_path)
+    except Exception as e:
+        log("error", f"密文加载失败:{e} · 回退固化 skill")
+        return None
+
+    # 5) 受限执行(decrypt 首次触发 B6-1)
+    log("call", "受限执行生成代码 · 密态计算")
+    try:
+        results = codegen_mod.run_generated_code(
+            code, cdf=cdf,
+            metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+            prompt_decrypt=exec_prompt_decrypt, should_cancel=chk,
+        )
+    except codegen_mod.CodegenCancelled:
+        log("error", "已停止 · 用户取消")
+        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
+    except codegen_mod.KeepEncrypted:
+        log("call", "用户选择保留密文 · 导出源密文 Excel")
+        try:
+            excel_path = export_cipher_as_is(cipher_path, metadata_rows, metadata_columns)
+        except Exception as e:
+            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
+        log("result", f"完成 · {excel_path.name}")
+        return {
+            "status": "done",
+            "summary": "已按要求保留密文展示 · 数值列保持同态密文形式。若要明文结果请重新提问并选择「解密展示」。",
+            "excel_path": str(excel_path), "skill_calls": ["codegen"], "error": "",
+        }
+    except Exception as e:
+        log("error", f"代码执行失败:{e} · 回退固化 skill")
+        return None
+
+    if not results:
+        log("error", "生成代码没产出结果 · 回退固化 skill")
+        return None
+    log("result", f"密态计算完成 · {len(results)} 个 sheet")
+
+    # 6a) 定时密态模式:结果加密暂存沙盒,不写明文 Excel
+    if output_mode == "encrypted_sandbox":
+        from client.webui import sched_results
+        log("call", "结果加密暂存(不解密)· 待批量解密")
+        try:
+            manifest = sched_results.persist_results_encrypted(results, run_id)
+        except Exception as e:
+            return {"status": "failed", "error": f"结果加密暂存失败: {e}", "summary": summary_raw}
+        log("result", f"已加密暂存 {len(manifest)} 张表 · 待你批量解密")
+        return {
+            "status": "encrypted_pending",
+            "summary": "密态计算已完成 · 结果已加密暂存(未解密)· 在「定时任务 → 待批运行」批量解密。",
+            "excel_path": "", "skill_calls": ["codegen"], "error": "",
+            "encrypted_run": {"run_id": run_id, "manifest": manifest},
+        }
+
+    # 6b) 写明文 Excel
+    log("call", "写入 Excel")
+    try:
+        excel_path = write_skill_results(results, stem=excel_stem)
+    except Exception as e:
+        return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": summary_raw}
+    log("result", f"完成 · {excel_path.name}")
+
+    fr = scan_summary(summary_raw)
+    summary_clean = summary_raw if fr.clean else "已生成分析,详见 Excel(summary 命中明文规则已隐去)。"
+    return {
+        "status": "done", "summary": summary_clean,
+        "excel_path": str(excel_path),
+        "skill_calls": ["codegen"], "error": "",
+    }
+
+
 def ask(
     *,
     user_query: str,
@@ -368,6 +515,9 @@ def ask(
     history: Optional[list[dict]] = None,
     text_attachments: Optional[list[dict]] = None,
     prompt_decrypt: Optional[Callable[[], str]] = None,
+    custom_block: str = "",
+    output_mode: str = "interactive",
+    run_id: str = "",
 ) -> dict:
     """
     跑一次完整分析。返回:
@@ -447,6 +597,34 @@ def ask(
     metadata_rows, metadata_columns = load_metadata(cipher_path)
     if metadata_rows:
         log("think", f"加载身份列 sidecar · {len(metadata_rows)} 行 · 列: {', '.join(metadata_columns[:6])}")
+
+    excel_stem = derive_excel_stem(cipher_path, user_query)
+
+    # ───────────────────────────────────────────────────────────
+    # 主路径:代码生成(LLM 读 SKILL.md 写代码 → 安全执行)
+    # 任一环节失败返回 None → 自动回退到下面的固化 skill 路径
+    # ───────────────────────────────────────────────────────────
+    try:
+        cg = _run_codegen_path(
+            effective_query=effective_query, cipher_path=cipher_path,
+            schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+            host_url=host_url, token=token, history=history,
+            custom_block=custom_block, excel_stem=excel_stem,
+            log=log, chk=chk, prompt_decrypt=prompt_decrypt,
+            output_mode=output_mode, run_id=run_id,
+        )
+    except CancelledError:
+        log("error", "已停止 · 用户取消")
+        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
+    except PermissionError:
+        return {"status": "failed", "error": "登录已过期 · 请重新登录", "summary": ""}
+    except Exception as e:
+        log("error", f"代码生成路径异常:{e} · 回退固化 skill")
+        cg = None
+    if cg is not None:
+        return cg
+
+    log("think", "回退固化 skill 路径")
 
     # 3) 调 LLM 拿 plan
     log("call", "调用 LLM 生成 skill_calls 计划")
@@ -554,6 +732,22 @@ def ask(
                 "summary": summary_raw,
             }
 
+    # 定时密态模式(固化兜底也支持):结果加密暂存,不弹 B6-1
+    if output_mode == "encrypted_sandbox":
+        from client.webui import sched_results
+        log("call", "结果加密暂存(不解密)· 待批量解密")
+        try:
+            manifest = sched_results.persist_results_encrypted(results, run_id)
+        except Exception as e:
+            return {"status": "failed", "error": f"结果加密暂存失败: {e}", "summary": summary_raw}
+        log("result", f"已加密暂存 {len(manifest)} 张表 · 待你批量解密")
+        return {
+            "status": "encrypted_pending",
+            "summary": "密态计算已完成 · 结果已加密暂存(未解密)· 在「定时任务 → 待批运行」批量解密。",
+            "excel_path": "", "skill_calls": [r["skill"] for r in results], "error": "",
+            "encrypted_run": {"run_id": run_id, "manifest": manifest},
+        }
+
     # ──────────────────────────────────────────────
     # B6-1 解密展示授权:计算已在密态完成,问用户结果是否解密展示
     # 选项:decrypt(解密后写 Excel)/ keep_encrypted(导出密文文件)/ cancel
@@ -570,9 +764,6 @@ def ask(
 
     if decision == "cancel":
         return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [r["skill"] for r in results]}
-
-    # Excel 文件名 stem:<密文原名> + <用户问题关键词>(尽量贴近用户语境)
-    excel_stem = derive_excel_stem(cipher_path, user_query)
 
     if decision == "keep_encrypted":
         log("call", f"重新加密 {len(results)} 个 sheet · 数值列保持密文")

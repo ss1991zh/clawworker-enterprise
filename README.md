@@ -1,152 +1,132 @@
+<div align="center">
+
 # Clawworker Enterprise
 
-**多用户加密数据分析 Agent · LangGraph 实现**
+### 数据不出本机的 AI 数据分析助手 · 全程同态加密
 
-在用户本地用同态加密做数据分析,LLM 全程只见 schema 不见明文,结果以 Excel 交付。
-基于 zionskill 工具链(crypto_toolkit / pandaseal / henumpy / helearn / hetorch)+
-LangGraph 工作流,适合需要"数据不出本机"的合规场景(财务 / 销售 / 医疗 / 私域)。
+**让企业用自然语言分析敏感数据,明文永不离开本地,AI 只见字段不见数据。**
+
+销售 · 财务 · 库存 · 客户 · 人力 —— 问一句,出一份 Excel。
+
+</div>
 
 ---
 
-## 架构一览
+## 这是什么
+
+Clawworker Enterprise 是一套**面向企业的隐私计算数据分析平台**。员工像跟 ChatGPT 聊天一样提问("按大区算每位代表的回款率,导 Excel"),系统在**本机同态加密态**下完成计算,把结果以专业 Excel 交付 —— 整个过程:
+
+- 🔒 **明文不出本机** —— 数据上传即加密,计算在密文上跑,只有最后授权解密才在本地还原
+- 🤖 **AI 零数据上下文** —— 大模型只收到字段名(schema),看不到任何一行真实数据
+- 📊 **结果即交付** —— 多 sheet Excel,身份列 + 派生指标 + 图表,中文表头、百分比、档位涂色
+- ⏰ **可托管运行** —— 定时任务自动跑,数据放进文件夹就自动刷新,结果加密暂存待你批量解密
+
+适用于对**数据合规、隐私保护、内部管控**有要求的场景:财务核算、销售经营分析、客户洞察、库存优化、私域数据、医疗/金融等受监管行业。
+
+---
+
+## 核心能力
+
+| 能力 | 说明 |
+|---|---|
+| **自然语言分析** | 用大白话提问,AI 读字段 → 写代码 → 密态计算 → 出 Excel |
+| **同态加密计算** | crypto_toolkit + pandaseal + henumpy + helearn,密文上做分组/比率/统计/回归/聚类 |
+| **技能体系(Skill)** | SKILL.md 教学技能(AI 现写代码)+ 固化业务模板(回款率/RFM/账龄/ABC/同比环比/预测...)双层,可拖拽扩展 |
+| **解密授权门** | 计算在密态完成后,弹窗确认是否解密展示;拒绝则导出密文版 Excel |
+| **定时任务** | 每天/每周/每月/自定义(大白话排程),绑定文件夹自动取最新数据,密态结果累积后批量解密到文件夹 |
+| **文档理解** | 附 TXT/Word/PDF 等明文文档作上下文(如"按这份办法里的口径算提成") |
+| **企业管控** | Admin 后台:账户/证书签发吊销、多 LLM 配置、按模型/用户/日/月的用量与成本统计 |
+
+---
+
+## 为什么是同态加密
+
+传统"脱敏 / 上云分析"要么损失精度,要么仍把数据交给第三方。Clawworker 用**全同态加密(FHE)**:
 
 ```
-mac 主机(控制面)               用户客户端(数据面 + 执行)
-─────────────────────         ─────────────────────────
- 证书管理                       密钥导入(本地隔离)
- 用户管理(双因子)              本地存储(密文 + Excel)
- LLM 代理                       Skill 工作流(LangGraph)
- 任务分发                       工具集(加密层 + 计算层)
-                                Excel 输出(产品级渲染)
-                                B6 权限护栏(授权/路径/过滤)
+明文数据  ──加密──▶  密文  ──密态计算(加减乘除/聚合/ML)──▶  密文结果  ──授权后本地解密──▶  Excel
+   │                                                                              
+   └─ 始终在用户本机,密钥(sk/evk)永不出本机,大模型全程只见 schema             
 ```
 
-完整架构、模块边界、6 个场景路由、双通道数据流、产品级渲染规格,
-全部见 [`docs/architecture.md`](docs/architecture.md)。
+- **AI 提供"怎么算",不接触"算什么"** —— 大模型生成分析代码 / 选择技能,数据始终是密文
+- **密钥本地沙盒** —— sk/evk 存 `~/.agent-system/` 沙盒(0600 权限),证书由企业 Admin 统一签发、可吊销
+- **三道安全护栏** —— 解密前授权 · 输出路径白名单 · AI 回复零明文过滤
+
+---
+
+## 架构
+
+```
+┌─ 主机端 (Host · 控制面) ────────┐     ┌─ 客户端 (Client · 数据面 + 执行) ──────┐
+│  • 账户 / 证书签发吊销           │     │  • 同态密钥本地沙盒(sk/evk 不出本机)   │
+│  • 多 LLM 配置 + 用量统计        │◀───▶│  • 密文文件管理 + 自动加密入库          │
+│  • LLM 代理(只转发,不存数据)  │     │  • Skill 引擎:代码生成 + 安全执行      │
+│  • Admin Web UI                 │     │  • 定时任务调度 + 文件夹监控            │
+│         :8443                   │     │  • 多 sheet Excel 产品级渲染           │
+└─────────────────────────────────┘     │         :8444                          │
+                                         └────────────────────────────────────────┘
+        ↑ 只传 schema + 用户意图,密钥与明文始终留在客户端本机 ↑
+```
+
+**两进程 + 双面分离**:主机端负责治理(谁能用、用哪个模型、花了多少),客户端负责数据(加密、计算、解密、出表)。LLM 代理在主机端中转,但任何一行真实数据都不会经过它。
+
+---
+
+## 技术栈
+
+- **隐私计算**:crypto_toolkit(加解密)· pandaseal(密态 DataFrame)· henumpy(密态数值)· helearn(密态机器学习)
+- **AI 编排**:代码生成 + AST 安全扫描 + 受限沙盒执行;固化技能兜底;LLM 回环自修复
+- **后端**:Python 3.11 · FastAPI · 多 LLM(OpenRouter / OpenAI / Anthropic / 国内兼容)
+- **前端**:原生 JS 单页(ChatGPT 风格)· Jinja2 Admin · openpyxl Excel 渲染
+- **调度**:croniter · 文件夹监控 · 自然语言排程解析
+
+---
+
+## 安全与合规
+
+| 维度 | 设计 |
+|---|---|
+| 数据驻留 | 明文与密钥**永不出本机**;LLM 只见字段 schema |
+| 密钥保护 | sk/evk 存本地沙盒,0700 目录 / 0600 文件,路径越权防御 |
+| 授权链路 | 证书由企业 Admin 签发,可吊销;吊销后客户端初始化即失败 |
+| 解密管控 | 每次解密需用户显式授权(B6-1);可选"保留密文"导出 |
+| 代码执行 | AI 生成代码经 AST 安全扫描(禁文件/网络/危险调用)+ 受限命名空间执行 |
+| 输出约束 | Excel 仅写 `~/Downloads/` 白名单;AI 回复经零明文过滤 |
+| 审计 | 用量按模型/用户/日/月统计;定时任务运行历史可查 |
 
 ---
 
 ## 快速开始
 
-### 1. 环境
-
 ```bash
-python --version  # 需要 3.11+
-cd clawworker-enterprise
-python -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"      # 客户端 + 开发依赖
-pip install -e ".[host]"     # 如需运行主机
+# 1. 环境(Python 3.11+)
+python -m venv .venv && source .venv/bin/activate
+pip install -e ".[dev]" ".[host]"
+
+# 2. 接入同态加密工具链(crypto_toolkit / pandaseal / henumpy / helearn)
+#    详见 PROVIDE_ME.md;把企业签发的 sk / evk / user_authorization 放到约定位置
+
+# 3. 启动(两进程)
+AGENT_BACKEND=real uvicorn host.server:app   --host 0.0.0.0   --port 8443   # 主机端
+AGENT_BACKEND=real uvicorn client.webui:app  --host 127.0.0.1 --port 8444   # 客户端
 ```
 
-### 2. 接入真实 HE 工具链(zionskill)
+- **Admin 后台**:http://127.0.0.1:8443/admin —— 建账户、签发证书、配 LLM、看用量
+- **用户端**:http://127.0.0.1:8444 —— 登录、上传加密数据、提问、出 Excel、设定时任务
 
-四个 Python 包来自 zionskill 项目(本仓库未包含):
-
-```
-crypto_toolkit / henumpy / pandaseal / helearn  → pip install -e 各自的 dev 目录
-```
-
-并把外部平台签发的三类文件放到约定位置:
-
-| 文件 | 默认位置 |
-|------|----------|
-| `skf`(secret key) | `crypto_toolkit-64_dev/crypto_toolkit/file/skf` |
-| `dictf`(字典 / 计算密钥) | `henumpy-dev/henumpy/file/dictf` |
-| `user_authorization`(账户授权) | `henumpy-dev/henumpy/file/user_authorization` |
-
-详见 [`PROVIDE_ME.md`](PROVIDE_ME.md)。
-
-### 3. 跑测试
-
-```bash
-pytest                                    # 默认 stub backend(57 单元 + 5 集成 stub)
-AGENT_BACKEND=real pytest                 # real backend 集成测试(需密钥就位)
-OPENROUTER_API_KEY=xxx AGENT_BACKEND=real pytest  # 完整端到端(含真实 LLM)
-```
-
-### 4. 启动主机
-
-```bash
-MODEL_TYPE=openrouter \
-OPENROUTER_API_KEY=sk-or-v1-xxxxx \
-MODEL_NAME=deepseek/deepseek-v4-pro \
-uvicorn host.server:app --host 127.0.0.1 --port 8443
-```
-
-浏览器打开 `http://127.0.0.1:8443/docs` 看 admin / 登录 / chat 端点。
-
-### 5. 客户端 CLI
-
-```bash
-# 一次性:admin 导入授权 + 建账号(通过 REST 或 admin 脚本)
-curl -X POST http://127.0.0.1:8443/admin/authorization/import \
-  -d '{"username":"alice","path":"/path/to/user_authorization"}'
-
-curl -X POST http://127.0.0.1:8443/admin/account/create \
-  -d '{"username":"alice","password":"<set>"}'
-
-# 用户侧
-agent-client login --host http://127.0.0.1:8443
-AGENT_BACKEND=real agent-client ingest data.csv --meta data_meta.csv
-AGENT_BACKEND=real agent-client ask "对每一行计算 X / Y 的比率" \
-  --schema schema.json --data ~/.agent-system/ciphertexts/data_enc.csv
-```
-
-输出 Excel 写到 `~/Downloads/analysis_<timestamp>.xlsx`,含:
-- 顶部 KPI 卡(平均率 / 达标率 / TOP3 / BOTTOM3)
-- 100 行明细(中文表头 + 百分比 + 业务档位涂色)
-- 大区汇总 sheet(按销售大区聚合)
-- TOP10 / BOTTOM10 排行榜(柱状图按大区色板染色)
+测试:`pytest`(stub 后端)· `AGENT_BACKEND=real pytest`(真实加密)
 
 ---
 
-## 目录结构
+## 文档
 
-```
-clawworker-enterprise/
-├── client/                  # 用户客户端(数据面)
-│   ├── skill_workflow.py    # LangGraph 工作流(整套系统的执行核心)
-│   ├── tools/               # 工具集 wrapper(stub + real 双 backend)
-│   │   ├── crypto.py        # CryptoToolkit(zfhe 加解密)
-│   │   ├── pandaseal.py     # 表格分析(group_by/sum/mean/div/...)
-│   │   ├── henumpy.py       # 数值矩阵
-│   │   ├── helearn.py       # 经典 ML
-│   │   ├── hetorch.py       # DL 推理(stub,待 hetorch2 包)
-│   │   └── runtime.py       # initSK + initDict 一次性管理
-│   ├── excel_output.py      # 产品级 Excel 渲染(KPI/染色/分层 X)
-│   ├── permissions.py       # B6 三条规则
-│   ├── keystore.py          # sk + evk + user_authorization 本地隔离
-│   └── main.py              # Typer CLI
-├── host/                    # mac 主机(控制面)
-│   ├── cert_manager.py      # 用户授权管理(原证书)
-│   ├── user_manager.py      # 账户 + 密码 + 会话
-│   ├── llm_proxy.py         # Anthropic / OpenRouter / OpenAI 兼容
-│   └── server.py            # FastAPI 端点
-├── shared/                  # 主机 + 客户端共用契约
-│   ├── contract.py          # ComputationPlan / LLMResponse / AgentState
-│   └── prompts.py           # 加载 LLM 系统 prompt
-├── tests/                   # 单元 / 集成 / 端到端
-└── docs/
-    ├── architecture.md      # 完整架构(必读)
-    ├── llm_system_prompt.md # LLM 系统 prompt(权威来源)
-    └── test_plan.md         # 测试设计与运行指南
-```
-
----
-
-## 设计哲学
-
-1. **数据不出本机** — 明文数据从加密入库到 Excel 解密渲染,全程在用户本地
-2. **LLM 零明文上下文** — 只发 schema + 用户意图,不发任何数据行
-3. **B6 三条客户端硬规则** —
-   解密前用户授权 / Excel 路径白名单(`~/Downloads/`)/ LLM 回答内容过滤(零明文)
-4. **拒绝授权不等于失败** — 仍产出 Excel,数据为序列化密文,持有密钥者后续可解
-5. **双通道数据流** — 明文标识列(姓名/大区/...)与加密数值列并行,renderer 按行号合并
-6. **产品级输出** — 中文化 / 百分比格式 / 业务档位涂色 / KPI 卡 / 大区色板 / 多 sheet
+- [`docs/architecture.md`](docs/architecture.md) —— 完整架构、模块边界、数据流
+- [`docs/llm_system_prompt.md`](docs/llm_system_prompt.md) —— AI 系统 prompt(技能与契约)
+- [`PROVIDE_ME.md`](PROVIDE_ME.md) —— 接入真实同态加密工具链清单
 
 ---
 
 ## License
 
-MIT(代码) · 但 zionskill 工具链与同态加密库另有授权,见各包内 LICENSE。
+应用层代码 MIT。同态加密工具链(crypto_toolkit / pandaseal / henumpy / helearn)及内置技能文档另有授权,见各自 LICENSE。

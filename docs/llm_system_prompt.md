@@ -68,6 +68,30 @@
 
   ⚠ compute 列表按顺序执行,后面的可以引用前面新增的派生列(链式)。
 
+★ yoy_mom —— 同比(YoY)/ 环比(MoM)增长分析
+  适用:月度/年度销售额增长、增长率
+  params: { time_col, value_col, group_col?, mode?("mom"/"yoy"/"both"), agg?, sheet_name? }
+
+★ budget_variance —— 预算 vs 实际 差异分析
+  适用:预算执行、超支/节约
+  params: { budget_col, actual_col, group_col?, favorable?("higher"/"lower"), sheet_name? }
+
+★ rfm_segment —— RFM 客户分群
+  适用:按最近/频次/金额给客户分群(重要价值/挽留/流失等)
+  params: { customer_col, recency_col, frequency_col, monetary_col, sheet_name? }
+
+★ ar_aging —— 应收账款账龄分析
+  适用:账款按逾期天数分桶 + 逾期占比
+  params: { amount_col, age_col, group_col?, bins?, sheet_name? }
+
+★ pareto_abc —— 帕累托(80/20)/ ABC 分类
+  适用:物料/客户/产品按金额累计占比分 A/B/C
+  params: { label_col, value_col, a_cut?, b_cut?, sheet_name? }
+
+★ pivot_summary —— 多维交叉透视
+  适用:大区×产品线 等任意两维交叉汇总
+  params: { row_col, col_col?, value_col, agg?, sheet_name? }
+
 ★ forecast_linreg —— 时间序列预测(HE 线性回归)
   适用:按月销售预测、未来 N 期销售额 / 用量 / 库存 趋势
   内部三段管线:pandas 清洗 → henumpy 加密数组 → helearn LinearRegression
