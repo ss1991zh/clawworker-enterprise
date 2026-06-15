@@ -17,11 +17,21 @@ from typing import Any, Optional
 
 
 # 路径白名单(B6 §2)
-def make_excel_path(stem: Optional[str] = None) -> Path:
-    """生成 ~/Downloads/<stem>_<ts>.xlsx 路径,stem 不传默认 "analysis"。"""
+# 交互式输出暂存目录:Excel 先写这里(不自动落 Downloads),用户点「下载」才存到 Downloads
+OUTPUTS_DIR = Path.home() / ".agent-system" / "outputs"
+
+
+def make_excel_path(stem: Optional[str] = None, staging: bool = False) -> Path:
+    """
+    生成 Excel 落盘路径。
+    staging=False(默认):~/Downloads/<stem>_<ts>.xlsx(批量解密到文件夹等显式产出)。
+    staging=True:~/.agent-system/outputs/<stem>_<ts>.xlsx(交互式生成,不自动进 Downloads,
+                 用户点「下载」时再由浏览器存到 Downloads)。
+    """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_stem = (stem or "analysis").strip("_") or "analysis"
-    return Path.home() / "Downloads" / f"{safe_stem}_{ts}.xlsx"
+    base = OUTPUTS_DIR if staging else (Path.home() / "Downloads")
+    return base / f"{safe_stem}_{ts}.xlsx"
 
 
 # ----------------------------------------------------------------------------
@@ -93,14 +103,15 @@ def derive_excel_stem(cipher_path: Optional[Path], user_query: str) -> str:
 
 
 def enforce_excel_path(path: Path) -> Path:
-    """B6 §2:Excel 输出强制 ~/Downloads/。"""
+    """B6 §2:Excel 输出强制在白名单目录(~/Downloads/ 或暂存 ~/.agent-system/outputs/)。"""
     resolved = path.expanduser().resolve()
-    downloads = (Path.home() / "Downloads").resolve()
-    try:
-        resolved.relative_to(downloads)
-    except ValueError:
-        raise PermissionError(f"Excel 输出路径不在白名单内:{resolved} 不在 {downloads}/ 下")
-    return resolved
+    for r in [(Path.home() / "Downloads").resolve(), OUTPUTS_DIR.resolve()]:
+        try:
+            resolved.relative_to(r)
+            return resolved
+        except ValueError:
+            continue
+    raise PermissionError(f"Excel 输出路径不在白名单内:{resolved}")
 
 
 # ----------------------------------------------------------------------------
@@ -225,9 +236,11 @@ def write_skill_results(
     results: list[dict],
     path: Optional[Path] = None,
     stem: Optional[str] = None,
+    staging: bool = False,
 ) -> Path:
     """
     把 [{sheet_name, df, ...}] 列表写成产品级多 sheet xlsx。
+    staging=True:写到暂存目录(不自动进 Downloads,供交互式「点下载才保存」)。
 
     每个 result dict 至少含 sheet_name + df,以下键全部可选(声明即美化):
         chart:          {"type":"bar"|"line","x":..,"y":..|[..],"title":..}
@@ -241,7 +254,7 @@ def write_skill_results(
     """
     import openpyxl
 
-    dst = enforce_excel_path(path or make_excel_path(stem))
+    dst = enforce_excel_path(path or make_excel_path(stem, staging=staging))
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     wb = openpyxl.Workbook()
@@ -557,6 +570,7 @@ def export_skill_results_encrypted(
     cipher_path: Path,
     note: str = "",
     stem: Optional[str] = None,
+    staging: bool = False,
 ) -> Path:
     """
     用户选择「保留密文」时的输出 —— 与解密版同结构,但数值列再加密:
@@ -577,7 +591,7 @@ def export_skill_results_encrypted(
     Runtime.get().ensure_all_initialized()
     import crypto_toolkit as ct  # noqa: F401
 
-    dst = enforce_excel_path(make_excel_path(stem))
+    dst = enforce_excel_path(make_excel_path(stem, staging=staging))
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     wb = openpyxl.Workbook()

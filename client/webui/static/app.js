@@ -73,6 +73,43 @@ function mdToHtml(src) {
   return html;
 }
 
+// 文件卡图标:明文(文档)/ 密文(锁)
+const FILE_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="8" y1="13" x2="16" y2="13"/><line x1="8" y1="17" x2="16" y2="17"/></svg>';
+const LOCK_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>';
+
+// 单个文件卡:仅右侧「下载」按钮触发下载(不自动下载,需手动点击)
+function oneFileCard(path, name, kind) {
+  const dl = `/api/excel/download?path=${encodeURIComponent(path)}`;
+  const icon = kind === "cipher" ? LOCK_ICON_SVG : FILE_ICON_SVG;
+  const hint = kind === "cipher" ? "加密文件 · 数值列为密文" : "Excel 输出 · 明文";
+  return `
+    <div class="file-card" data-path="${esc(path)}" data-name="${esc(name)}" data-kind="${kind}">
+      <div class="fc-ic ${kind}">${icon}</div>
+      <div class="fc-body">
+        <div class="fc-nm">${esc(name)}</div>
+        <div class="fc-hint">${hint}</div>
+      </div>
+      <a class="fc-btn" href="${dl}" download="${esc(name)}">⬇ 下载</a>
+    </div>`;
+}
+
+// 一条 assistant 消息的文件区:加密卡在前、解密卡在后;保留密文未解密时给「解密」按钮
+function fileCardsHtml(m, willType) {
+  const cards = [];
+  if (m.enc_excel_path && m.enc_excel_name) cards.push(oneFileCard(m.enc_excel_path, m.enc_excel_name, "cipher"));
+  if (m.excel_path && m.excel_name) cards.push(oneFileCard(m.excel_path, m.excel_name, "plain"));
+  let decBtn = "";
+  if (m.enc_excel_path && m.can_decrypt && !m.excel_path) {
+    decBtn = `<button class="dec-file-btn" data-mid="${esc(m.id)}">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" class="dec-ic"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 9.9-1"/></svg>
+      <span>解密查看明文</span>
+    </button>`;
+  }
+  if (!cards.length && !decBtn) return "";
+  const hidden = willType ? ' data-defer-reveal="1"' : '';
+  return `<div class="file-cards"${hidden}>${cards.join("")}${decBtn}</div>`;
+}
+
 const ICON_SVG = {
   doc: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
   warn: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
@@ -354,27 +391,7 @@ function renderMessage(m) {
       } else {
         content += `<div class="bubble md">${mdToHtml(m.summary || "(无总结)")}</div>`;
       }
-      if (m.excel_path && m.excel_name) {
-        const dlUrl = `/api/excel/download?path=${encodeURIComponent(m.excel_path)}`;
-        // 如果要打字机,先隐藏附件卡 —— 打字完才浮现;不打字直接显示
-        const hiddenAttr = willType ? ' data-defer-reveal="1"' : '';
-        content += `
-          <a class="file-card"${hiddenAttr} href="${dlUrl}" download="${esc(m.excel_name)}">
-            <div class="fc-ic">
-              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                <polyline points="14 2 14 8 20 8"/>
-                <line x1="8" y1="13" x2="16" y2="13"/>
-                <line x1="8" y1="17" x2="16" y2="17"/>
-              </svg>
-            </div>
-            <div class="fc-body">
-              <div class="fc-nm">${esc(m.excel_name)}</div>
-              <div class="fc-hint">Excel 输出 · 点击下载</div>
-            </div>
-            <div class="fc-btn">⬇ 下载</div>
-          </a>`;
-      }
+      content += fileCardsHtml(m, willType);
     }
   }
   content += `</div>`;
@@ -400,6 +417,29 @@ function renderMessage(m) {
       } catch (e) {
         alert("提交选择失败:" + e.message);
         card.querySelectorAll(".dc-btn").forEach(x => x.disabled = false);
+      }
+    });
+  });
+
+  // 「保留密文」后的「解密查看明文」按钮 → 事后解密,显示明文文件卡
+  wrap.querySelectorAll(".dec-file-btn").forEach(b => {
+    b.addEventListener("click", async () => {
+      const fmid = b.dataset.mid;
+      if (!fmid) return;
+      const orig = b.innerHTML;
+      b.disabled = true; b.textContent = "解密中…";
+      try {
+        const r = await api("POST", `/api/sessions/${state.currentSid}/messages/${fmid}/decrypt_file`);
+        // 回填到本地消息对象 → 重渲该条(密文卡 + 明文卡并列)
+        const msg = state.currentSession?.messages?.find(x => x.id === fmid);
+        if (msg) {
+          msg.excel_path = r.excel_path; msg.excel_name = r.excel_name; msg.can_decrypt = false;
+          const node = document.querySelector(`.msg[data-mid="${fmid}"]`);
+          if (node) { state.typedMids.add(fmid); node.replaceWith(renderMessage(msg)); }
+        }
+      } catch (e) {
+        alert("解密失败:" + e.message);
+        b.disabled = false; b.innerHTML = orig;
       }
     });
   });

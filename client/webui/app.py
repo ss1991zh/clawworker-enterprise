@@ -947,6 +947,29 @@ async def api_decrypt_decision(sid: str, mid: str, request: Request):
     return {"ok": True, "choice": choice}
 
 
+@app.post("/api/sessions/{sid}/messages/{mid}/decrypt_file")
+def api_decrypt_file(sid: str, mid: str):
+    """「保留密文」后用户点「解密」:把加密暂存的结果解出明文 Excel,回填到该消息。"""
+    if not _is_logged_in():
+        return _need_login()
+    sess = _sess_for_user(sid)
+    msg = next((m for m in sess.messages if m.id == mid), None)
+    if not msg:
+        raise HTTPException(404, "消息不存在")
+    if msg.excel_path:
+        # 已解密过 → 幂等返回
+        return {"ok": True, "excel_path": msg.excel_path, "excel_name": msg.excel_name}
+    if not (msg.can_decrypt and msg.dec_run_id):
+        raise HTTPException(400, "该结果不支持事后解密(无加密暂存)")
+    try:
+        from client.webui import sched_results
+        dec_path = sched_results.decrypt_persisted_run_to_excel(msg.dec_run_id, msg.dec_stem or "analysis")
+    except Exception as e:
+        raise HTTPException(500, f"解密失败:{type(e).__name__}: {e}")
+    _sessions.update_message(sid, mid, excel_path=str(dec_path), excel_name=dec_path.name)
+    return {"ok": True, "excel_path": str(dec_path), "excel_name": dec_path.name}
+
+
 def _run_pipeline(
     sid: str, asst_mid: str, user_query: str, attached_cipher: str,
     history: list[dict[str, str]],
@@ -1101,11 +1124,17 @@ def _run_pipeline(
         return
 
     excel_path = result.get("excel_path", "")
+    enc_path = result.get("enc_excel_path", "")
     _sessions.update_message(
         sid, asst_mid, status="done",
         summary=result.get("summary", ""),
         excel_path=excel_path,
-        excel_name=Path(excel_path).name if excel_path else "",
+        excel_name=result.get("excel_name") or (Path(excel_path).name if excel_path else ""),
+        enc_excel_path=enc_path,
+        enc_excel_name=result.get("enc_excel_name") or (Path(enc_path).name if enc_path else ""),
+        can_decrypt=bool(result.get("can_decrypt")),
+        dec_run_id=result.get("dec_run_id", ""),
+        dec_stem=result.get("dec_stem", ""),
         skill_calls=result.get("skill_calls", []),
         used_cipher=used_cipher,
         duration_sec=round(time.time() - t0, 2),
@@ -1499,3 +1528,5 @@ def api_excel_download(path: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         filename=p.name,
     )
+
+

@@ -30,8 +30,13 @@ class Message:
     text_attachment_names: list[str] = field(default_factory=list)
     # assistant-only:
     summary: str = ""
-    excel_path: str = ""
+    excel_path: str = ""            # 明文 Excel(decrypt 时;或事后解密后)
     excel_name: str = ""
+    enc_excel_path: str = ""        # 密文 Excel(加密版)
+    enc_excel_name: str = ""
+    can_decrypt: bool = False       # 保留密文场景:可点「解密」事后解出明文
+    dec_run_id: str = ""            # 事后解密用的加密暂存 run_id(沙盒)
+    dec_stem: str = ""              # 事后解密输出文件名 stem
     error: str = ""
     skill_calls: list[str] = field(default_factory=list)   # 跑了哪些 skill 名
     steps: list[dict[str, Any]] = field(default_factory=list)
@@ -54,6 +59,11 @@ class Message:
             summary=d.get("summary", ""),
             excel_path=d.get("excel_path", ""),
             excel_name=d.get("excel_name", ""),
+            enc_excel_path=d.get("enc_excel_path", ""),
+            enc_excel_name=d.get("enc_excel_name", ""),
+            can_decrypt=bool(d.get("can_decrypt", False)),
+            dec_run_id=d.get("dec_run_id", ""),
+            dec_stem=d.get("dec_stem", ""),
             error=d.get("error", ""),
             skill_calls=list(d.get("skill_calls", []) or []),
             steps=list(d.get("steps", []) or []),

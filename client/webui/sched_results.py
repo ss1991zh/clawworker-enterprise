@@ -93,6 +93,35 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
     return manifest
 
 
+def decrypt_persisted_run_to_excel(run_id: str, stem: str = "analysis"):
+    """
+    把一次加密暂存的结果(run_id 沙盒)解密为单个明文 Excel,返回落盘路径(~/Downloads)。
+    用于交互式「保留密文」后,用户点「解密」按钮事后解出明文。复用产品级渲染器。
+    """
+    from client.webui.writer import write_skill_results, make_excel_path
+
+    run_dir = ENC_RESULTS_DIR / run_id
+    mf = run_dir / "manifest.json"
+    if not mf.exists():
+        raise FileNotFoundError(f"加密暂存已不存在(run_id={run_id}),无法解密")
+    manifest = json.loads(mf.read_text(encoding="utf-8"))
+    sheets: list[dict] = []
+    for entry in manifest:
+        df = _decrypt_one_sheet(entry)
+        if df is None or getattr(df, "empty", True):
+            continue
+        item = {"sheet_name": str(entry.get("sheet_name") or "结果")[:31], "df": df}
+        for k in ("chart", "charts", "tier_col", "total_row", "note", "number_formats"):
+            v = entry.get(k)
+            if v:
+                item[k] = v
+        sheets.append(item)
+    if not sheets:
+        raise ValueError("暂存结果为空,无法解密")
+    # 交互式事后解密 → 写暂存目录(不自动落 Downloads,用户点「下载」才存)
+    return write_skill_results(sheets, path=make_excel_path(stem, staging=True))
+
+
 def _decrypt_one_sheet(entry: dict):
     """按 manifest 单条还原一张明文 df。"""
     import pandas as pd

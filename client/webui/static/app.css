@@ -58,6 +58,11 @@ button { font-family: inherit; }
   display: grid; place-items: center; color: #fff;
   font-weight: 700; font-size: 17px;
 }
+/* 图片版 logo:填满 logo 方框,去掉文字版的渐变底 */
+img.logo-img {
+  display: block; object-fit: cover; background: none;
+  font-size: 0;  /* 抑制 alt 文本占位 */
+}
 .sidebar__head h1 { font-size: 15px; font-weight: 600; }
 .sidebar__head p { font-size: 11px; color: var(--text-muted); }
 
@@ -123,9 +128,11 @@ button { font-family: inherit; }
 }
 .user-chip {
   flex: 1;
+  height: 40px;                 /* 与设置按钮等高 */
+  line-height: 40px;            /* 单行文本垂直居中(保留省略号截断)*/
   background: var(--blue-light);
   color: var(--blue);
-  padding: 8px 12px;
+  padding: 0 12px;
   border-radius: 10px;
   font-size: 13px;
   font-weight: 600;
@@ -313,15 +320,21 @@ main {
 .msg.bot + .msg.user { margin-top: 26px; }
 
 /* 文件卡片(Excel 下载) */
+/* 文件区:可放 1~2 个文件卡(密文/明文)+ 解密按钮,自动换行 */
+.file-cards { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; align-items: stretch; }
+
 .file-card {
   display: inline-flex; align-items: center; gap: 12px;
-  margin: 10px 0; padding: 10px 14px; max-width: 100%;
+  padding: 10px 14px; max-width: 100%;
   background: var(--blue-light); border: 1px solid var(--blue-ring);
   border-radius: 12px; color: var(--text); text-decoration: none;
   transition: background 0.15s;
-  cursor: pointer;
 }
 .file-card:hover { background: #dbeafe; }
+/* 密文卡:与「是否解密」授权卡同款琥珀黄系(带锁) */
+.file-card[data-kind="cipher"] { background: #fff7ed; border-color: #fed7aa; }
+.file-card[data-kind="cipher"]:hover { background: #ffedd5; border-color: #fdba74; }
+.file-card .fc-ic.cipher { color: #b45309; }
 .file-card .fc-ic {
   width: 38px; height: 38px; border-radius: 9px; flex-shrink: 0;
   background: #fff; color: var(--blue);
@@ -337,8 +350,23 @@ main {
 .file-card .fc-btn {
   margin-left: 6px; padding: 6px 12px; border-radius: 8px;
   background: var(--blue); color: #fff; font-size: 12.5px; font-weight: 600;
-  flex-shrink: 0;
+  flex-shrink: 0; text-decoration: none; cursor: pointer; white-space: nowrap;
 }
+.file-card .fc-btn:hover { background: var(--blue-dark); }
+.file-card[data-kind="cipher"] .fc-btn { background: #d97706; }
+.file-card[data-kind="cipher"] .fc-btn:hover { background: #b45309; }
+/* 「解密查看明文」按钮 —— 与文件卡等高(stretch),扁平图标 + 文字居中 */
+.dec-file-btn {
+  align-self: stretch;                 /* 高度与同行文件卡一致 */
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 0 16px; border-radius: 12px;
+  border: 1px dashed var(--blue-ring); background: var(--blue-light);
+  color: var(--blue); font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: all 0.15s; white-space: nowrap;
+}
+.dec-file-btn:hover { background: #dbeafe; border-style: solid; }
+.dec-file-btn:disabled { opacity: 0.6; cursor: default; }
+.dec-file-btn .dec-ic { width: 17px; height: 17px; flex-shrink: 0; }
 
 /* Running pill */
 .run-pill {
@@ -1042,3 +1070,4 @@ body.login-body {
   .modal__nav h3 { display: none; }
   .tab-btn { white-space: nowrap; }
 }
+

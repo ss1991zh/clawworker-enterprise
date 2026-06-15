@@ -531,6 +531,55 @@ def _results_look_truncated(results: list, n_src: int, query: str,
     return max_rows if max_rows < need else 0
 
 
+def _build_done_files(decision, results, cipher_path, excel_stem, skill_calls, clean_summary, log):
+    """
+    计算完成 → 按 decision 产出下载文件(status=done 结果片段):
+      · decrypt        —— 同时产出 明文 Excel + 密文 Excel,前端两个并列下载
+      · keep_encrypted —— 产出 密文 Excel + 把结果加密暂存沙盒(供前端「解密」按钮事后解出明文)
+    任一写文件失败 → status=failed。
+    """
+    import secrets as _secrets
+    try:
+        # 密文文件加 _密文 后缀 —— 否则与明文同 stem+同秒时间戳会重名互相覆盖。
+        # staging=True:写到沙盒暂存目录,不自动落 Downloads(用户点「下载」才存)。
+        enc_path = export_skill_results_encrypted(results, cipher_path, stem=f"{excel_stem}_密文", staging=True)
+    except Exception as e:
+        return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": clean_summary}
+
+    if decision == "keep_encrypted":
+        # 结果加密暂存 → 供「解密」按钮事后解出明文(明文不落盘,直到用户点解密)
+        dec_run_id = _secrets.token_hex(8)
+        try:
+            from client.webui import sched_results
+            sched_results.persist_results_encrypted(results, dec_run_id)
+        except Exception:
+            dec_run_id = ""   # 暂存失败 → 不提供事后解密,但密文文件仍可下载
+        log("result", f"完成 · {enc_path.name}(保留密文)")
+        return {
+            "status": "done",
+            "summary": clean_summary + " · 已生成密文版 Excel;如需明文结果,点文件旁「解密」即可。",
+            "excel_path": "", "excel_name": "",
+            "enc_excel_path": str(enc_path), "enc_excel_name": enc_path.name,
+            "can_decrypt": bool(dec_run_id), "dec_run_id": dec_run_id, "dec_stem": excel_stem,
+            "skill_calls": skill_calls, "error": "",
+        }
+
+    # decrypt:明文 + 密文 两个文件,用户自由选择下载哪个(均写暂存,不自动落 Downloads)
+    try:
+        dec_path = write_skill_results(results, stem=excel_stem, staging=True)
+    except Exception as e:
+        return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": clean_summary}
+    log("result", f"完成 · 明文 {dec_path.name} + 密文 {enc_path.name}")
+    return {
+        "status": "done",
+        "summary": clean_summary,
+        "excel_path": str(dec_path), "excel_name": dec_path.name,
+        "enc_excel_path": str(enc_path), "enc_excel_name": enc_path.name,
+        "can_decrypt": False,
+        "skill_calls": skill_calls, "error": "",
+    }
+
+
 def _run_codegen_path(
     *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
     host_url, token, history, custom_block, excel_stem,
@@ -778,35 +827,12 @@ def _run_codegen_path(
     if decision == "cancel":
         return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
                 "excel_path": "", "skill_calls": ["codegen"]}
-    if decision == "keep_encrypted":
-        log("call", f"重新加密 {len(results)} 个 sheet · 数值列保持密文")
-        try:
-            excel_path = export_skill_results_encrypted(results, cipher_path, stem=excel_stem)
-        except Exception as e:
-            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
-        log("result", f"完成 · {excel_path.name}")
-        return {
-            "status": "done",
-            "summary": "已按要求保留密文展示 · 输出结构与解密版一致,数值列保持同态密文形式。"
-                       "若要明文结果请重新提问并选择「解密展示」。",
-            "excel_path": str(excel_path), "skill_calls": ["codegen"], "error": "",
-        }
 
-    # 6c) 写明文 Excel
-    log("call", "写入 Excel")
-    try:
-        excel_path = write_skill_results(results, stem=excel_stem)
-    except Exception as e:
-        return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": summary_raw}
-    log("result", f"完成 · {excel_path.name}")
-
+    # 6c) 产出下载文件(decrypt=明文+密文两个;keep_encrypted=密文+可事后解密)
     fr = scan_summary(summary_raw)
-    summary_clean = summary_raw if fr.clean else "已生成分析,详见 Excel(summary 命中明文规则已隐去)。"
-    return {
-        "status": "done", "summary": summary_clean,
-        "excel_path": str(excel_path),
-        "skill_calls": ["codegen"], "error": "",
-    }
+    clean = summary_raw if fr.clean else "已生成分析,详见 Excel(summary 命中明文规则已隐去)。"
+    log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
+    return _build_done_files(decision, results, cipher_path, excel_stem, ["codegen"], clean, log)
 
 
 def ask(
@@ -1085,44 +1111,9 @@ def ask(
     if decision == "cancel":
         return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [r["skill"] for r in results]}
 
-    if decision == "keep_encrypted":
-        log("call", f"重新加密 {len(results)} 个 sheet · 数值列保持密文")
-        try:
-            excel_path = export_skill_results_encrypted(
-                results, cipher_path, stem=excel_stem,
-            )
-        except Exception as e:
-            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
-        log("result", f"完成 · {excel_path.name}")
-        cipher_summary = (
-            f"密态计算已完成 · 已按要求**保留密文展示** · 共 {len(results)} 个 sheet。"
-            f"输出 Excel 与解密版结构一致(身份列 + 数值列),但数值列保持同态密文 (base64) 形式;"
-            f"「说明」sheet 列出了 skill → sheet 映射。若要查看明文结果请重新提问并选择「解密展示」。"
-        )
-        return {
-            "status": "done",
-            "summary": cipher_summary,
-            "excel_path": str(excel_path),
-            "skill_calls": [r["skill"] for r in results],
-            "error": "",
-        }
-
-    # 6) 写 Excel(decision == "decrypt" · 解密后正常输出)
-    log("call", "写入 Excel")
-    try:
-        excel_path = write_skill_results(results, stem=excel_stem)
-    except Exception as e:
-        return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": summary_raw}
-    log("result", f"完成 · {excel_path.name}")
-
-    # 7) summary B6-3 零明文过滤
+    # 6) 产出下载文件(decrypt=明文+密文两个;keep_encrypted=密文+可事后解密)· summary 零明文过滤
     fr = scan_summary(summary_raw)
-    summary_clean = summary_raw if fr.clean else "已生成多 sheet 分析,详见 Excel(模型 summary 命中明文规则,已隐去)。"
-
-    return {
-        "status": "done",
-        "summary": summary_clean,
-        "excel_path": str(excel_path),
-        "skill_calls": [sc.skill for sc in plan.skill_calls],
-        "error": "",
-    }
+    clean = summary_raw if fr.clean else "已生成多 sheet 分析,详见 Excel(模型 summary 命中明文规则,已隐去)。"
+    log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
+    return _build_done_files(decision, results, cipher_path, excel_stem,
+                             [r["skill"] for r in results], clean, log)
