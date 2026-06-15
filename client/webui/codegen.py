@@ -119,7 +119,7 @@ hp.initDict() / ct.initSK()(已初始化):
    `ct.decrypt(...)` **仅**用于 `ct.encrypt(...)` 出来的数值数组——把 CipherSeries 喂给
    `ct.decrypt` 会报 `Unable to decrypt data of CipherSeries type`。
    **最稳写法:开头就 `df = ct.decrypt_df(cdf)`,之后全程用 pandas/numpy 处理。**
-   首次解密会触发用户授权,是正常流程,直接调用即可。
+   解密在本机内存自动放行(计算完成后系统才向用户申请"解密展示"授权),直接调用即可。
 4. 身份列已自动拼好:`df = ct.decrypt_df(cdf)` 返回的就是**完整明文表**——
    身份列(姓名/大区/月份/物料名…)在前,数值列在后,可直接
    `df.groupby("销售大区")` / `df["销售月份"]`,**不要再手动 merge metadata_rows**
@@ -127,7 +127,13 @@ hp.initDict() / ct.initSK()(已初始化):
 5. 派生指标用 pandas/numpy 算(如 回款率 = 回款金额 / 实际销售额);比率列保留小数(渲染端转百分比)。
 6. 列名严格用 schema 里的字段名(含括号单位);字段缺失就在 summary 说明缺什么,别硬编造数。
 7. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性。
-8. **数值稳健(避免崩溃)**:任何拟合 / 回归 / 相关性 / 分位数前,先清洗——
+8. **全量处理铁律(每一行都是独立记录,永不合并行)**:
+   输出主表一律**逐行明细**:行数 = 数据行数,可排序、可加排名/档位/派生列。
+   "按大区 / 各产品线 / 汇总"指的是**排序方式**(先按该维度排、组内再按指标降序),
+   **不是 groupby 把行压缩合并**;需要聚合视角时,只能在逐行明细之外**另加**聚合 sheet。
+   禁止 head() / sample() / iloc 截断;只有用户明确要 TOP/前 N 或筛选
+   (如"找出异常/超期")才允许输出子集。数据多≠只算一部分。
+9. **数值稳健(避免崩溃)**:任何拟合 / 回归 / 相关性 / 分位数前,先清洗——
    `s = s[np.isfinite(s)]` 去掉 NaN/inf;除法防 0(分母 `.replace(0, np.nan)` 或先判);
    `np.polyfit`/`lstsq`/`corr` 的输入**绝不能含 NaN**(否则报 "SVD did not converge")。
    样本不足(<3 点)或数据为常数(`np.ptp(x)==0`)时跳过拟合、只给已有结果并在 summary 说明。
@@ -310,10 +316,15 @@ def _attach_identity(plain_df, cipher_arg, original_cdf, meta_df):
         add = [c for c in meta_df.columns if c not in plain_df.columns]
         if not add:
             return plain_df
-        return pd.concat(
+        merged = pd.concat(
             [meta_df[add].reset_index(drop=True), plain_df.reset_index(drop=True)],
             axis=1,
         )
+        # 源数据表尾自带的合计行(身份列几乎全空)不是真实记录 —— 进分析前剔除,
+        # 否则人数 +1、总和翻倍,输出再加合计就成双重合计
+        from client.tools.skills import drop_source_total_rows
+        merged, _ = drop_source_total_rows(merged)
+        return merged
     except Exception:
         return plain_df
 
@@ -509,7 +520,8 @@ def run_generated_code(
     final = sandbox_globals.get("results", results)
     if not isinstance(final, list):
         raise ValueError("生成代码没有产出 results 列表")
-    # 规整:只留 {sheet_name, df, chart}
+    # 规整:sheet_name + df 必填,呈现键(chart/charts/tier_col/total_row/note/
+    # number_formats)原样透传 —— 渲染端(writer)按声明美化,丢了就退化成裸表
     cleaned: list[dict] = []
     for r in final:
         if not isinstance(r, dict):
@@ -517,9 +529,14 @@ def run_generated_code(
         df = r.get("df")
         if df is None:
             continue
-        cleaned.append({
+        item = {
             "sheet_name": r.get("sheet_name") or "结果",
             "df": df,
             "chart": r.get("chart"),
-        })
+        }
+        for k in ("charts", "tier_col", "total_row", "note", "number_formats"):
+            v = r.get(k)
+            if v:
+                item[k] = v
+        cleaned.append(item)
     return cleaned

@@ -299,6 +299,18 @@ def _render_sheet(ws, df, r: dict) -> None:
 
     # 图表规格(chart + charts)+ split_by 预排序:同组行连续 → 可按组拆成多张图
     chart_specs = _collect_chart_specs(r)
+
+    # 兜底自动配图:没有任何有效图表提示(LLM 偶尔漏配)时,自动挑
+    # 文本主体列 × 指标列配一张;行多自动按低基数维度 split_by 拆图
+    def _spec_valid(s):
+        x = s.get("x")
+        y = s.get("y")
+        ys = [y] if isinstance(y, str) else list(y or [])
+        return x in df.columns and any(c in df.columns for c in ys)
+    if not any(_spec_valid(s) for s in chart_specs):
+        auto = _auto_chart_spec(df)
+        chart_specs = [auto] if auto else []
+
     split_col = next(
         (s.get("split_by") for s in chart_specs
          if s.get("split_by") and s.get("split_by") in df.columns),
@@ -737,6 +749,65 @@ def _render_charts(ws, df, specs: list, headers: list, header_row: int, n_cols: 
             anchor_row += 18   # 每张图竖直间隔约 18 行,互不遮挡
 
 
+# 图表里要剔除的"求和总数"行 —— x 轴类别出现这些词的行不画进图
+# (数据表里保留;只是不让一根"合计"柱把其余类别压扁)
+_CHART_TOTAL_KEYS = ("合计", "总计", "汇总", "累计", "总和", "total")
+
+# 自动配图时不当 y 的"序数列" / 不当 x 的"标识列"
+_AUTO_Y_SKIP = ("排名", "名次", "序号")
+_AUTO_X_SKIP = ("序号", "编号", "ID", "id", "备注", "说明")
+
+
+def _auto_chart_spec(df) -> Optional[dict]:
+    """
+    一张 sheet 没有任何有效图表提示时的兜底自动配图:
+      x = 基数最高的文本列(明细主体:销售代表/物料名称…,跳过序号/编号/备注)
+      y = 第一个指标数值列(跳过排名/序号)
+      行数 > 20 → 自动找低基数文本列(2~12 组,如销售大区)做 split_by 拆图
+    挑不出有意义的列(纯数值表/相关性矩阵等)→ 返回 None,不强行画。
+    """
+    import pandas as pd
+    try:
+        if df is None or len(df) == 0:
+            return None
+        num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        txt_cols = [c for c in df.columns if c not in num_cols]
+        y = next((c for c in num_cols
+                  if not any(k in str(c) for k in _AUTO_Y_SKIP)), None)
+        x_cands = [c for c in txt_cols
+                   if not any(k in str(c) for k in _AUTO_X_SKIP)]
+        if y is None or not x_cands:
+            return None
+        x = max(x_cands, key=lambda c: df[c].astype(str).nunique())
+        spec = {"type": "bar", "x": str(x), "y": str(y), "title": f"{y} · 概览"}
+        if len(df) > 20:
+            cand = [(c, df[c].astype(str).nunique()) for c in x_cands if c != x]
+            cand = [(c, n) for c, n in cand if 2 <= n <= 12]
+            if cand:
+                spec["split_by"] = str(min(cand, key=lambda t: t[1])[0])
+        return spec
+    except Exception:
+        return None
+
+
+def _is_total_label(v) -> bool:
+    s = str(v).strip().lower()
+    return bool(s) and any(k in s for k in _CHART_TOTAL_KEYS)
+
+
+def _trim_trailing_totals(df, x_name: str) -> int:
+    """返回剔除末尾「合计/总计…」行后的有效行数(合计行通常在表尾)。"""
+    n = len(df)
+    try:
+        if x_name in df.columns:
+            vals = df[x_name].astype(str).tolist()
+            while n > 0 and _is_total_label(vals[n - 1]):
+                n -= 1
+    except Exception:
+        pass
+    return n
+
+
 def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
     """一个 spec → 一张或多张 chart(有 split_by 时按组各一张)。"""
     typ = (spec.get("type") or "bar").lower()
@@ -765,12 +836,17 @@ def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
                 spans.append((col[start], start, j - 1))
                 start = j
         for gval, s, e in spans[:_MAX_SPLIT_CHARTS]:
+            if _is_total_label(gval):
+                continue  # 「合计」组不单独出图
             title = f"{gval} · {base_title}" if base_title else str(gval)
             charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
                                       data0 + s, data0 + e, title))
     else:
+        eff = _trim_trailing_totals(df, x)
+        if eff <= 0:
+            return []
         charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
-                                  data0, data0 + len(df) - 1, base_title))
+                                  data0, data0 + eff - 1, base_title))
     return charts
 
 

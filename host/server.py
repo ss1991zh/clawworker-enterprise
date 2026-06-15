@@ -227,6 +227,8 @@ class ChatRequest(BaseModel):
     user: str
     # 可选:同会话的近端历史(由客户端裁剪);后端会折叠到 user prompt 顶部
     history: list[ChatTurn] = []
+    # 可选:启用联网搜索(若该用户绑定的模型/服务支持;不支持自动降级为普通调用)
+    web_search: bool = False
 
 
 def _compose_user_with_history(history: list[ChatTurn], new_user: str) -> str:
@@ -279,7 +281,7 @@ def freechat(req: ChatRequest, sess=Depends(get_current_session)):
     provider, cfg = _resolve_user_provider(sess.username)
     user_msg = _compose_user_with_history(req.history, req.user)
     try:
-        text = provider.raw_chat(system=req.system, user=user_msg)
+        text = provider.raw_chat(system=req.system, user=user_msg, web_search=req.web_search)
     except Exception as e:
         call_stats.record(
             config=cfg, username=sess.username,

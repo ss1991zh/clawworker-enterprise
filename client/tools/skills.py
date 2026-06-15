@@ -26,8 +26,53 @@ from typing import Any, Callable, Optional
 # ---------------------------------------------------------------------------
 
 
+_SOURCE_TOTAL_KEYS = ("合计", "总计", "汇总", "累计", "总和", "total")
+
+
+def drop_source_total_rows(df):
+    """
+    剔除**源数据自带**的合计行,返回 (df, 剔除行数)。
+
+    业务 Excel 常在表尾带一行合计(身份列几乎全空、只有数值汇总,或写着"合计")。
+    它不是一条真实记录,混进分析会把人数 +1、总和翻倍、比率污染,
+    输出时系统/LLM 再加合计就成了双重合计。
+    只扫**表尾连续最多 3 行**,避免误删中间正常数据;判定条件(满足其一):
+      · 任一身份列值含 合计/总计/汇总/Total 字样
+      · 身份列非空数 ≤ 1(几乎全空)而数值列有值(且身份列 ≥ 2 个才启用此规则)
+    """
+    import pandas as pd
+    if df is None or len(df) == 0:
+        return df, 0
+    num_cols = df.select_dtypes(include="number").columns
+    id_cols = [c for c in df.columns if c not in num_cols]
+    if not id_cols:
+        return df, 0
+
+    def _is_total(row) -> bool:
+        vals = []
+        for c in id_cols:
+            v = row[c]
+            vals.append("" if pd.isna(v) else str(v).strip())
+        if any(any(k in v.lower() for k in _SOURCE_TOTAL_KEYS) for v in vals if v):
+            return True
+        nonempty = sum(1 for v in vals if v and v.lower() not in ("nan", "none"))
+        has_num = bool(len(num_cols)) and any(pd.notna(row[c]) for c in num_cols)
+        return len(id_cols) >= 2 and nonempty <= 1 and has_num
+
+    n = len(df)
+    drop_pos = []
+    for i in range(n - 1, max(-1, n - 4), -1):   # 表尾最多 3 行
+        if _is_total(df.iloc[i]):
+            drop_pos.append(i)
+        else:
+            break
+    if not drop_pos:
+        return df, 0
+    return df.drop(df.index[drop_pos]).reset_index(drop=True), len(drop_pos)
+
+
 def _merge_meta(decrypted_df, metadata_rows, metadata_columns):
-    """通用:把解密后的数字列横拼上 metadata 身份列。"""
+    """通用:把解密后的数字列横拼上 metadata 身份列(并剔除源数据自带的合计行)。"""
     import pandas as pd
     if metadata_rows and len(metadata_rows) == len(decrypted_df):
         meta_df = pd.DataFrame(metadata_rows)
@@ -36,11 +81,13 @@ def _merge_meta(decrypted_df, metadata_rows, metadata_columns):
             if keep:
                 meta_df = meta_df[keep]
         meta_keep = [c for c in meta_df.columns if c not in decrypted_df.columns]
-        return pd.concat(
+        merged = pd.concat(
             [meta_df[meta_keep].reset_index(drop=True),
              decrypted_df.reset_index(drop=True)],
             axis=1,
         )
+        merged, _ = drop_source_total_rows(merged)
+        return merged
     return decrypted_df.reset_index(drop=True)
 
 

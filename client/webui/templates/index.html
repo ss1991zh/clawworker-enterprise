@@ -89,6 +89,11 @@
           </button>
           <input type="file" id="fileInput" hidden multiple
                  accept=".csv,.xlsx,.xls,.txt,.md,.markdown,.rst,.log,.text,.docx,.pdf,.rtf,.html,.htm,.json,.yml,.yaml">
+          <button class="attach-btn" id="webSearchBtn" type="button" aria-pressed="false"
+                  title="联网搜索:遇到不知道的(天气、最新数据、计算口径等)让模型上网查;需所用模型支持">
+            <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                 stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          </button>
           <textarea id="input" rows="1" placeholder="问问看 · 回车发送 · Shift+回车换行" disabled></textarea>
           <button class="send" id="sendBtn" disabled>发送</button>
         </div>

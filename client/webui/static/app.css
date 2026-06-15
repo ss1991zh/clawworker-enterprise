@@ -255,6 +255,50 @@ main {
 .msg.user .bubble { background: var(--blue); color: #fff; border-bottom-right-radius: 4px; }
 .msg.bot .bubble { background: var(--surface); border: none; border-bottom-left-radius: 4px; }
 
+/* AI 回复 markdown 排版(标题/列表/加粗/行内代码/代码块/链接) */
+.bubble.md { white-space: normal; }
+.bubble.md > :first-child { margin-top: 0; }
+.bubble.md > :last-child { margin-bottom: 0; }
+.bubble.md p { margin: 8px 0; }
+.bubble.md h1, .bubble.md h2, .bubble.md h3,
+.bubble.md h4, .bubble.md h5, .bubble.md h6 {
+  margin: 14px 0 6px; line-height: 1.35; font-weight: 700;
+}
+.bubble.md h1 { font-size: 1.3em; }
+.bubble.md h2 { font-size: 1.2em; }
+.bubble.md h3 { font-size: 1.1em; }
+.bubble.md h4, .bubble.md h5, .bubble.md h6 { font-size: 1em; }
+.bubble.md ul, .bubble.md ol { margin: 8px 0; padding-left: 1.5em; }
+.bubble.md li { margin: 3px 0; }
+.bubble.md li > ul, .bubble.md li > ol { margin: 3px 0; }
+.bubble.md strong { font-weight: 700; }
+.bubble.md em { font-style: italic; }
+.bubble.md a {
+  color: var(--blue);                 /* 主色调 */
+  text-decoration: underline; text-underline-offset: 2px;
+  margin: 0 4px;                      /* 与正文稍微留开距离 */
+}
+.bubble.md a:hover { opacity: 0.8; }
+/* 相邻链接之间的分隔符 */
+.bubble.md .link-sep { color: var(--text-muted); margin: 0 2px; }
+.bubble.md code {
+  background: rgba(0,0,0,0.06); border-radius: 4px;
+  padding: 1px 5px; font-size: 0.9em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+.bubble.md pre {
+  background: #0f172a; color: #e2e8f0; border-radius: 10px;
+  padding: 12px 14px; margin: 10px 0; overflow-x: auto;
+}
+.bubble.md pre code { background: none; padding: 0; color: inherit; font-size: 0.86em; }
+.bubble.md blockquote {
+  margin: 8px 0; padding: 4px 12px;
+  border-left: 3px solid var(--border); color: var(--text-muted);
+}
+.bubble.md hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.bubble.md table { border-collapse: collapse; margin: 8px 0; }
+.bubble.md th, .bubble.md td { border: 1px solid var(--border); padding: 4px 10px; }
+
 .msg.user .att-line {
   font-size: 12px; opacity: 0.9; margin-top: 6px;
   display: flex; flex-direction: column; align-items: flex-end; gap: 4px;
@@ -511,6 +555,11 @@ footer {
 }
 .attach-btn:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-light); }
 .attach-btn .ic { width: 20px; height: 20px; }
+/* 联网搜索开关:点亮态 */
+.attach-btn.active {
+  border-color: var(--blue); color: #fff; background: var(--blue);
+}
+.attach-btn.active:hover { background: var(--blue); color: #fff; }
 
 textarea {
   flex: 1; resize: none; border: 1px solid var(--border); border-radius: 14px;

@@ -29,12 +29,13 @@ class LLMProvider(ABC):
     """LLM 调用接口 —— 主机内部使用。"""
 
     @abstractmethod
-    def chat(self, system: str, user: str) -> LLMResponse: ...
+    def chat(self, system: str, user: str, web_search: bool = False) -> LLMResponse: ...
 
-    def raw_chat(self, system: str, user: str) -> str:
+    def raw_chat(self, system: str, user: str, web_search: bool = False) -> str:
         """
         返回模型原始文本(不 parse 出 computation_plan)。
         默认实现:不支持(子类必须重写)。用于自由聊天场景。
+        web_search=True:若该 provider/模型支持联网搜索就启用;不支持则自动降级为普通调用。
         """
         raise NotImplementedError("provider 不支持 raw_chat")
 
@@ -56,14 +57,14 @@ class StubLLMProvider(LLMProvider):
         # 以便统计页面在 stub 模式下也能看到数字。
         self.last_usage: dict[str, int] = {}
 
-    def chat(self, system: str, user: str) -> LLMResponse:
+    def chat(self, system: str, user: str, web_search: bool = False) -> LLMResponse:
         # 简单按字符数估 tokens(粗略 1:4)
         pt = max(1, (len(system) + len(user)) // 4)
         ct = 200  # 假定固定输出长度
         self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
         return self._response
 
-    def raw_chat(self, system: str, user: str) -> str:
+    def raw_chat(self, system: str, user: str, web_search: bool = False) -> str:
         pt = max(1, (len(system) + len(user)) // 4)
         ct = 30
         self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
@@ -90,7 +91,14 @@ class AnthropicLLMProvider(LLMProvider):
         self._max_tokens = max_tokens
         self.last_usage: dict[str, int] = {}
 
-    def _complete(self, system: str, user: str) -> str:
+    def _complete(self, system: str, user: str, web_search: bool = False) -> str:
+        # 联网搜索:Anthropic 服务端 web_search 工具,API 自动跑搜索、最终文本带引用返回。
+        # 模型不支持时(老模型)会 400 → 自动降级为普通调用。
+        if web_search:
+            try:
+                return self._complete_with_search(system, user)
+            except Exception:
+                pass  # 降级
         resp = self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -109,11 +117,33 @@ class AnthropicLLMProvider(LLMProvider):
             self.last_usage = {}
         return text
 
-    def chat(self, system: str, user: str) -> LLMResponse:
-        return parse_llm_text(self._complete(system, user))
+    def _complete_with_search(self, system: str, user: str) -> str:
+        """带 web_search 工具调用;处理 pause_turn(超 10 轮服务端循环)续跑。"""
+        tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
+        messages = [{"role": "user", "content": user}]
+        pt = ct = 0
+        resp = None
+        for _ in range(5):  # 最多续 5 次,防失控
+            resp = self._client.messages.create(
+                model=self._model, max_tokens=self._max_tokens,
+                system=system, messages=messages, tools=tools,
+            )
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                pt += getattr(usage, "input_tokens", 0) or 0
+                ct += getattr(usage, "output_tokens", 0) or 0
+            if getattr(resp, "stop_reason", "") != "pause_turn":
+                break
+            messages = [{"role": "user", "content": user},
+                        {"role": "assistant", "content": resp.content}]
+        self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
+        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
 
-    def raw_chat(self, system: str, user: str) -> str:
-        return self._complete(system, user)
+    def chat(self, system: str, user: str, web_search: bool = False) -> LLMResponse:
+        return parse_llm_text(self._complete(system, user, web_search))
+
+    def raw_chat(self, system: str, user: str, web_search: bool = False) -> str:
+        return self._complete(system, user, web_search)
 
 
 class OpenAICompatibleProvider(LLMProvider):
@@ -149,6 +179,7 @@ class OpenAICompatibleProvider(LLMProvider):
             raise RuntimeError("未安装 openai 包,请 `pip install openai`") from e
         # timeout 单位秒 · 长任务(推理模型 / 大上下文)默认 10 分钟容易断
         self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=timeout)
+        self._base_url = base_url or ""
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
@@ -156,16 +187,35 @@ class OpenAICompatibleProvider(LLMProvider):
         # cost_usd 在 OpenRouter 时来自服务端返回的 usage.cost(优先),否则按 PRICE_PER_1K 估
         self.last_usage: dict[str, float] = {}
 
-    def _complete(self, system: str, user: str) -> str:
-        resp = self._client.chat.completions.create(
-            model=self._model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=self._max_tokens,
-            temperature=self._temperature,
+    def _web_search_extra(self) -> dict:
+        """按 base_url 给出该服务的联网搜索参数;不支持则返回 {}(降级为普通调用)。"""
+        base = self._base_url.lower()
+        if "openrouter" in base:
+            # OpenRouter:web 插件(走 Exa),对任意模型生效
+            return {"extra_body": {"plugins": [{"id": "web"}]}}
+        if "openai.com" in base:
+            # OpenAI:仅部分模型支持;失败会被外层 try 兜底降级
+            return {"extra_body": {"web_search_options": {}}}
+        return {}  # DeepSeek 直连 / 国内厂商等:暂不支持,普通调用
+
+    def _complete(self, system: str, user: str, web_search: bool = False) -> str:
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+        base_kwargs = dict(
+            model=self._model, messages=messages,
+            max_tokens=self._max_tokens, temperature=self._temperature,
         )
+        extra = self._web_search_extra() if web_search else {}
+        try:
+            resp = self._client.chat.completions.create(**base_kwargs, **extra)
+        except Exception:
+            if extra:
+                # 联网参数被拒(模型/服务不支持)→ 降级为普通调用,不让搜索拖垮请求
+                resp = self._client.chat.completions.create(**base_kwargs)
+            else:
+                raise
         text = resp.choices[0].message.content or ""
         # 抓 token 用量
         usage = getattr(resp, "usage", None)
@@ -182,11 +232,11 @@ class OpenAICompatibleProvider(LLMProvider):
             self.last_usage = {}
         return text
 
-    def chat(self, system: str, user: str) -> LLMResponse:
-        return parse_llm_text(self._complete(system, user))
+    def chat(self, system: str, user: str, web_search: bool = False) -> LLMResponse:
+        return parse_llm_text(self._complete(system, user, web_search))
 
-    def raw_chat(self, system: str, user: str) -> str:
-        return self._complete(system, user)
+    def raw_chat(self, system: str, user: str, web_search: bool = False) -> str:
+        return self._complete(system, user, web_search)
 
 
 # OpenRouter 是 OpenAI 兼容协议的代理,常用预设

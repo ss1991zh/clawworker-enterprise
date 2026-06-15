@@ -873,6 +873,7 @@ async def api_messages_send(sid: str, request: Request):
     if not content:
         raise HTTPException(400, "消息为空")
     attached_cipher = (data.get("attached_cipher") or "").strip()
+    web_search = bool(data.get("web_search"))  # 用户在输入框开了「联网搜索」
     # 明文文本附件(每条 {name, content})— 客户端已通过 /api/files/text_extract 抽好文本
     raw_text_atts = data.get("text_attachments") or []
     text_attachments: list[dict[str, str]] = []
@@ -905,6 +906,7 @@ async def api_messages_send(sid: str, request: Request):
     threading.Thread(
         target=_run_pipeline,
         args=(sid, asst.id, content, attached_cipher, history_for_llm, text_attachments),
+        kwargs={"web_search": web_search},
         daemon=True, name=f"ask-{sid}-{asst.id}",
     ).start()
     return {"user_message": user_msg.to_dict(), "assistant_message": asst.to_dict()}
@@ -951,6 +953,7 @@ def _run_pipeline(
     text_attachments: list[dict[str, str]],
     output_mode: str = "interactive",
     sched_task: Optional[Any] = None,   # 定时密态任务对象(用于回填 EncryptedResult)
+    web_search: bool = False,           # 用户开了「联网搜索」
 ) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
@@ -1030,6 +1033,9 @@ def _run_pipeline(
             custom_block=custom_block,
             output_mode=output_mode,
             run_id=run_id,
+            # 定时任务:固化首次成功生成的代码,每次到点复用 → 输出结构一致
+            codegen_cache_key=(f"task_{sched_task.id}" if sched_task is not None else ""),
+            web_search=web_search,
         )
     except Exception as e:
         _sessions.update_message(
@@ -1354,6 +1360,7 @@ def api_tasks_delete(tid: str):
     if not t or t.username != _session_state["username"]:
         raise HTTPException(404, "任务不存在")
     _task_store.delete(tid)
+    pipeline_mod._codegen_cache_delete(f"task_{tid}")  # 任务删了,固化代码缓存一并清
     return {"ok": True}
 
 
@@ -1402,22 +1409,33 @@ def api_task_decrypt(task_id: str):
              "question": r.question} for r in items]
     try:
         from client.webui import sched_results
-        out_dir = sched_results.decrypt_runs_to_folder(runs, folder_name)
+        out_dir, outcomes = sched_results.decrypt_runs_to_folder(runs, folder_name)
     except Exception as e:
         raise HTTPException(500, f"批量解密失败:{type(e).__name__}: {e}")
-    # 标记已解密 + 清沙盒密文
-    _enc_results.mark_decrypted([r.id for r in items])
+
+    # 只对真正出了文件的 run 标记已解密 + 清沙盒密文;
+    # 失败的保留待批、密文保留(此前版本整批标记 → 失败 run 数据无声丢失)
+    ok_run_ids = {o["run_id"] for o in outcomes if o.get("ok")}
+    ok_items = [r for r in items if r.run_id in ok_run_ids]
+    failures = [o for o in outcomes if not o.get("ok")]
+    if not ok_items:
+        detail = failures[0].get("error", "未知原因") if failures else "未知原因"
+        raise HTTPException(500, f"批量解密失败(全部 {len(items)} 次运行未产出文件):{detail}")
+    _enc_results.mark_decrypted([r.id for r in ok_items])
     try:
-        from client.webui import sched_results as _sr
-        _sr.cleanup_runs([r.run_id for r in items])
+        sched_results.cleanup_runs([r.run_id for r in ok_items])
     except Exception:
         pass
+    summary = f"已批量解密 {len(ok_items)}/{len(items)} 次运行 → 文件夹 {out_dir.name}"
+    if failures:
+        summary += f" · {len(failures)} 次失败保留待批({failures[0].get('error', '')[:60]})"
     _run_history.add(
         username=u, task_id=task_id, task_name=folder_name,
         ran_at=datetime.now().isoformat(timespec="seconds"),
-        status="decrypted", summary=f"已批量解密 {len(items)} 次运行 → 文件夹 {out_dir.name}",
+        status="decrypted", summary=summary,
     )
-    return {"ok": True, "folder": str(out_dir), "count": len(items)}
+    return {"ok": True, "folder": str(out_dir), "count": len(ok_items),
+            "failed": len(failures), "failures": failures}
 
 
 @app.post("/api/scheduled_tasks/pending/{pid}/approve")

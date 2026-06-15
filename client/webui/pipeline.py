@@ -151,9 +151,40 @@ _ANALYSIS_KEYWORDS = (
 )
 
 
+# "知识/概念提问" 标记 —— 问某方法/概念是什么、怎么算、口径/公式,而非要对数据做计算。
+# 命中这些(且无下面的"对数据操作"标记)→ 应走自由聊天 / 联网,不做密态分析。
+_KNOWLEDGE_Q_MARKERS = (
+    "是什么", "什么是", "啥是", "是啥", "什么意思", "啥意思", "何为",
+    "怎么算", "怎样算", "如何算", "怎么计算", "怎样计算", "如何计算",
+    "计算口径", "计算方式", "计算方法", "计算公式", "的公式", "公式是",
+    "定义", "含义", "概念", "原理", "区别", "介绍一下", "介绍下",
+    "解释一下", "解释下", "科普", "为什么", "怎么理解", "适用于什么",
+    "什么场景", "有哪些方法", "怎么做", "如何做",
+)
+# "对这份数据操作"的强标记 —— 出现则即便像知识问题也按分析处理(在数据上算)。
+_DATA_OP_MARKERS = (
+    "这份", "这个表", "这张表", "这些数据", "表里", "数据中", "数据里",
+    "上传", "附件", "文件里", "文件中", "每个人", "每位", "每人", "各位",
+    "top", "排名", "排行", "导出", "出表", "生成excel", "生成 excel",
+)
+
+
+def _looks_like_knowledge_question(user_query: str) -> bool:
+    """问概念/口径/公式(而非要在用户数据上计算)→ True。"""
+    if not user_query:
+        return False
+    q = user_query.lower()
+    if any(m.lower() in q for m in _DATA_OP_MARKERS):
+        return False  # 明确要对数据操作 → 不是纯知识问题
+    return any(m.lower() in q for m in _KNOWLEDGE_Q_MARKERS)
+
+
 def looks_like_analysis(user_query: str) -> bool:
     """启发式:是否像数据分析意图。否 → 走自由聊天端点。"""
     if not user_query:
+        return False
+    # 知识/概念提问优先判定为"非分析"(问 X 是什么 / X 怎么算,而非算这份数据)
+    if _looks_like_knowledge_question(user_query):
         return False
     q = user_query.lower()
     for kw in _ANALYSIS_KEYWORDS:
@@ -171,10 +202,15 @@ def looks_like_analysis(user_query: str) -> bool:
 
 _FREECHAT_SYSTEM = (
     "你是 Clawworker 企业版 · 同态加密数据分析助手。"
-    "用户现在没有附加密文文件 / 也没提数据分析诉求,你只是和他闲聊。"
-    "请用简洁、礼貌的中文回答。不要输出 <computation_plan> 或 JSON 块。"
-    "如果用户问起怎么用,可以提醒:点击下方回形针按钮选一份已加密文件,"
-    "再问类似「按大区统计完成率」「TOP10 销售」这样的问题即可生成 Excel 报表。"
+    "用户当前的问题不是要对他的数据出报表,而是闲聊或**概念/方法咨询**"
+    "(如「RFM 怎么算」「目标完成率的口径是什么」「这种指标适用什么场景」)。"
+    "请用简洁、专业的中文**直接回答问题本身**(讲清定义 / 计算口径 / 公式 / 适用场景);"
+    "若已开启联网搜索,优先采用查到的最新、权威信息,并简述要点。"
+    "**引用来源链接统一放在相关句子的句号(。)之后**,不要把链接插在句子中间打断阅读;"
+    "同一处有多个链接时,链接之间用「 · 」分隔。"
+    "不要输出 <computation_plan> 或 JSON 块,也不要假设你看过用户的数据。"
+    "仅当用户确实想对某份数据出表时,才提醒:点下方回形针选一份已加密文件,"
+    "再问「按大区统计完成率」「TOP10 销售」这类问题即可生成 Excel。"
 )
 
 
@@ -183,8 +219,9 @@ def call_llm_for_freechat(
     history: Optional[list[dict]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     timeout: float = 1800.0,
+    web_search: bool = False,
 ) -> str:
-    """调 host /llm/freechat,返回纯文本回复。history 可选透传。"""
+    """调 host /llm/freechat,返回纯文本回复。history 可选透传;web_search 可选联网搜索。"""
     r = _post_cancellable(
         f"{host_url}/llm/freechat",
         headers={"Authorization": f"Bearer {token}"},
@@ -192,6 +229,7 @@ def call_llm_for_freechat(
             "system": _FREECHAT_SYSTEM,
             "user": user_query,
             "history": history or [],
+            "web_search": bool(web_search),
         },
         timeout=timeout,
         should_cancel=should_cancel,
@@ -258,12 +296,14 @@ def call_llm_for_codegen(
     history: Optional[list[dict]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
     timeout: float = 1800.0,
+    web_search: bool = False,
 ) -> str:
-    """调 host /llm/freechat 拿原始文本(含 ```python``` 代码块 + summary)。"""
+    """调 host /llm/freechat 拿原始文本(含 ```python``` 代码块 + summary)。web_search 可选联网。"""
     r = _post_cancellable(
         f"{host_url}/llm/freechat",
         headers={"Authorization": f"Bearer {token}"},
-        json_body={"system": system, "user": user, "history": history or []},
+        json_body={"system": system, "user": user, "history": history or [],
+                   "web_search": bool(web_search)},
         timeout=timeout,
         should_cancel=should_cancel,
     )
@@ -380,10 +420,122 @@ def _fold_text_attachments(user_query: str, atts: Optional[list[dict]]) -> str:
     return "\n\n".join(parts)
 
 
+# ---------------------------------------------------------------------------
+# 定时任务代码固化缓存 —— 首次运行成功后固化生成代码,之后每次到点复用同一份,
+# 保证同一任务每次运行的输出结构完全一致(不再"每次现写、次次不同")。
+# 任务问题或数据 schema(列名)变化 → 签名失配 → 自动重新生成。
+# ---------------------------------------------------------------------------
+
+_CODEGEN_CACHE_DIR = Path.home() / ".agent-system" / "scheduler" / "codegen_cache"
+
+
+def _codegen_cache_sig(effective_query: str, schema: dict) -> str:
+    import hashlib
+    cols = ",".join(sorted(
+        str(c.get("name", "")) for c in (schema or {}).get("columns", [])
+    ))
+    return hashlib.sha256(f"{effective_query}|{cols}".encode("utf-8")).hexdigest()[:16]
+
+
+def _codegen_cache_load(cache_key: str, sig: str) -> Optional[dict]:
+    """命中返回 {code, summary, lazy_waived};签名失配或无缓存返回 None。"""
+    import json
+    f = _CODEGEN_CACHE_DIR / f"{cache_key}.json"
+    try:
+        if not f.exists():
+            return None
+        data = json.loads(f.read_text(encoding="utf-8"))
+        if data.get("sig") != sig or not data.get("code"):
+            return None
+        return {"code": data["code"], "summary": data.get("summary") or "",
+                "lazy_waived": bool(data.get("lazy_waived"))}
+    except Exception:
+        return None
+
+
+def _codegen_cache_save(cache_key: str, sig: str, code: str, summary: str,
+                        lazy_waived: bool = False) -> None:
+    import json
+    try:
+        _CODEGEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        (_CODEGEN_CACHE_DIR / f"{cache_key}.json").write_text(
+            json.dumps({"sig": sig, "code": code, "summary": summary,
+                        "lazy_waived": lazy_waived},
+                       ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+    except Exception:
+        pass
+
+
+def _codegen_cache_delete(cache_key: str) -> None:
+    try:
+        (_CODEGEN_CACHE_DIR / f"{cache_key}.json").unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# LLM 偷懒检测 —— 用户要全量,生成代码却 head()/sample() 截断
+# ---------------------------------------------------------------------------
+
+_FULL_QUERY_PAT = re.compile(r"所有|全部|每个|每位|每人|全员|全体|逐[行条]|明细|\d{2,}\s*[个条人位]")
+_TRUNCATION_PAT = re.compile(
+    r"\.head\s*\(|\.tail\s*\(|\.sample\s*\(|\.nlargest\s*\(|\.nsmallest\s*\("
+    r"|\.iloc\s*\[\s*\d*\s*:\s*\d+"          # .iloc[:20] / .iloc[0:20]
+    r"|\.loc\s*\[\s*:\s*\d+"                  # .loc[:20]
+    r"|\[\s*:\s*\d{1,3}\s*\]"                 # full[:20] 裸切片
+)
+_TOPN_QUERY_PAT = re.compile(r"top|前\s*\d+|最[高低大小].{0,3}\d+|排名前|倒数", re.IGNORECASE)
+
+
+def _detect_lazy_truncation(query: str, code: str) -> bool:
+    """用户要全量(且没要 TOP-N)而代码里有截断 → 判定偷懒。"""
+    if not _FULL_QUERY_PAT.search(query or ""):
+        return False
+    if _TOPN_QUERY_PAT.search(query or ""):
+        return False
+    return bool(_TRUNCATION_PAT.search(code or ""))
+
+
+# 筛选类问题(找异常/超期/不达标…)合法输出子集,不做全量验收
+_FILTER_QUERY_PAT = re.compile(
+    r"异常|离群|超过|低于|高于|大于|小于|超出|筛选|挑出|找出|不达标|未达标|超期|逾期|大额"
+)
+
+
+def _results_look_truncated(results: list, n_src: int, query: str,
+                            metadata_rows=None, metadata_columns=None) -> int:
+    """
+    结果级偷懒验收(正则猜不全写法,行数骗不了人)。
+
+    用户口径:**数据每一行都是独立记录,任何分析都不得合并行** ——
+    "按大区 / 按产品线汇总"是排序方式,不是聚合压行;聚合 sheet 只能是
+    逐行明细之外的附加 sheet。因此全量类问题必须有一张 sheet 行数 ≈ 数据行数
+    (≥ 90%,容许剔除源合计行/坏行),否则返回最大 sheet 行数(疑似截断)。
+    豁免:TOP-N、筛选类(异常/超期…)、小数据(<30 行)。
+    """
+    if n_src < 30:
+        return 0
+    q = query or ""
+    if not _FULL_QUERY_PAT.search(q) or _TOPN_QUERY_PAT.search(q) or _FILTER_QUERY_PAT.search(q):
+        return 0
+    max_rows = 0
+    for r in results or []:
+        df = r.get("df")
+        try:
+            max_rows = max(max_rows, len(df))
+        except Exception:
+            continue
+    need = max(30, int(n_src * 0.9))
+    return max_rows if max_rows < need else 0
+
+
 def _run_codegen_path(
     *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
     host_url, token, history, custom_block, excel_stem,
     log, chk, prompt_decrypt, output_mode="interactive", run_id="",
+    cache_key="", lazy_feedback="", web_search=False,
 ) -> Optional[dict]:
     """
     代码生成主路径:LLM 读 SKILL.md → 写代码 → AST 扫描 → 受限 exec → Excel。
@@ -395,37 +547,109 @@ def _run_codegen_path(
       "encrypted_sandbox"  —— 定时密态:自动允许计算,结果**加密暂存沙盒**,
                               不写明文 Excel,返回 encrypted_run(供批量解密)
     """
-    # 定时密态模式:计算阶段自动放行解密(在本机内存算),结果保持密文
-    exec_prompt_decrypt = prompt_decrypt
-    if output_mode == "encrypted_sandbox":
-        exec_prompt_decrypt = lambda: "decrypt"  # noqa: E731
-    # 1) 意图路由选 SKILL.md
-    skill_docs = skills_loader.route(effective_query)
-    if not skill_docs:
-        return None
-    log("think", f"代码生成 · 加载技能文档:{' / '.join(d.name for d in skill_docs)}")
+    # 解密授权后置(与固化路径同序):计算阶段在本机内存自动放行解密
+    # (明文不出进程、不展示);算完 + 行数验收通过后,才向用户申请「解密展示」
+    # 授权 —— 行数等验收都在授权前完成,偷懒重生成也不会反复弹授权。
+    exec_prompt_decrypt = lambda: "decrypt"  # noqa: E731
 
-    # 2) LLM 写代码
-    system, user = codegen_mod.build_codegen_messages(
-        skill_docs, schema, metadata_columns, effective_query, custom_block,
-    )
-    log("call", "调用 LLM 生成密态分析代码")
-    if chk():
-        raise CancelledError("用户已停止")
-    raw = call_llm_for_codegen(host_url, token, system, user, history=history, should_cancel=chk)
-    if chk():
-        raise CancelledError("用户已停止")
+    # 0) 定时任务代码固化缓存:命中则跳过 LLM,直接复用首次成功的代码
+    cache_sig = ""
+    from_cache = False
+    code = ""
+    summary_raw = ""
+    lazy_waived = False
+    if cache_key:
+        cache_sig = _codegen_cache_sig(effective_query, schema)
+        cached = _codegen_cache_load(cache_key, cache_sig)
+        if cached:
+            code, summary_raw = cached["code"], cached["summary"]
+            # 固化代码也过偷懒检测 —— 早期定板可能把 head()/切片截断固化了进去
+            # (已豁免的不再重检,避免每次作废重生成、缓存名存实亡)
+            if not cached["lazy_waived"] and _detect_lazy_truncation(effective_query, code):
+                log("think", "固化代码截断了数据而用户要求全量 · 作废缓存,重新生成")
+                _codegen_cache_delete(cache_key)
+                code, summary_raw = "", ""
+            else:
+                from_cache = True
+                log("think", "定时任务 · 复用首次固化的分析代码(每次运行结构保持一致)")
 
-    try:
-        code, summary_raw = codegen_mod.extract_code(raw)
-    except Exception as e:
-        log("error", f"代码生成解析失败:{e} · 回退固化 skill")
-        return None
+    if not from_cache:
+        # 1) 意图路由选 SKILL.md
+        skill_docs = skills_loader.route(effective_query)
+        if not skill_docs:
+            return None
+        log("think", f"代码生成 · 加载技能文档:{' / '.join(d.name for d in skill_docs)}")
 
-    # 3) AST 安全扫描
+        # 2) LLM 写代码(定时任务首次生成是"定板":提示补全意图,产出将被固化复用)
+        gen_query = effective_query
+        if cache_key:
+            gen_query = (
+                f"{effective_query}\n\n"
+                "(说明:这是**定时任务**的问题,会反复运行,本次生成的代码将被固化复用。"
+                "即使问题很简短,也请一次性补全分析意图,按完整专业报表标准输出:"
+                "关键指标排序+排名列、文字档位列、占比/合计、合适的图表;结构要经得起反复出表。)"
+            )
+        if lazy_feedback:
+            gen_query = f"{gen_query}\n\n{lazy_feedback}"
+        system, user = codegen_mod.build_codegen_messages(
+            skill_docs, schema, metadata_columns, gen_query, custom_block,
+        )
+        log("call", "调用 LLM 生成密态分析代码")
+        if chk():
+            raise CancelledError("用户已停止")
+        raw = call_llm_for_codegen(host_url, token, system, user, history=history,
+                                   should_cancel=chk, web_search=web_search)
+        if chk():
+            raise CancelledError("用户已停止")
+
+        try:
+            code, summary_raw = codegen_mod.extract_code(raw)
+        except Exception as e:
+            log("error", f"代码生成解析失败:{e} · 回退固化 skill")
+            return None
+
+        # 偷懒检测:用户要全量,代码却截断(head/sample/iloc[:N])→ 要求重写一次
+        if _detect_lazy_truncation(effective_query, code):
+            log("think", "检测到生成代码截断了数据,但用户要求全量 · 要求 LLM 重写")
+            retry_user = (
+                user + "\n\n⚠️ 你刚才的代码用 head()/sample()/iloc 截断了数据,"
+                "但用户要求处理**全部数据行**。请重写:禁止任何截断,逐行全量处理。"
+            )
+            try:
+                raw2 = call_llm_for_codegen(host_url, token, system, retry_user,
+                                            history=history, should_cancel=chk,
+                                            web_search=web_search)
+                code2, summary2 = codegen_mod.extract_code(raw2)
+                if not _detect_lazy_truncation(effective_query, code2):
+                    code, summary_raw = code2, summary2
+                    log("result", "重写完成 · 已改为全量处理")
+                else:
+                    lazy_waived = True  # 重写仍截断 · 存缓存时记豁免,下次不再反复作废
+                    log("error", "重写后仍含截断 · 按原样继续(结果可能不全)")
+            except Exception:
+                lazy_waived = True
+                log("error", "重写失败 · 按原代码继续(结果可能不全)")
+
+    def _retry_without_cache(reason: str) -> Optional[dict]:
+        """固化代码失效(数据形态变了等)→ 删缓存,本次就地重新生成一遍。"""
+        log("error", f"{reason} · 固化代码失效,重新生成")
+        _codegen_cache_delete(cache_key)
+        return _run_codegen_path(
+            effective_query=effective_query, cipher_path=cipher_path,
+            schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+            host_url=host_url, token=token, history=history,
+            custom_block=custom_block, excel_stem=excel_stem,
+            log=log, chk=chk, prompt_decrypt=prompt_decrypt,
+            output_mode=output_mode, run_id=run_id, cache_key=cache_key,
+            web_search=web_search,
+        )
+
+    # 3) AST 安全扫描(缓存代码也重新扫,规则可能收紧过)
     try:
         codegen_mod.ast_safety_check(code)
     except codegen_mod.UnsafeCode as e:
+        if from_cache:
+            return _retry_without_cache(f"固化代码未通过安全扫描:{e}")
         log("error", f"生成代码未通过安全扫描:{e} · 回退固化 skill")
         return None
     log("result", "代码安全扫描通过")
@@ -476,13 +700,53 @@ def _run_codegen_path(
             "summary": "", "excel_path": "", "skill_calls": ["codegen"],
         }
     except Exception as e:
+        if from_cache:
+            return _retry_without_cache(f"固化代码执行失败:{e}")
         log("error", f"代码执行失败:{e} · 回退固化 skill")
         return None
 
     if not results:
+        if from_cache:
+            return _retry_without_cache("固化代码没产出结果")
         log("error", "生成代码没产出结果 · 回退固化 skill")
         return None
     log("result", f"密态计算完成 · {len(results)} 个 sheet")
+
+    # 结果级偷懒验收:用户要全量但所有 sheet 行数都远小于数据行数 → 行数骗不了人
+    # (按身份实体聚合的行数 == 实体去重数,属合法全量,已在检查内豁免)
+    n_src = len(metadata_rows or [])
+    trunc_rows = _results_look_truncated(results, n_src, effective_query,
+                                         metadata_rows, metadata_columns)
+    if trunc_rows:
+        if from_cache:
+            return _retry_without_cache(
+                f"固化代码输出行数过少({trunc_rows} 行,数据 {n_src} 行)疑似截断")
+        if not lazy_feedback:
+            log("error",
+                f"结果疑似截断:数据 {n_src} 行,最大 sheet 仅 {trunc_rows} 行 · 带反馈重新生成")
+            return _run_codegen_path(
+                effective_query=effective_query, cipher_path=cipher_path,
+                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+                host_url=host_url, token=token, history=history,
+                custom_block=custom_block, excel_stem=excel_stem,
+                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
+                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
+                web_search=web_search,
+                lazy_feedback=(
+                    f"⚠️ 数据共 {n_src} 行,**每一行都是独立记录,不得合并行**;"
+                    f"但你上次只输出了 {trunc_rows} 行。请改为**逐行明细**:行数 = 数据行数。"
+                    "「按大区 / 按产品线 / 汇总」指的是**排序方式**(先按该维度排、"
+                    "组内再按指标排),不是 groupby 压行;"
+                    "聚合视角只能作为逐行明细之外的**附加** sheet。"
+                ),
+            )
+        lazy_waived = True  # 重试过仍偏少 · 按现有结果继续,缓存记豁免
+        log("think", f"重新生成后最大 sheet 仍只有 {trunc_rows} 行 · 按现有结果继续")
+
+    # 首次成功 → 固化本任务的分析代码,之后每次到点复用(输出结构一致)
+    if cache_key and not from_cache:
+        _codegen_cache_save(cache_key, cache_sig, code, summary_raw, lazy_waived=lazy_waived)
+        log("think", "已固化本任务的分析代码 · 后续每次运行保持同一结构")
 
     # 6a) 定时密态模式:结果加密暂存沙盒,不写明文 Excel
     if output_mode == "encrypted_sandbox":
@@ -500,7 +764,35 @@ def _run_codegen_path(
             "encrypted_run": {"run_id": run_id, "manifest": manifest},
         }
 
-    # 6b) 写明文 Excel
+    # 6b) 解密展示授权(后置 · 与固化路径同序):计算与验收都已完成,才问用户
+    decision = "decrypt"
+    if prompt_decrypt:
+        log("think", f"密态计算完成 · 等待解密展示授权({len(results)} 个 sheet)")
+        try:
+            decision = prompt_decrypt() or "decrypt"
+        except CancelledError:
+            log("error", "已停止 · 用户取消")
+            return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
+                    "excel_path": "", "skill_calls": ["codegen"]}
+        log("result", f"用户选择:{'解密展示' if decision == 'decrypt' else '保留密文展示' if decision == 'keep_encrypted' else '取消'}")
+    if decision == "cancel":
+        return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
+                "excel_path": "", "skill_calls": ["codegen"]}
+    if decision == "keep_encrypted":
+        log("call", f"重新加密 {len(results)} 个 sheet · 数值列保持密文")
+        try:
+            excel_path = export_skill_results_encrypted(results, cipher_path, stem=excel_stem)
+        except Exception as e:
+            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
+        log("result", f"完成 · {excel_path.name}")
+        return {
+            "status": "done",
+            "summary": "已按要求保留密文展示 · 输出结构与解密版一致,数值列保持同态密文形式。"
+                       "若要明文结果请重新提问并选择「解密展示」。",
+            "excel_path": str(excel_path), "skill_calls": ["codegen"], "error": "",
+        }
+
+    # 6c) 写明文 Excel
     log("call", "写入 Excel")
     try:
         excel_path = write_skill_results(results, stem=excel_stem)
@@ -532,6 +824,8 @@ def ask(
     custom_block: str = "",
     output_mode: str = "interactive",
     run_id: str = "",
+    codegen_cache_key: str = "",
+    web_search: bool = False,
 ) -> dict:
     """
     跑一次完整分析。返回:
@@ -567,7 +861,7 @@ def ask(
             log("think", "未附密文文件 · 自由聊天模式")
             log("call", "调用 LLM(freechat)")
             _ck()
-            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk)
+            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
             _ck()
             log("result", "已回复")
             return {
@@ -580,7 +874,7 @@ def ask(
             log("think", f"已附密文「{cipher_path.name}」· 但问题不像数据分析 · 自由聊天模式")
             log("call", "调用 LLM(freechat)")
             _ck()
-            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk)
+            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
             _ck()
             log("result", "已回复")
             return {
@@ -626,6 +920,7 @@ def ask(
             custom_block=custom_block, excel_stem=excel_stem,
             log=log, chk=chk, prompt_decrypt=prompt_decrypt,
             output_mode=output_mode, run_id=run_id,
+            cache_key=codegen_cache_key, web_search=web_search,
         )
     except CancelledError:
         log("error", "已停止 · 用户取消")

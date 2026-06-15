@@ -67,14 +67,25 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
             id_df.to_csv(str(p), index=False)
             id_csv_path = str(p)
 
-        manifest.append({
+        entry = {
             "sheet_name": str(r.get("sheet_name") or f"结果{idx+1}")[:31],
             "num_enc": num_enc_path,
             "id_csv": id_csv_path,
             "numeric_cols": [str(c) for c in numeric_cols],
             "col_order": col_order,
             "n_rows": int(len(df)),
-        })
+        }
+        # 呈现键(chart/档位/合计行等)一并暂存 —— 批量解密时按产品级渲染还原,
+        # 保证定时任务出的 Excel 和单独提问完全一个样
+        for k in ("chart", "charts", "tier_col", "total_row", "note", "number_formats"):
+            v = r.get(k)
+            if v:
+                try:
+                    json.dumps(v)   # 只存可序列化的
+                    entry[k] = v
+                except Exception:
+                    pass
+        manifest.append(entry)
 
     # manifest 也落一份(方便排查)
     (run_dir / "manifest.json").write_text(
@@ -86,13 +97,12 @@ def _decrypt_one_sheet(entry: dict):
     """按 manifest 单条还原一张明文 df。"""
     import pandas as pd
 
-    from client.tools.runtime import Runtime
-    Runtime.get().ensure_all_initialized()
-    import crypto_toolkit as ct  # noqa: F401
-    import pandaseal as ps  # noqa: F401
-
     num_plain = None
     if entry.get("num_enc") and Path(entry["num_enc"]).exists():
+        from client.tools.runtime import Runtime
+        Runtime.get().ensure_all_initialized()
+        import crypto_toolkit as ct  # noqa: F401
+        import pandaseal as ps  # noqa: F401
         try:
             cdf = ps.read_excel(entry["num_enc"], index_col=0)
         except Exception:
@@ -125,21 +135,22 @@ def _decrypt_one_sheet(entry: dict):
     return merged
 
 
-def decrypt_runs_to_folder(runs: list[dict], folder_name: str) -> Path:
+def decrypt_runs_to_folder(runs: list[dict], folder_name: str) -> tuple[Path, list[dict]]:
     """
     批量解密多次运行 → 明文 Excel 落到 ~/Downloads/<folder_name>/。
 
     runs: [{run_id, run_at, manifest: [...], question}]
       每次运行 → 一个 Excel 文件(多 sheet)。
-    返回文件夹路径。
+
+    返回 (文件夹路径, 逐 run 结果):
+      [{run_id, ok, file, sheets, error}]
+    —— 调用方**只对 ok=True 的 run** 做 mark_decrypted / 清沙盒;
+       ok=False(沙盒密文缺失、解密报错等)的 run 保持待批、密文保留,可重试排查。
+       此前版本会静默跳过失败 run 仍整批标记已解密 → 数据无声丢失,见 bug 修复记录。
     """
     from datetime import datetime
 
-    import openpyxl
-    from openpyxl.styles import Alignment, Font, PatternFill
-    from openpyxl.utils import get_column_letter
-
-    from client.webui.writer import _infer_number_format
+    from client.webui.writer import write_skill_results
 
     downloads = Path.home() / "Downloads"
     safe = "".join(ch for ch in folder_name if ch not in '\\/:*?"<>|').strip() or "定时任务结果"
@@ -149,45 +160,57 @@ def decrypt_runs_to_folder(runs: list[dict], folder_name: str) -> Path:
         out_dir = downloads / f"{safe}_{datetime.now().strftime('%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    header_font = Font(bold=True, color="FFFFFF")
-    header_fill = PatternFill("solid", fgColor="2563EB")
-    center = Alignment(horizontal="center", vertical="center")
-
+    outcomes: list[dict] = []
+    used_names: set[str] = set()
     for run in runs:
+        rid = str(run.get("run_id") or "")
         manifest = run.get("manifest", []) or []
         ts = (run.get("run_at") or "").replace(":", "").replace("-", "").replace("T", "_")[:15]
-        fname = f"{safe}_{ts or secrets.token_hex(3)}.xlsx"
+        base = f"{safe}_{ts or secrets.token_hex(3)}"
+        # 同一秒完成的多次运行会得到相同时间戳 —— 文件名去重,杜绝互相覆盖
+        fname = f"{base}.xlsx"
+        seq = 2
+        while fname in used_names or (out_dir / fname).exists():
+            fname = f"{base}_{seq}.xlsx"
+            seq += 1
         dst = out_dir / fname
 
-        wb = openpyxl.Workbook()
-        wb.remove(wb.active)
-        any_sheet = False
-        for entry in manifest:
-            df = _decrypt_one_sheet(entry)
-            if df is None or df.empty:
-                continue
-            any_sheet = True
-            ws = wb.create_sheet(title=str(entry.get("sheet_name") or "结果")[:31])
-            headers = [str(c) for c in df.columns]
-            col_fmt = {}
-            for ci, h in enumerate(headers, 1):
-                cell = ws.cell(1, ci, h)
-                cell.font = header_font; cell.fill = header_fill; cell.alignment = center
-                nf = _infer_number_format(h)
-                if nf:
-                    col_fmt[ci] = nf
-            for ri, row in enumerate(df.itertuples(index=False), 2):
-                for ci, val in enumerate(row, 1):
-                    cell = ws.cell(ri, ci, val)
-                    if ci in col_fmt:
-                        cell.number_format = col_fmt[ci]
-            for ci, h in enumerate(headers, 1):
-                ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 30)
-            ws.freeze_panes = "A2"
-        if any_sheet:
-            wb.save(dst)
+        try:
+            # 还原每张表 + 暂存的呈现键(chart/档位/合计行…),交给产品级渲染器 ——
+            # 和单独提问出的 Excel 完全同一套样式(图表/档位上色/合计/自动筛选)
+            sheets: list[dict] = []
+            for entry in manifest:
+                df = _decrypt_one_sheet(entry)
+                if df is None or df.empty:
+                    continue
+                item = {"sheet_name": str(entry.get("sheet_name") or "结果")[:31], "df": df}
+                for k in ("chart", "charts", "tier_col", "total_row", "note", "number_formats"):
+                    v = entry.get(k)
+                    if v:
+                        item[k] = v
+                sheets.append(item)
+            if sheets:
+                write_skill_results(sheets, path=dst)
+                used_names.add(fname)
+                outcomes.append({"run_id": rid, "ok": True, "file": fname,
+                                 "sheets": len(sheets), "error": ""})
+            else:
+                outcomes.append({
+                    "run_id": rid, "ok": False, "file": "", "sheets": 0,
+                    "error": "密文暂存缺失或解密为空(沙盒文件不存在)· 该次运行保留待批",
+                })
+        except Exception as e:  # noqa: BLE001 —— 单个 run 失败不拖垮整批
+            outcomes.append({"run_id": rid, "ok": False, "file": "", "sheets": 0,
+                             "error": f"{type(e).__name__}: {e}"})
 
-    return out_dir
+    # 一个文件都没写出来 → 收掉空文件夹
+    if not any(o["ok"] for o in outcomes):
+        try:
+            out_dir.rmdir()
+        except Exception:
+            pass
+
+    return out_dir, outcomes
 
 
 def cleanup_runs(run_ids: list[str]) -> None:

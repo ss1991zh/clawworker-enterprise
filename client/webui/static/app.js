@@ -11,6 +11,68 @@ const esc = (s) =>
   String(s ?? "").replace(/[&<>"']/g, c =>
     ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 
+// 安全 markdown → HTML(先 esc 防 XSS,再处理 标题/列表/加粗/斜体/行内代码/代码块/链接)。
+// 链接仅放行 http(s),统一 target=_blank rel=noopener。给 AI 回复 / summary 通用排版。
+function mdToHtml(src) {
+  if (!src) return "";
+  let s = esc(src);                       // 1) 整体转义,后续只引入受控标签
+  const blocks = [];                      // 围栏代码块(块级)
+  const inl = [];                         // 行内代码 / 链接 占位(避免被斜体正则误吃 _blank)
+  const stash = (html) => { inl.push(html); return `@@I${inl.length - 1}@@`; };
+  // 2) 围栏代码块 ```lang\n...```
+  s = s.replace(/```[^\n`]*\n?([\s\S]*?)```/g, (_, code) => {
+    blocks.push(code.replace(/\n+$/, ""));
+    return `@@B${blocks.length - 1}@@`;
+  });
+  // 3) 行内代码 `x` → 占位
+  s = s.replace(/`([^`\n]+)`/g, (_, c) => stash(`<code>${c}</code>`));
+  // 4) 链接 [text](url) —— 仅 http(s) → 占位(含 target="_blank")
+  s = s.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    (_, t, u) => stash(`<a href="${u}" target="_blank" rel="noopener noreferrer">${t}</a>`));
+  // 5) 裸 URL(前面是空白/行首/左括号,避免命中已在 href 里的)→ 占位
+  s = s.replace(/(^|[\s(（])(https?:\/\/[^\s<)）]+)/g,
+    (_, pre, u) => `${pre}${stash(`<a href="${u}" target="_blank" rel="noopener noreferrer">${u}</a>`)}`);
+  // 6) 加粗 / 斜体(链接/代码已占位,_blank 等不会被误吃)
+  s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+       .replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>')
+       .replace(/(^|[^_])_([^_\n]+)_(?!_)/g, '$1<em>$2</em>');
+  // 7) 逐行:标题 / 有序无序列表 / 引用 / 分隔线 / 段落
+  const out = [];
+  let list = null;  // 'ul' | 'ol'
+  const closeList = () => { if (list) { out.push(`</${list}>`); list = null; } };
+  for (const line of s.split("\n")) {
+    const ph = line.match(/^@@B(\d+)@@$/);
+    if (ph) { closeList(); out.push(`<pre><code>${blocks[+ph[1]]}</code></pre>`); continue; }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)$/))) {
+      closeList(); const lv = Math.min(m[1].length, 6); out.push(`<h${lv}>${m[2]}</h${lv}>`); continue;
+    }
+    if (/^\s*([-*+])\s+/.test(line)) {
+      if (list !== "ul") { closeList(); out.push("<ul>"); list = "ul"; }
+      out.push(`<li>${line.replace(/^\s*[-*+]\s+/, "")}</li>`); continue;
+    }
+    if (/^\s*\d+\.\s+/.test(line)) {
+      if (list !== "ol") { closeList(); out.push("<ol>"); list = "ol"; }
+      out.push(`<li>${line.replace(/^\s*\d+\.\s+/, "")}</li>`); continue;
+    }
+    if (/^\s*>\s?/.test(line)) { closeList(); out.push(`<blockquote>${line.replace(/^\s*>\s?/, "")}</blockquote>`); continue; }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(line)) { closeList(); out.push("<hr>"); continue; }
+    if (line.trim() === "") { closeList(); continue; }
+    closeList(); out.push(`<p>${line}</p>`);
+  }
+  closeList();
+  // 还原行内代码/链接占位
+  let html = out.join("").replace(/@@I(\d+)@@/g, (_, i) => inl[+i] || "");
+  // 1) 相邻链接(仅空白相隔)→ 插入分隔符「·」
+  html = html.replace(/<\/a>\s*<a /g, '</a><span class="link-sep">·</span><a ');
+  // 2) 链接放在句末标点「之后」:把紧跟在(整串)链接后的句末标点(。.!?;)挪到链接前,
+  //    让链接成为句末的引用。单链接 / 多链接并排都正确。
+  const linkRun = '(?:<a\\b[^>]*>[^<]*<\\/a>(?:<span class="link-sep">·<\\/span>)?)+';
+  html = html.replace(new RegExp(`(${linkRun})\\s*([。.!?;！?;])`, 'g'),
+                      (_, run, punct) => `${punct} ${run}`);
+  return html;
+}
+
 const ICON_SVG = {
   doc: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
   warn: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
@@ -35,6 +97,9 @@ const state = {
   typedMids: new Set(),
   // 正在轮询的 mid(防止 sync + selectSession 重复起 interval)
   pollingMids: new Set(),
+  // 联网搜索开关(发送时透传给后端;需所用模型/服务支持)。
+  // 持久化到 localStorage —— 刷新/重启后保留上次选择。
+  webSearch: (() => { try { return localStorage.getItem("cw_web_search") === "1"; } catch (e) { return false; } })(),
 };
 
 // ============ API helpers ============
@@ -244,7 +309,7 @@ function renderMessage(m) {
     } else if (failed) {
       content += `<div class="err-card">${ICON_SVG.warn}<span class="err-text">${esc(m.error || "未知错误")}</span></div>`;
       if (m.summary) {
-        content += `<div class="bubble">${esc(m.summary).replace(/\n/g, "<br>")}</div>`;
+        content += `<div class="bubble md">${mdToHtml(m.summary)}</div>`;
       }
     } else if (needsCipher) {
       content += `<div class="ask-card">${ICON_SVG.ask}<span>${esc(m.summary || "请附一份已加密的数据文件")}</span></div>`;
@@ -285,9 +350,9 @@ function renderMessage(m) {
       // 打字机:首次渲染留空 bubble + cursor,渲染完后 JS 逐字填入
       const willType = !state.typedMids.has(m.id) && (m.summary || "").length > 0;
       if (willType) {
-        content += `<div class="bubble" data-typewriter="${esc(m.summary || "")}"><span class="type-cursor">▍</span></div>`;
+        content += `<div class="bubble md" data-typewriter="${esc(m.summary || "")}"><span class="type-cursor">▍</span></div>`;
       } else {
-        content += `<div class="bubble">${esc(m.summary || "(无总结)").replace(/\n/g, "<br>")}</div>`;
+        content += `<div class="bubble md">${mdToHtml(m.summary || "(无总结)")}</div>`;
       }
       if (m.excel_path && m.excel_name) {
         const dlUrl = `/api/excel/download?path=${encodeURIComponent(m.excel_path)}`;
@@ -346,7 +411,9 @@ function renderMessage(m) {
     bubble.removeAttribute('data-typewriter');
     state.typedMids.add(m.id);
     typewriter(bubble, full, () => {
-      // 打字完 → 让所有标记为 defer-reveal 的兄弟节点淡入
+      // 打字完 → 定格成 markdown 排版(标题/列表/加粗/可点链接)
+      bubble.innerHTML = mdToHtml(full);
+      // 让所有标记为 defer-reveal 的兄弟节点淡入
       wrap.querySelectorAll('[data-defer-reveal]').forEach(el => {
         el.removeAttribute('data-defer-reveal');
         el.classList.add('revealed');
@@ -438,7 +505,34 @@ function pollMessage(sid, mid) {
   if (state.pollingMids.has(mid)) return;   // 已在轮询,别重复起 interval
   state.pollingMids.add(mid);
   const since = Date.now();
-  let renderedSteps = 0;
+  // 逐条亮出(自愈式):始终按「DOM 已显示条数」从服务端最新 steps 数组取下一条,
+  // 每 230ms 一条 —— 中途整体重渲(刷新/授权浮卡)后自动对齐,不可能重复或乱序。
+  let latestSteps = [];
+  let revealTimer = null;
+  let stopped = false;
+  const stepsBoxOf = () => {
+    const n = document.querySelector(`.msg[data-mid="${mid}"]`);
+    return n ? n.querySelector(".trace-steps") : null;
+  };
+  const drain = () => {
+    if (stopped || revealTimer) return;
+    revealTimer = setTimeout(() => {
+      revealTimer = null;
+      if (stopped) return;
+      const box = stepsBoxOf();
+      if (box && box.children.length < latestSteps.length) {
+        const s = latestSteps[box.children.length];   // 永远取"下一条",以 DOM 为准
+        const wasNearBottom =
+          ($("main").scrollHeight - $("main").scrollTop - $("main").clientHeight) < 80;
+        const div = document.createElement("div");
+        div.className = `step ${s.kind || "step"}`;
+        div.textContent = s.label;
+        box.appendChild(div);
+        if (wasNearBottom) $("main").scrollTop = $("main").scrollHeight;
+        if (box.children.length < latestSteps.length) drain();
+      }
+    }, 230);
+  };
   const intv = setInterval(async () => {
     try {
       const m = await api("GET", `/api/sessions/${sid}/messages/${mid}`);
@@ -450,16 +544,19 @@ function pollMessage(sid, mid) {
                         m.status === "needs_cipher" || m.status === "cancelled");
       const awaitingDecrypt = (m.status === "awaiting_decrypt");
 
-      // 出现授权门 → 主动重渲一次(把浮卡渲出来),但不终止轮询
-      if (awaitingDecrypt && node) {
+      // 出现授权门 → 主动重渲一次(把浮卡渲出来),但不终止轮询;
+      // 浮卡已在则不再重渲(避免每 tick 重置折叠/滚动状态)
+      if (awaitingDecrypt && node && !node.querySelector(".decrypt-card")) {
         const fresh = renderMessage(m);
         node.replaceWith(fresh);
+        latestSteps = m.steps || [];   // 整体重渲已含全部 step,对齐基准
         $("main").scrollTop = $("main").scrollHeight;
       }
       const idx = state.currentSession?.messages?.findIndex(x => x.id === mid);
       if (idx >= 0) state.currentSession.messages[idx] = m;
 
       if (terminal) {
+        stopped = true;
         // 终态:完整重渲 → 折叠态、显示 summary / Excel 卡 / 错误 / 取消
         if (node) {
           const fresh = renderMessage(m);
@@ -473,9 +570,9 @@ function pollMessage(sid, mid) {
         return;
       }
 
-      // running 增量:把新出现的 step 行追加到现有 trace 里
+      // running 增量:新 step 进显示队列,由 drain 逐条亮出(不一次性贴一堆)
       const steps = m.steps || [];
-      if (node && steps.length > renderedSteps) {
+      if (node && steps.length) {
         let stepsBox = node.querySelector(".trace-steps");
         let traceDetails = node.querySelector("details.trace");
         // 极少数情况:首批 step 抵达前 trace 还没渲;补建一个
@@ -495,24 +592,15 @@ function pollMessage(sid, mid) {
           }
         }
         if (stepsBox) {
-          const wasNearBottom =
-            ($("main").scrollHeight - $("main").scrollTop - $("main").clientHeight) < 80;
-          for (let i = renderedSteps; i < steps.length; i++) {
-            const s = steps[i];
-            const div = document.createElement("div");
-            div.className = `step ${s.kind || "step"}`;
-            div.textContent = s.label;
-            stepsBox.appendChild(div);
-          }
-          renderedSteps = steps.length;
-          if (wasNearBottom) $("main").scrollTop = $("main").scrollHeight;
+          latestSteps = steps;
+          if (stepsBox.children.length < steps.length) drain();
         }
       }
     } catch (e) {
       clearInterval(intv);
       state.pollingMids.delete(mid);
     }
-  }, 1200);
+  }, 600);
 }
 
 // ============ 当前会话后台同步 ============
@@ -591,6 +679,7 @@ async function sendMessage() {
   try {
     const res = await api("POST", `/api/sessions/${state.currentSid}/messages`, {
       content: text, attached_cipher, text_attachments,
+      web_search: !!state.webSearch,
     });
     state.currentSession.messages.push(res.user_message, res.assistant_message);
     if (state.currentSession.messages.length === 2 && state.currentSession.title === "新会话") {
@@ -1028,7 +1117,12 @@ function renderPendingList() {
     b.disabled = true; b.textContent = "解密中…";
     try {
       const r = await api("POST", `/api/scheduled_tasks/decrypt/${b.dataset.decrypt}`);
-      $("tasksAlert").innerHTML = `<div class="alert-box success">✓ 已解密 ${r.count} 次运行 → 文件夹:<span class="mono">${esc(r.folder)}</span></div>`;
+      let msg = `<div class="alert-box success">✓ 已解密 ${r.count} 次运行 → 文件夹:<span class="mono">${esc(r.folder)}</span></div>`;
+      if (r.failed) {
+        const firstErr = (r.failures && r.failures[0] && r.failures[0].error) || "";
+        msg += `<div class="alert-box">⚠ ${r.failed} 次运行解密失败,已保留待批可重试:${esc(firstErr)}</div>`;
+      }
+      $("tasksAlert").innerHTML = msg;
       await loadTasksData(); renderPendingList(); renderTaskHistory(); refreshTasksBadge();
     } catch (e) {
       $("tasksAlert").innerHTML = `<div class="alert-box">解密失败:${esc(e.message)}</div>`;
@@ -1676,6 +1770,22 @@ function bindEvents() {
     handleFileAttach(e.target.files);
     e.target.value = "";  // 允许重复选同一文件
   });
+
+  // 联网搜索开关:点亮即在后续消息里启用(需所用模型支持,否则后端自动降级)。
+  // 状态持久化:启动时回显上次选择,点击时写回 localStorage。
+  const wsBtn = $("webSearchBtn");
+  if (wsBtn) {
+    const syncWs = () => {
+      wsBtn.classList.toggle("active", state.webSearch);
+      wsBtn.setAttribute("aria-pressed", state.webSearch ? "true" : "false");
+    };
+    syncWs();  // 回显持久化的初始状态
+    wsBtn.addEventListener("click", () => {
+      state.webSearch = !state.webSearch;
+      try { localStorage.setItem("cw_web_search", state.webSearch ? "1" : "0"); } catch (e) {}
+      syncWs();
+    });
+  }
 
   // 拖拽到 composer overlay
   const modalOpen = () => $("modalMask").classList.contains("open");
