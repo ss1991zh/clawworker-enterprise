@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}Admin · Clawworker Enterprise{% endblock %}</title>
-  <link rel="stylesheet" href="/admin/static/admin.css">
+  <link rel="stylesheet" href="/admin/static/admin.css?v={{ asset_ver('admin.css') }}">
 </head>
 <body>
   <header class="topbar">
@@ -14,6 +14,7 @@
       <a href="/admin/users" class="{% if active=='users' %}active{% endif %}">用户</a>
       <a href="/admin/llm" class="{% if active=='llm' %}active{% endif %}">LLM 配置</a>
       <a href="/admin/sessions" class="{% if active=='sessions' %}active{% endif %}">会话</a>
+      <a href="/admin/ops" class="{% if active=='ops' %}active{% endif %}">运维</a>
     </nav>
   </header>
 

@@ -1,0 +1,163 @@
+{% extends "base.html" %}
+{% block title %}运维 / 服务 · Clawworker Enterprise{% endblock %}
+{% block content %}
+
+<div class="page-head">
+  <h2>运维 / 服务</h2>
+  <p class="muted">开机自启 · 健康监控 · 崩溃自愈 —— 当前平台
+    <span class="pill muted" id="platform">{{ snap.platform }}</span>
+    <span class="muted" style="margin-left:10px;">每 4 秒自动刷新</span>
+  </p>
+</div>
+
+<!-- 状态总览 -->
+<div class="kpi-grid">
+  <div class="kpi-card">
+    <div class="label">守护进程 Supervisor</div>
+    <div class="value" id="kpi-sup">
+      {% if snap.supervisor.running %}<span class="ok">运行中</span>{% else %}<span class="bad">未运行</span>{% endif %}
+    </div>
+    <div class="hint" id="kpi-sup-hint">{% if snap.supervisor.pid %}pid {{ snap.supervisor.pid }}{% else %}崩溃自愈未生效{% endif %}</div>
+  </div>
+  <div class="kpi-card">
+    <div class="label">开机自启</div>
+    <div class="value" id="kpi-auto">
+      {% if snap.autostart.installed %}<span class="ok">已启用</span>{% else %}<span class="bad">未启用</span>{% endif %}
+    </div>
+    <div class="hint">{{ snap.autostart.detail }}</div>
+  </div>
+  {% for s in snap.services %}
+  <div class="kpi-card">
+    <div class="label">{{ s.label }} · :{{ s.port }}</div>
+    <div class="value" id="kpi-svc-{{ s.key }}">
+      {% if s.healthy %}<span class="ok">健康</span>{% else %}<span class="bad">不可达</span>{% endif %}
+    </div>
+    <div class="hint" id="kpi-svc-hint-{{ s.key }}">
+      {% if s.managed %}受管 · 重启 {{ s.restarts }} 次{% else %}外部实例 / 未受管{% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+
+<!-- 服务实例表 -->
+<div class="panel">
+  <div class="panel-header"><h3>服务实例</h3></div>
+  <div class="panel-body" style="padding:0;">
+    <table class="table">
+      <thead>
+        <tr><th>服务</th><th>端口</th><th>状态</th><th>受管 PID</th><th>重启次数</th><th>最近重启</th><th style="text-align:right;">操作</th></tr>
+      </thead>
+      <tbody id="svc-tbody">
+        {% for s in snap.services %}
+        <tr data-key="{{ s.key }}">
+          <td>{{ s.label }}</td>
+          <td class="mono">{{ s.port }}</td>
+          <td class="c-status">
+            {% if s.healthy %}<span class="pill active">健康</span>{% else %}<span class="pill disabled">不可达</span>{% endif %}
+          </td>
+          <td class="mono c-pid">{{ s.pid or "—" }}</td>
+          <td class="c-rst">{{ s.restarts }}</td>
+          <td class="mono c-last">{{ s.last_restart or "—" }}</td>
+          <td style="text-align:right;">
+            <form method="post" action="/admin/ops/restart/{{ s.key }}" style="display:inline;"
+                  onsubmit="return confirm('托管重启「{{ s.label }}」?守护会在数秒内拉起新实例。{% if s.key == 'host' %}\n注意:重启控制面会使本页短暂断开,稍后刷新即可。{% endif %}');">
+              <button class="btn btn-secondary btn-sm" type="submit">托管重启</button>
+            </form>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- 开机自启 & 守护控制 -->
+<div class="panel">
+  <div class="panel-header"><h3>开机自启 &amp; 守护</h3></div>
+  <div class="panel-body">
+    <dl>
+      <div class="dl-row"><dt>机制</dt><dd>{{ snap.autostart.kind }} · {{ snap.autostart.detail }}</dd></div>
+      <div class="dl-row"><dt>守护脚本</dt><dd class="mono">{{ supervisor_py }}</dd></div>
+      <div class="dl-row"><dt>守护日志</dt><dd class="mono">{{ log_path }}</dd></div>
+    </dl>
+
+    <div class="ops-actions" style="display:flex; gap:12px; flex-wrap:wrap; margin-top:16px;">
+      <form method="post" action="/admin/ops/autostart/enable">
+        <button class="btn btn-primary" type="submit">启用开机自启 + 守护</button>
+      </form>
+      <form method="post" action="/admin/ops/autostart/disable"
+            onsubmit="return confirm('停用开机自启,并停止守护(host/client 仍继续运行,但崩溃后不再自动重启)?');">
+        <button class="btn btn-danger" type="submit">停用</button>
+      </form>
+      <form method="post" action="/admin/ops/supervisor/start">
+        <button class="btn btn-secondary" type="submit">仅启动守护(本次)</button>
+      </form>
+      <form method="post" action="/admin/ops/supervisor/stop"
+            onsubmit="return confirm('停止守护?崩溃自愈将失效,直到重新启动守护(服务本身保留)。');">
+        <button class="btn btn-secondary" type="submit">停止守护</button>
+      </form>
+    </div>
+
+    <div class="alert info" style="margin-top:18px;">
+      <strong>工作原理:</strong>开机自启只负责在登录时拉起 <code>supervisor.py</code> 一个守护进程;
+      由守护进程负责启动、健康探测、崩溃后退避重启<strong>本机所承担的服务</strong>——
+      这套自愈逻辑三平台一致。
+      <br><strong>部署边界:</strong>本机(控制面)只托管 <code>Host :8443</code>;
+      数据面 <code>Client :8444</code> 运行在<strong>各终端用户机器</strong>上,由那台机器自己的守护托管
+      (终端机部署时设 <code>CLAWWORKER_MANAGED_SERVICES=client</code>),不在本机管理范围内。
+      {% if snap.platform == 'darwin' %}
+        macOS 用 <code>LaunchAgent</code>(<code>RunAtLoad</code>+<code>KeepAlive</code>),
+        登录即启动,且守护自身被 launchd KeepAlive 兜底。
+      {% elif snap.platform == 'linux' %}
+        Linux 用 <code>systemd --user</code>(<code>Restart=on-failure</code>);
+        如需"未登录也自启",已尝试 <code>loginctl enable-linger</code>。
+      {% elif snap.platform == 'windows' %}
+        Windows 用计划任务(<code>schtasks /SC ONLOGON</code>),登录时启动守护。
+      {% endif %}
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  function set(el, html) { if (el) el.innerHTML = html; }
+  function pill(ok, okText, badText) {
+    return ok ? '<span class="pill active">' + okText + '</span>'
+              : '<span class="pill disabled">' + badText + '</span>';
+  }
+  async function refresh() {
+    let snap;
+    try {
+      const r = await fetch('/admin/ops/status.json', { cache: 'no-store' });
+      if (!r.ok) return;
+      snap = await r.json();
+      if (snap.error) return;
+    } catch (e) { return; }
+
+    // KPI: 守护 / 自启
+    set(document.getElementById('kpi-sup'),
+        snap.supervisor.running ? '<span class="ok">运行中</span>' : '<span class="bad">未运行</span>');
+    set(document.getElementById('kpi-sup-hint'),
+        snap.supervisor.pid ? ('pid ' + snap.supervisor.pid) : '崩溃自愈未生效');
+    set(document.getElementById('kpi-auto'),
+        snap.autostart.installed ? '<span class="ok">已启用</span>' : '<span class="bad">未启用</span>');
+
+    // 每个服务
+    (snap.services || []).forEach(function (s) {
+      set(document.getElementById('kpi-svc-' + s.key),
+          s.healthy ? '<span class="ok">健康</span>' : '<span class="bad">不可达</span>');
+      set(document.getElementById('kpi-svc-hint-' + s.key),
+          s.managed ? ('受管 · 重启 ' + s.restarts + ' 次') : '外部实例 / 未受管');
+      const tr = document.querySelector('#svc-tbody tr[data-key="' + s.key + '"]');
+      if (tr) {
+        set(tr.querySelector('.c-status'), pill(s.healthy, '健康', '不可达'));
+        set(tr.querySelector('.c-pid'), s.pid || '—');
+        set(tr.querySelector('.c-rst'), s.restarts);
+        set(tr.querySelector('.c-last'), s.last_restart || '—');
+      }
+    });
+  }
+  setInterval(refresh, 4000);
+})();
+</script>
+{% endblock %}

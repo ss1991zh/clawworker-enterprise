@@ -37,6 +37,19 @@ _HOST_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_HOST_DIR / "templates"))
 
 
+def _asset_ver(name: str) -> str:
+    """静态资源版本号 = 文件 mtime,用于 ?v= 破缓存。
+    改了 admin.css 后无需手动 bump、也不依赖用户硬刷新。"""
+    try:
+        return str(int((_HOST_DIR / "static" / name).stat().st_mtime))
+    except OSError:
+        return "0"
+
+
+# 注册为 Jinja 全局,所有模板可直接 {{ asset_ver('admin.css') }}
+templates.env.globals["asset_ver"] = _asset_ver
+
+
 def _mask_token(token: str, keep: int = 6) -> str:
     if not token:
         return "—"
@@ -530,6 +543,94 @@ def build_admin_router(
     def session_revoke(request: Request, token: str):
         user_manager.logout(token)
         return _flash_redirect("/admin/sessions", ("success", "会话已注销"))
+
+    # ============================================================
+    # 运维 / 服务(开机自启 + 健康监控 + 崩溃自愈)
+    # ============================================================
+
+    @router.get("/ops", response_class=HTMLResponse)
+    def ops_view(request: Request):
+        from host import service_manager as sm
+
+        def _safe(fn, default):
+            try:
+                return fn()
+            except Exception:
+                return default
+
+        snap = _safe(sm.status_snapshot, {
+            "platform": sm.current_platform(),
+            "supervisor": {"running": False, "pid": None},
+            "autostart": {"installed": False, "kind": "unknown", "detail": ""},
+            "services": [],
+        })
+        return templates.TemplateResponse(
+            request, "ops.html",
+            {
+                "active": "ops",
+                "snap": snap,
+                "supervisor_py": str(sm.SUPERVISOR_PY),
+                "log_path": str(sm.SUP_LOG),
+                "messages": _pop_messages(request),
+            },
+        )
+
+    @router.get("/ops/status.json")
+    def ops_status_json(request: Request):
+        from host import service_manager as sm
+        try:
+            return JSONResponse(sm.status_snapshot())
+        except Exception as e:  # noqa: BLE001
+            return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+    @router.post("/ops/autostart/enable")
+    def ops_autostart_enable(request: Request):
+        from host import service_manager as sm
+        try:
+            msg = sm.install_autostart()
+            sm.ensure_supervisor_running()
+            return _flash_redirect("/admin/ops", ("success", f"已启用开机自启 + 守护 · {msg}"))
+        except Exception as e:  # noqa: BLE001
+            return _flash_redirect("/admin/ops", ("error", f"启用失败:{e}"))
+
+    @router.post("/ops/autostart/disable")
+    def ops_autostart_disable(request: Request):
+        from host import service_manager as sm
+        try:
+            msg = sm.uninstall_autostart()
+            sm.stop_supervisor(kill_children=False)  # 停守护但保留服务,admin 不掉线
+            return _flash_redirect("/admin/ops",
+                                   ("success", f"已停用开机自启 · {msg} · 守护已停(服务仍在运行)"))
+        except Exception as e:  # noqa: BLE001
+            return _flash_redirect("/admin/ops", ("error", f"停用失败:{e}"))
+
+    @router.post("/ops/supervisor/start")
+    def ops_supervisor_start(request: Request):
+        from host import service_manager as sm
+        try:
+            started = sm.ensure_supervisor_running()
+            msg = "守护已启动" if started else "守护已在运行"
+            return _flash_redirect("/admin/ops", ("success", msg))
+        except Exception as e:  # noqa: BLE001
+            return _flash_redirect("/admin/ops", ("error", f"启动守护失败:{e}"))
+
+    @router.post("/ops/supervisor/stop")
+    def ops_supervisor_stop(request: Request):
+        from host import service_manager as sm
+        try:
+            msg = sm.stop_supervisor(kill_children=False)
+            return _flash_redirect("/admin/ops", ("success", f"{msg}(子服务保留)"))
+        except Exception as e:  # noqa: BLE001
+            return _flash_redirect("/admin/ops", ("error", f"停止守护失败:{e}"))
+
+    @router.post("/ops/restart/{which}")
+    def ops_restart(request: Request, which: str):
+        from host import service_manager as sm
+        try:
+            msg = sm.restart_service(which)
+            return _flash_redirect("/admin/ops", ("success", msg))
+        except Exception as e:  # noqa: BLE001
+            return _flash_redirect("/admin/ops", ("error", f"重启失败:{e}"))
 
     return router
 
