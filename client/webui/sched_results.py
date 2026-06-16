@@ -93,6 +93,60 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
     return manifest
 
 
+def _sanitize(name: str, fallback: str = "定时任务结果") -> str:
+    return "".join(ch for ch in (name or "") if ch not in '\\/:*?"<>|').strip() or fallback
+
+
+def task_output_subdirs(output_folder: str) -> tuple[Path, Path]:
+    """在每任务的输出文件夹下确保 密文/ 与 明文/ 两个子文件夹存在,返回 (密文, 明文)。"""
+    root = Path(output_folder).expanduser()
+    cipher_dir = root / "密文"
+    plain_dir = root / "明文"
+    cipher_dir.mkdir(parents=True, exist_ok=True)
+    plain_dir.mkdir(parents=True, exist_ok=True)
+    return cipher_dir, plain_dir
+
+
+def export_encrypted_run_to_folder(run_id: str, manifest: list, output_folder: str,
+                                   stem: str, run_at: str = "") -> Optional[Path]:
+    """把一次运行的加密结果(沙盒密文 + 明文身份列)组装成一个**密文 Excel**,
+    落到 <output_folder>/密文/。数值列保持 base64 密文,身份列明文 —— 未授权也能看到/留存。
+    返回落盘路径(无可写内容则 None)。"""
+    import pandas as pd
+    from datetime import datetime
+
+    from client.webui.writer import write_skill_results
+
+    cipher_dir, _ = task_output_subdirs(output_folder)
+    sheets: list[dict] = []
+    for entry in manifest:
+        parts = []
+        if entry.get("id_csv") and Path(entry["id_csv"]).exists():
+            parts.append(pd.read_csv(entry["id_csv"], dtype=str, keep_default_na=False)
+                         .reset_index(drop=True))
+        if entry.get("num_enc") and Path(entry["num_enc"]).exists():
+            # 密文 xlsx:数值列已是 base64 ciphertext,按字符串原样读出
+            parts.append(pd.read_excel(entry["num_enc"], dtype=str).reset_index(drop=True))
+        if not parts:
+            continue
+        merged = pd.concat(parts, axis=1)
+        order = [c for c in entry.get("col_order", []) if c in merged.columns]
+        if order:
+            merged = merged[order]
+        # 不带 chart 键:密文不可作图
+        sheets.append({"sheet_name": str(entry.get("sheet_name") or "结果")[:31], "df": merged})
+    if not sheets:
+        return None
+    ts = (run_at or "").replace(":", "").replace("-", "").replace("T", "_")[:15] or secrets.token_hex(3)
+    dst = cipher_dir / f"{_sanitize(stem, 'result')}_密文_{ts}.xlsx"
+    seq = 2
+    while dst.exists():
+        dst = cipher_dir / f"{_sanitize(stem, 'result')}_密文_{ts}_{seq}.xlsx"
+        seq += 1
+    write_skill_results(sheets, path=dst)
+    return dst
+
+
 def decrypt_persisted_run_to_excel(run_id: str, stem: str = "analysis"):
     """
     把一次加密暂存的结果(run_id 沙盒)解密为单个明文 Excel,返回落盘路径(~/Downloads)。
@@ -164,29 +218,32 @@ def _decrypt_one_sheet(entry: dict):
     return merged
 
 
-def decrypt_runs_to_folder(runs: list[dict], folder_name: str) -> tuple[Path, list[dict]]:
+def decrypt_runs_to_folder(runs: list[dict], folder_name: str,
+                           output_folder: str = "") -> tuple[Path, list[dict]]:
     """
-    批量解密多次运行 → 明文 Excel 落到 ~/Downloads/<folder_name>/。
+    批量解密多次运行 → 明文 Excel 落盘。
 
-    runs: [{run_id, run_at, manifest: [...], question}]
-      每次运行 → 一个 Excel 文件(多 sheet)。
+    - 指定了 output_folder(每任务专属):明文落 <output_folder>/明文/(密文版已在 密文/)。
+    - 否则:回退 ~/Downloads/<folder_name>/。
 
-    返回 (文件夹路径, 逐 run 结果):
-      [{run_id, ok, file, sheets, error}]
+    runs: [{run_id, run_at, manifest: [...], question}] —— 每次运行 → 一个 Excel(多 sheet)。
+
+    返回 (文件夹路径, 逐 run 结果):[{run_id, ok, file, sheets, error}]
     —— 调用方**只对 ok=True 的 run** 做 mark_decrypted / 清沙盒;
-       ok=False(沙盒密文缺失、解密报错等)的 run 保持待批、密文保留,可重试排查。
-       此前版本会静默跳过失败 run 仍整批标记已解密 → 数据无声丢失,见 bug 修复记录。
+       ok=False 的 run 保持待批、密文保留,可重试排查。
     """
     from datetime import datetime
 
     from client.webui.writer import write_skill_results
 
-    downloads = Path.home() / "Downloads"
-    safe = "".join(ch for ch in folder_name if ch not in '\\/:*?"<>|').strip() or "定时任务结果"
-    out_dir = downloads / safe
-    # 防重名
-    if out_dir.exists():
-        out_dir = downloads / f"{safe}_{datetime.now().strftime('%H%M%S')}"
+    safe = _sanitize(folder_name)
+    if output_folder:
+        _, out_dir = task_output_subdirs(output_folder)   # <folder>/明文/
+    else:
+        downloads = Path.home() / "Downloads"
+        out_dir = downloads / safe
+        if out_dir.exists():
+            out_dir = downloads / f"{safe}_{datetime.now().strftime('%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     outcomes: list[dict] = []

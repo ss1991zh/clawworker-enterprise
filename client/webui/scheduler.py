@@ -148,6 +148,8 @@ class ScheduledTask:
     cipher_path: str = ""               # 固定密文(空 = 不绑固定文件)
     source_folder: str = ""             # 绑定源文件夹:到点取最新明文文件自动加密再分析
     source_pattern: str = ""            # 可选 glob(默认 *.csv/*.xlsx/*.xls 取最新)
+    output_folder: str = ""             # 每任务专属输出文件夹(内自动分 密文/ 明文/);空=回退 ~/Downloads/<name>/
+    web_search: bool = False            # 联网搜索(查天气/新闻/资料等实时信息;主要用于无数据的问答任务)
     # 周期:kind ∈ interval / daily / weekly / monthly / cron
     schedule_kind: str = "daily"
     interval_minutes: int = 60          # kind=interval 时用
@@ -487,6 +489,80 @@ class EncryptedResultStore(_JsonStore):
             self._flush()
 
 
+@dataclass
+class MissedRun:
+    """一次本该执行却没跑成的运行(漏跑)—— 服务当时没运行 / 未登录 / 无数据。
+    供监控预警 + 手动补救(补救时让用户指定该轮数据文件)。"""
+    id: str
+    username: str
+    task_id: str
+    task_name: str
+    question: str
+    due_at: str                         # 本应执行的时间
+    reason: str                         # 漏跑原因(中文)
+    needs_data: bool = False            # 该任务需不需要数据(补救时是否要选文件)
+    status: str = "pending"             # pending / resolved / dismissed
+    created_at: str = field(default_factory=lambda: _iso(_now()))
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+class MissedRunStore(_JsonStore):
+    def __init__(self, path: Optional[Path] = None):
+        super().__init__(path or SCHED_DIR / "missed.json")
+        self._items: dict[str, MissedRun] = {}
+        for d in self._read():
+            try:
+                m = MissedRun(**{k: d.get(k) for k in MissedRun.__dataclass_fields__ if k in d})
+                self._items[m.id] = m
+            except Exception:
+                continue
+
+    def _flush(self):
+        self._write([m.to_dict() for m in self._items.values()])
+
+    def add(self, **kw) -> "MissedRun":
+        with self._lock:
+            mid = secrets.token_hex(5)
+            while mid in self._items:
+                mid = secrets.token_hex(5)
+            m = MissedRun(id=mid, **kw)
+            self._items[mid] = m
+            self._flush()
+            return m
+
+    def has_pending(self, task_id: str, due_at: str) -> bool:
+        """去重:同一任务同一到点窗口只记一条 pending。"""
+        return any(m.task_id == task_id and m.due_at == due_at and m.status == "pending"
+                   for m in self._items.values())
+
+    def add_deduped(self, **kw) -> Optional["MissedRun"]:
+        if self.has_pending(kw.get("task_id", ""), kw.get("due_at", "")):
+            return None
+        return self.add(**kw)
+
+    def list_pending(self, username: str) -> list["MissedRun"]:
+        out = [m for m in self._items.values()
+               if m.username == username and m.status == "pending"]
+        out.sort(key=lambda m: m.due_at, reverse=True)
+        return out
+
+    def get(self, mid: str) -> Optional["MissedRun"]:
+        return self._items.get(mid)
+
+    def set_status(self, mid: str, status: str) -> None:
+        with self._lock:
+            m = self._items.get(mid)
+            if m:
+                m.status = status
+                self._flush()
+
+    def count_pending(self, username: str) -> int:
+        return sum(1 for m in self._items.values()
+                   if m.username == username and m.status == "pending")
+
+
 # ---------------------------------------------------------------------------
 # 调度器
 # ---------------------------------------------------------------------------
@@ -495,9 +571,13 @@ class Scheduler:
     """后台线程 · 每 poll 秒检查到点任务 · 调 on_fire(task)。"""
 
     def __init__(self, task_store: TaskStore, on_fire: Callable[[ScheduledTask], None],
-                 poll_seconds: int = 30):
+                 poll_seconds: int = 30,
+                 on_miss: Optional[Callable[[ScheduledTask, datetime], None]] = None,
+                 miss_grace_seconds: int = 600):
         self._tasks = task_store
         self._on_fire = on_fire
+        self._on_miss = on_miss
+        self._miss_grace = miss_grace_seconds   # next_run 过期超过这个秒数 = 漏跑(服务当时没运行)
         self._poll = poll_seconds
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -531,9 +611,17 @@ class Scheduler:
                 self._tasks.mark_fired(t.id)
                 continue
             if nxt <= now:
+                late = (now - nxt).total_seconds()
                 # 先推进 next_run,避免回调里异常导致重复触发
                 self._tasks.mark_fired(t.id)
-                try:
-                    self._on_fire(t)
-                except Exception:
-                    pass
+                if late > self._miss_grace and self._on_miss is not None:
+                    # 到点窗口已过去很久 = 服务当时没运行(漏跑)→ 记预警,不自动补跑
+                    try:
+                        self._on_miss(t, nxt)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._on_fire(t)
+                    except Exception:
+                        pass

@@ -191,8 +191,17 @@ class OpenAICompatibleProvider(LLMProvider):
         """按 base_url 给出该服务的联网搜索参数;不支持则返回 {}(降级为普通调用)。"""
         base = self._base_url.lower()
         if "openrouter" in base:
-            # OpenRouter:web 插件(走 Exa),对任意模型生效
-            return {"extra_body": {"plugins": [{"id": "web"}]}}
+            # OpenRouter:web 插件(走 Exa),对任意模型生效。
+            # max_results 调到 10(默认 ~5)多拉源;search_prompt 引导优先采用权威/最新信息并标注来源。
+            return {"extra_body": {"plugins": [{
+                "id": "web",
+                "max_results": 10,
+                "search_prompt": (
+                    "以下是联网检索到的相关网页结果。请**优先采用其中权威、最新**的信息作答;"
+                    "遇到有时效性的问题(价格、天气、新闻、最新口径等)以检索结果为准,不要凭记忆;"
+                    "在相关结论处用 [来源](URL) 标注引用。"
+                ),
+            }]}}
         if "openai.com" in base:
             # OpenAI:仅部分模型支持;失败会被外层 try 兜底降级
             return {"extra_body": {"web_search_options": {}}}

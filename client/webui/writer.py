@@ -102,10 +102,26 @@ def derive_excel_stem(cipher_path: Optional[Path], user_query: str) -> str:
     return stem
 
 
+# 用户为定时任务显式指定的输出文件夹根(由 app 在 create/patch/startup 注册)。
+# 这是用户主动选择的落盘位置(等同选择下载目录),纳入白名单。
+_EXTRA_OUTPUT_ROOTS: set[Path] = set()
+
+
+def register_output_root(folder) -> None:
+    """登记一个用户指定的输出文件夹根,使其下的 Excel 写入通过白名单校验。"""
+    try:
+        if folder:
+            _EXTRA_OUTPUT_ROOTS.add(Path(folder).expanduser().resolve())
+    except Exception:
+        pass
+
+
 def enforce_excel_path(path: Path) -> Path:
-    """B6 §2:Excel 输出强制在白名单目录(~/Downloads/ 或暂存 ~/.agent-system/outputs/)。"""
+    """B6 §2:Excel 输出强制在白名单目录 —— ~/Downloads/、暂存 ~/.agent-system/outputs/,
+    以及用户为定时任务显式指定并已登记的输出文件夹。"""
     resolved = path.expanduser().resolve()
-    for r in [(Path.home() / "Downloads").resolve(), OUTPUTS_DIR.resolve()]:
+    roots = [(Path.home() / "Downloads").resolve(), OUTPUTS_DIR.resolve(), *_EXTRA_OUTPUT_ROOTS]
+    for r in roots:
         try:
             resolved.relative_to(r)
             return resolved

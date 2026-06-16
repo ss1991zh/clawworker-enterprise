@@ -16,10 +16,19 @@
         <p>同态加密 · 企业版</p>
       </div>
     </div>
+    <div class="sess-toggle" id="sessToggle">
+      <button class="sess-toggle__btn active" data-view="normal">普通会话</button>
+      <button class="sess-toggle__btn" data-view="scheduled">定时任务</button>
+    </div>
     <button class="new-btn ic-btn" id="newBtn">
       <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
            stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
       新建会话
+    </button>
+    <button class="new-btn ic-btn" id="newTaskBtn" style="display:none;">
+      <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+           stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+      新建定时任务
     </button>
     <div class="session-list" id="sessionList"></div>
     <div class="sidebar__foot">
@@ -43,41 +52,50 @@
              stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <h2 id="topTitle">智能分析助手</h2>
-      <button class="top-action" id="tasksBtn" title="定时任务" style="margin-left:auto;">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round">
-          <circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/>
-        </svg>
-        <span>定时任务</span>
-        <span class="badge-dot" id="tasksBadge" style="display:none;">0</span>
-      </button>
-      <button class="top-action" id="filesBtn" title="密文文件管理" style="margin-left:10px;">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-             stroke-linecap="round" stroke-linejoin="round">
-          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
-        </svg>
-        <span>密文文件</span>
-      </button>
+      <!-- 选中定时任务会话时显示:该任务的 4 个管理面板入口 -->
+      <div class="task-actions" id="taskActions" style="margin-left:auto; display:none;">
+        <button class="top-action" data-tpanel="pending" title="待解密文件" style="display:none;">
+          <span>待解密文件</span><span class="badge-dot" id="tasksBadge" style="display:none;">0</span>
+        </button>
+        <button class="top-action ta-missed" data-tpanel="missed" title="漏跑(未按时执行)" style="display:none;">
+          <span>漏跑</span><span class="badge-dot danger" id="missedBadge" style="display:none;">0</span>
+        </button>
+        <button class="top-action" data-tpanel="edit" title="编辑定时任务"><span>编辑任务</span></button>
+        <button class="top-action" data-tpanel="history" title="运行历史"><span>运行历史</span></button>
+        <span class="ta-divider"></span>
+        <button class="top-action ta-icon" data-tpanel="status" title="运行状态 · 全部定时任务">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3"/>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+          </svg>
+        </button>
+      </div>
     </div>
 
     <main id="main">
-      <div class="chat" id="chat">
-        <div class="welcome" id="welcome">
-          <div class="logo welcome-logo">爪</div>
-          <div class="big">同态加密 · 数据分析助手</div>
-          <div class="sub">明文不出本机 · 计算全程密文 · 输出 Excel 解密回本机</div>
-          <div class="chips">
-            <div class="chip">按大区统计销售目标完成率,完成档位涂色,导 Excel</div>
-            <div class="chip">用 ARIMA + EWMA 预测未来 12 个月销量,看产品线</div>
-            <div class="chip">算库存周转天数 + ABC 分类,标记呆滞物料</div>
-            <div class="chip">月度回款率 TOP10 / BOTTOM10 排行</div>
-          </div>
-          <p class="welcome-hint">点击左侧 <strong>新建会话</strong> 开始 · 或选一条已有会话继续</p>
-        </div>
-      </div>
+      <!-- #chat 由 JS 填充:恢复上次会话直接渲染,无会话才显示欢迎页 —— 避免首屏先闪"新会话页"再切走 -->
+      <div class="chat" id="chat"></div>
     </main>
 
     <footer>
+      <!-- 创建定时任务向导:内联在输入框上方(Claude Code 风格,一步步补全) -->
+      <div class="wiz-bar" id="wizBar" hidden>
+        <div class="wiz-bar__head">
+          <div class="wiz-bar__t">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>
+            <span>创建定时任务</span>
+          </div>
+          <div class="wiz-bar__dots" id="wizDots"></div>
+          <button class="wiz-bar__x" id="wizClose" aria-label="关闭">✕</button>
+        </div>
+        <div class="wiz-bar__body" id="wizBody"></div>
+        <div class="wiz-bar__foot">
+          <button class="wiz-ghost" id="wizBack">上一步</button>
+          <button class="wiz-go" id="wizNext">下一步</button>
+        </div>
+      </div>
+
       <div class="composer" id="composer">
         <!-- 已选密文 chip(本条消息附带的) -->
         <div class="attach-chips" id="attachChips"></div>
@@ -120,7 +138,6 @@
       <nav class="modal__nav">
         <h3>设置</h3>
         <button class="tab-btn active" data-tab="general">连接 / 计算</button>
-        <button class="tab-btn" data-tab="tasks">定时任务</button>
         <button class="tab-btn" data-tab="skills">Skill 管理</button>
         <button class="tab-btn" data-tab="keys">同态密钥</button>
         <button class="tab-btn" data-tab="account">账户</button>
@@ -137,6 +154,18 @@
              stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
       <div class="modal__body" id="filesBody"></div>
+    </div>
+  </div>
+
+  <!-- ============ 定时任务面板 Modal(选中定时会话后,顶栏 4 个入口打开)============ -->
+  <div class="modal-mask" id="taskPanelMask">
+    <div class="modal modal--single task-panel" style="position:relative;">
+      <button class="modal__close" id="taskPanelClose">
+        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+             stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+      <div class="task-panel__tabs" id="taskPanelTabs"></div>
+      <div class="modal__body" id="taskPanelBody"></div>
     </div>
   </div>
 

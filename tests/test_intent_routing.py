@@ -38,3 +38,21 @@ def test_data_ops_route_to_analysis(q):
 def test_plain_chat_not_analysis():
     assert looks_like_analysis("你好,你能做什么") is False
     assert looks_like_analysis("今天天气不错") is False
+
+
+def test_web_lookup_routes_to_freechat():
+    # 查外部实时信息 → 非分析(即便含"汇总"等聚合词,也走联网/自由聊天)
+    assert looks_like_analysis("查一下北京今天天气") is False
+    assert looks_like_analysis("汇总一下最新的行业新闻") is False
+    assert looks_like_analysis("现在的美元汇率是多少") is False
+    # 但若明确针对"这份数据" → 仍是分析,不被实时词带偏
+    assert looks_like_analysis("汇总这份数据每个大区的最新回款率") is True
+
+
+def test_web_lookup_detector():
+    from client.webui.pipeline import _looks_like_web_lookup
+    assert _looks_like_web_lookup("搜索今日国内热点新闻") is True
+    assert _looks_like_web_lookup("查一下上海明天天气") is True
+    assert _looks_like_web_lookup("按大区统计回款率") is False
+    # 针对"这份数据"的不算外部查询
+    assert _looks_like_web_lookup("搜索这份数据里的异常值") is False

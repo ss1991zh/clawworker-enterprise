@@ -50,7 +50,10 @@ def _provider(base_url, fail_on_extra=False):
 def test_openrouter_uses_web_plugin():
     p, calls = _provider("https://openrouter.ai/api/v1")
     p.raw_chat("sys", "今天北京天气?", web_search=True)
-    assert calls[-1].get("extra_body") == {"plugins": [{"id": "web"}]}
+    plugins = calls[-1].get("extra_body", {}).get("plugins")
+    assert plugins and plugins[0]["id"] == "web"
+    assert plugins[0].get("max_results") == 10        # 多拉源
+    assert plugins[0].get("search_prompt")            # 有搜索引导
 
 
 def test_openai_uses_web_search_options():

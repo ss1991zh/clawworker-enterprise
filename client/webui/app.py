@@ -41,10 +41,12 @@ from client.local_storage import LocalStorage
 from client.tools.crypto import ZFHE
 from client.webui import pipeline as pipeline_mod
 from client.webui import text_extract
+from client.webui import writer as writer_mod
 from client.webui.sessions import ChatSession, Message, SessionStore
 from client.webui.scheduler import (
     EncryptedResultStore,
     HistoryStore,
+    MissedRunStore,
     PendingStore,
     Scheduler,
     TaskStore,
@@ -110,6 +112,12 @@ _task_store = TaskStore()
 _pending_store = PendingStore()
 _run_history = HistoryStore()
 _enc_results = EncryptedResultStore()
+_missed_store = MissedRunStore()
+
+# 启动时登记所有已存在任务的输出文件夹根 → Excel 白名单(每任务专属输出夹)
+for _t in _task_store.all_enabled():
+    if getattr(_t, "output_folder", ""):
+        writer_mod.register_output_root(_t.output_folder)
 
 
 # ----------------------------------------------------------------------------
@@ -601,12 +609,72 @@ def _native_pick_folder() -> tuple[Optional[str], bool, str]:
         return None, False, "未找到系统文件选择器 · 请手动粘贴路径"
 
 
+def _native_pick_file() -> tuple[Optional[str], bool, str]:
+    """原生「选择文件」对话框(跨平台)—— 用于漏跑补救时指定该轮数据文件。"""
+    import subprocess
+    import sys
+
+    prompt = "选择该轮要处理的数据文件(CSV / Excel)"
+    plat = sys.platform
+    try:
+        if plat == "darwin":
+            script = f'POSIX path of (choose file with prompt "{prompt}")'
+            r = subprocess.run(["osascript", "-e", script],
+                               capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                if "-128" in (r.stderr or "") or "User canceled" in (r.stderr or ""):
+                    return None, True, ""
+                return None, False, (r.stderr or "").strip()[:120]
+            return (r.stdout or "").strip(), False, ""
+        if plat == "win32":
+            ps = (
+                "Add-Type -AssemblyName System.Windows.Forms;"
+                "$d = New-Object System.Windows.Forms.OpenFileDialog;"
+                f"$d.Title = '{prompt}';"
+                "$d.Filter = 'data (*.csv;*.xlsx;*.xls)|*.csv;*.xlsx;*.xls|all|*.*';"
+                "$r = $d.ShowDialog();"
+                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }"
+            )
+            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+                               capture_output=True, text=True, timeout=300)
+            path = (r.stdout or "").strip()
+            return (path, False, "") if path else (None, True, "")
+        for cmd in (["zenity", "--file-selection", f"--title={prompt}"],
+                    ["kdialog", "--getopenfilename", os.path.expanduser("~")]):
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+            except FileNotFoundError:
+                continue
+            if r.returncode != 0:
+                return None, True, ""
+            path = (r.stdout or "").strip()
+            return (path, False, "") if path else (None, True, "")
+        return None, False, "未找到 zenity/kdialog · 请手动粘贴路径"
+    except subprocess.TimeoutExpired:
+        return None, False, "选择超时"
+    except FileNotFoundError:
+        return None, False, "未找到系统文件选择器 · 请手动粘贴路径"
+
+
 @app.post("/api/pick_folder")
 def api_pick_folder():
     """原生「选择文件夹」对话框(macOS / Windows / Linux),返回绝对路径。"""
     if not _is_logged_in():
         return _need_login()
     path, cancelled, err = _native_pick_folder()
+    if cancelled:
+        return {"cancelled": True}
+    if err:
+        raise HTTPException(500, err)
+    return {"path": path, "cancelled": False}
+
+
+@app.post("/api/pick_file")
+def api_pick_file():
+    """原生「选择文件」对话框,返回绝对路径(漏跑补救指定该轮数据文件)。"""
+    if not _is_logged_in():
+        return _need_login()
+    path, cancelled, err = _native_pick_file()
     if cancelled:
         return {"cancelled": True}
     if err:
@@ -804,14 +872,34 @@ def _sess_for_user(sid: str) -> ChatSession:
 def api_sessions_list():
     if not _is_logged_in():
         return _need_login()
-    return [
-        {
+    out = []
+    for s in _sessions.list_for(_session_state["username"]):
+        tid = getattr(s, "task_id", "")
+        # 定时会话:带上其任务是否"有数据绑定"(决定是否显示「待解密文件」入口)+ 漏跑条数(侧栏红警示)
+        task_needs_data = False
+        missed_count = 0
+        if tid:
+            t = _task_store.get(tid)
+            if t:
+                task_needs_data = bool(t.needs_approval)
+            missed_count = sum(
+                1 for mr in _missed_store.list_pending(_session_state["username"])
+                if mr.task_id == tid
+            )
+        running = any(
+            m.role == "assistant" and m.status in ("pending", "running", "awaiting_decrypt")
+            for m in s.messages
+        )
+        out.append({
             "id": s.id, "title": s.title,
+            "kind": getattr(s, "kind", "normal"),
+            "task_id": tid, "task_needs_data": task_needs_data,
+            "missed_count": missed_count,
+            "running": running,
             "created_at": s.created_at, "updated_at": s.updated_at,
             "message_count": len(s.messages),
-        }
-        for s in _sessions.list_for(_session_state["username"])
-    ]
+        })
+    return out
 
 
 @app.post("/api/sessions")
@@ -847,7 +935,9 @@ def api_messages_list(sid: str):
         return _need_login()
     sess = _sess_for_user(sid)
     return {
-        "session": {"id": sess.id, "title": sess.title},
+        "session": {"id": sess.id, "title": sess.title,
+                    "kind": getattr(sess, "kind", "normal"),
+                    "updated_at": sess.updated_at},
         "messages": [m.to_dict() for m in sess.messages],
     }
 
@@ -929,6 +1019,73 @@ def api_messages_cancel(sid: str, mid: str):
     return {"ok": True}
 
 
+@app.post("/api/sessions/{sid}/messages/{mid}/wizard_done")
+def api_wizard_done(sid: str, mid: str):
+    """聊天向导创建成功后,把触发消息的 wizard 标记为已创建(卡片变「创建完成」并持久化)。"""
+    if not _is_logged_in():
+        return _need_login()
+    sess = _sess_for_user(sid)
+    for m in sess.messages:
+        if m.id == mid:
+            w = dict(getattr(m, "wizard", {}) or {})
+            w["created"] = True
+            _sessions.update_message(sid, mid, wizard=w)
+            return {"ok": True}
+    raise HTTPException(404, "消息不存在")
+
+
+@app.post("/api/sessions/{sid}/messages/{mid}/clarify")
+async def api_clarify(sid: str, mid: str, request: Request):
+    """歧义澄清:用户在澄清卡上做了选择。
+    choice=wizard → 返回抽取好的任务槽位(前端开向导);
+    choice=analyze → 清掉澄清,按"只算当前附件"重跑该消息(跳过意图识别);
+    choice=free → 仅清掉澄清,用户自行重述。"""
+    if not _is_logged_in():
+        return _need_login()
+    sess = _sess_for_user(sid)
+    data = await request.json()
+    choice = (data.get("choice") or "").strip()
+    msgs = sess.messages
+    idx = next((i for i, m in enumerate(msgs) if m.id == mid), -1)
+    if idx < 0:
+        raise HTTPException(404, "消息不存在")
+    _sessions.update_message(sid, mid, clarify={})   # 选了就清掉澄清卡
+
+    if choice == "wizard":
+        umsg = msgs[idx - 1] if idx > 0 and msgs[idx - 1].role == "user" else None
+        query = umsg.content if umsg else ""
+        try:
+            wiz = pipeline_mod.extract_task_slots(
+                _session_state["host_url"], _session_state["token"], query)
+        except Exception:
+            wiz = {"name": "", "question": query, "schedule_text": "",
+                   "cron": "", "cron_readable": "", "needs_data": True}
+        _sessions.update_message(sid, mid, summary="好的,来创建定时任务 👇")
+        return {"ok": True, "action": "wizard", "wizard": wiz}
+
+    if choice == "analyze":
+        umsg = msgs[idx - 1] if idx > 0 and msgs[idx - 1].role == "user" else None
+        if not umsg:
+            raise HTTPException(400, "找不到原始问题")
+        query, cipher = umsg.content, (umsg.attached_cipher or "")
+        history = []
+        for m in msgs[:idx - 1][-6:]:
+            if m.role == "user" and m.content:
+                history.append({"role": "user", "content": m.content})
+            elif m.role == "assistant" and m.status == "done" and m.summary:
+                history.append({"role": "assistant", "content": m.summary})
+        _sessions.update_message(sid, mid, status="pending", summary="", error="")
+        threading.Thread(
+            target=_run_pipeline,
+            args=(sid, mid, query, cipher, history, []),
+            kwargs={"skip_intent": True},
+            daemon=True, name=f"clarify-{sid}-{mid}",
+        ).start()
+        return {"ok": True, "action": "analyze", "rerun": True}
+
+    return {"ok": True, "action": "free"}
+
+
 @app.post("/api/sessions/{sid}/messages/{mid}/decrypt_decision")
 async def api_decrypt_decision(sid: str, mid: str, request: Request):
     """解密授权门:用户在浮卡上选了 decrypt / keep_encrypted。"""
@@ -977,6 +1134,7 @@ def _run_pipeline(
     output_mode: str = "interactive",
     sched_task: Optional[Any] = None,   # 定时密态任务对象(用于回填 EncryptedResult)
     web_search: bool = False,           # 用户开了「联网搜索」
+    skip_intent: bool = False,          # 跳过意图识别(歧义澄清后用户已明确选择,直接按选择跑)
 ) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
@@ -986,7 +1144,9 @@ def _run_pipeline(
         steps.append({"kind": kind, "label": label})
         _sessions.update_message(sid, asst_mid, steps=list(steps))
 
-    # 决定用哪份 cipher:这条消息带的 > 上一条 user 消息的
+    # 决定用哪份 cipher:这条消息带的 > 上一条 user 消息的(沿用)。
+    # 注意:是否真的"用"这份密文,由意图决定 —— 只有"对数据分析"的意图才会用它;
+    #       问天气/新闻/概念等会走自由聊天(见 pipeline.ask 的意图路由),与是否沿用无关。
     sess = _sessions.get(sid)
     cipher_path = None
     used_cipher = ""
@@ -998,6 +1158,34 @@ def _run_pipeline(
         if last and Path(last).exists():
             cipher_path = Path(last)
             used_cipher = last
+
+    # 意图识别(普通会话、交互式、未要求跳过时):
+    #   ① 矛盾/歧义(如"定时"措辞 + 带了附件)→ 先弹澄清卡让用户选,不擅自决定
+    #   ② 无歧义的排程意图 → 直接弹"创建定时任务"向导
+    if (output_mode == "interactive"
+            and sess is not None and getattr(sess, "kind", "normal") != "scheduled"
+            and not skip_intent):
+        amb = pipeline_mod.detect_intent_ambiguity(user_query, has_attachment=bool(cipher_path))
+        if amb:
+            _sessions.update_message(
+                sid, asst_mid, status="done",
+                summary="我需要先跟你确认一下 👇",
+                clarify=amb, duration_sec=round(time.time() - t0, 2),
+            )
+            return
+        if pipeline_mod.looks_like_schedule_request(user_query):
+            try:
+                wiz = pipeline_mod.extract_task_slots(
+                    _session_state["host_url"], _session_state["token"], user_query)
+            except Exception:
+                wiz = {"name": "", "question": user_query, "schedule_text": "",
+                       "cron": "", "cron_readable": "", "needs_data": True}
+            _sessions.update_message(
+                sid, asst_mid, status="done",
+                summary="看起来你想创建一个**定时任务**,我来帮你一步步设置 👇",
+                wizard=wiz, duration_sec=round(time.time() - t0, 2),
+            )
+            return
 
     try:
         base_prompt = load_system_prompt()
@@ -1107,6 +1295,7 @@ def _run_pipeline(
     # 定时密态:结果加密暂存 → 累积成 EncryptedResult(按任务聚合,待批量解密)
     if status == "encrypted_pending":
         enc = result.get("encrypted_run") or {}
+        run_summary = result.get("summary", "")
         if sched_task is not None and enc.get("manifest"):
             _enc_results.add(
                 username=sched_task.username, task_id=sched_task.id,
@@ -1114,9 +1303,23 @@ def _run_pipeline(
                 run_at=datetime.now().isoformat(timespec="seconds"),
                 question=sched_task.question, manifest=enc.get("manifest", []),
             )
+            # 每任务专属输出夹:把密文版 Excel 落到 <output_folder>/密文/(未授权也可见/留存)
+            of = getattr(sched_task, "output_folder", "")
+            if of:
+                try:
+                    from client.webui import sched_results
+                    writer_mod.register_output_root(of)
+                    p = sched_results.export_encrypted_run_to_folder(
+                        enc.get("run_id", run_id), enc.get("manifest", []),
+                        of, stem=sched_task.name,
+                        run_at=datetime.now().isoformat(timespec="seconds"))
+                    if p:
+                        run_summary += f" · 密文已存入 {Path(of).name}/密文/"
+                except Exception as e:  # noqa: BLE001 —— 落密文夹失败不影响沙盒暂存与后续解密
+                    run_summary += f" · (密文落盘失败:{type(e).__name__})"
         _sessions.update_message(
             sid, asst_mid, status="done",
-            summary=result.get("summary", ""),
+            summary=run_summary,
             skill_calls=result.get("skill_calls", []),
             used_cipher=used_cipher,
             duration_sec=round(time.time() - t0, 2),
@@ -1151,7 +1354,8 @@ def _ensure_task_session(task) -> str:
     sid = task.session_id
     sess = _sessions.get(sid) if sid else None
     if not sess:
-        sess = _sessions.create(username=task.username, title=f"⏰ {task.name}")
+        sess = _sessions.create(username=task.username, title=f"⏰ {task.name}",
+                                kind="scheduled", task_id=task.id)
         _task_store.update(task.id, session_id=sess.id)
         sid = sess.id
     return sid
@@ -1159,7 +1363,8 @@ def _ensure_task_session(task) -> str:
 
 def _launch_run(*, username: str, task_name: str, question: str,
                 cipher_path: str, session_id: str,
-                output_mode: str = "interactive", sched_task=None) -> None:
+                output_mode: str = "interactive", sched_task=None,
+                web_search: bool = False) -> None:
     """把一次运行注入聊天会话并跑 pipeline。output_mode=encrypted_sandbox 时密态结果加密暂存。"""
     sess = _sessions.get(session_id)
     if not sess:
@@ -1179,7 +1384,7 @@ def _launch_run(*, username: str, task_name: str, question: str,
     threading.Thread(
         target=_run_pipeline,
         args=(session_id, asst.id, question, cipher_path or "", history_for_llm, []),
-        kwargs={"output_mode": output_mode, "sched_task": sched_task},
+        kwargs={"output_mode": output_mode, "sched_task": sched_task, "web_search": web_search},
         daemon=True, name=f"sched-{session_id}-{asst.id}",
     ).start()
 
@@ -1232,17 +1437,46 @@ def _resolve_task_cipher(task) -> tuple[Optional[str], str]:
     return None, ""
 
 
+def _now_iso() -> str:
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def _record_missed(task, due_at: str, reason: str) -> None:
+    """记一条漏跑预警(去重:同任务同到点窗口只记一条 pending)。"""
+    try:
+        _missed_store.add_deduped(
+            username=task.username, task_id=task.id, task_name=task.name,
+            question=task.question, due_at=due_at or "", reason=reason,
+            needs_data=bool(task.needs_approval),
+        )
+    except Exception:
+        pass
+
+
+def _on_scheduler_miss(task, due_dt) -> None:
+    """调度器检测到漏跑(服务当时没运行,到点窗口已过去很久)→ 预警,不自动补跑。"""
+    due_at = due_dt.isoformat(timespec="seconds") if hasattr(due_dt, "isoformat") else str(due_dt)
+    _record_missed(task, due_at, "设定时间未执行(服务当时未运行)· 可手动补救")
+    _run_history.add(
+        username=task.username, task_id=task.id, task_name=task.name,
+        ran_at=_now_iso(), status="missed",
+        summary=f"漏跑:{due_at} 该轮未执行(服务未运行)· 已生成预警",
+    )
+
+
 def _on_scheduler_fire(task) -> None:
     """调度器到点回调(在 scheduler 线程里)。"""
     # 密态分析(有数据:固定密文 / 源文件夹)→ 正常计算,结果加密暂存,累积待批量解密
     if task.needs_approval:
         if not (_is_logged_in() and _session_state.get("username") == task.username):
-            # 仅活跃会话:没登录就不跑(下次到点再说)
+            # 仅活跃会话:没登录就不跑 → 记漏跑预警(可手动补救)
             _run_history.add(
                 username=task.username, task_id=task.id, task_name=task.name,
                 ran_at=datetime.now().isoformat(timespec="seconds"),
                 status="skipped", summary="到点时未登录 · 跳过(仅活跃会话)",
             )
+            _record_missed(task, task.next_run or _now_iso(),
+                           "到点时未登录,该轮未执行")
             return
         cipher_path, note = _resolve_task_cipher(task)
         if not cipher_path:
@@ -1251,11 +1485,14 @@ def _on_scheduler_fire(task) -> None:
                 ran_at=datetime.now().isoformat(timespec="seconds"),
                 status="skipped", summary=note or "无可用数据 · 跳过",
             )
+            _record_missed(task, task.next_run or _now_iso(),
+                           note or "无可用数据,该轮未执行")
             return
         sid = _ensure_task_session(task)
         _launch_run(username=task.username, task_name=task.name,
                     question=task.question, cipher_path=cipher_path,
-                    session_id=sid, output_mode="encrypted_sandbox", sched_task=task)
+                    session_id=sid, output_mode="encrypted_sandbox", sched_task=task,
+                    web_search=bool(getattr(task, "web_search", False)))
         _run_history.add(
             username=task.username, task_id=task.id, task_name=task.name,
             ran_at=datetime.now().isoformat(timespec="seconds"),
@@ -1267,7 +1504,8 @@ def _on_scheduler_fire(task) -> None:
     if _is_logged_in() and _session_state.get("username") == task.username:
         sid = _ensure_task_session(task)
         _launch_run(username=task.username, task_name=task.name,
-                    question=task.question, cipher_path="", session_id=sid)
+                    question=task.question, cipher_path="", session_id=sid,
+                    web_search=bool(getattr(task, "web_search", False)))
         _run_history.add(
             username=task.username, task_id=task.id, task_name=task.name,
             ran_at=datetime.now().isoformat(timespec="seconds"),
@@ -1287,7 +1525,8 @@ def _on_scheduler_fire(task) -> None:
         )
 
 
-_scheduler = Scheduler(_task_store, _on_scheduler_fire, poll_seconds=30)
+_scheduler = Scheduler(_task_store, _on_scheduler_fire, poll_seconds=30,
+                       on_miss=_on_scheduler_miss, miss_grace_seconds=600)
 
 
 @app.on_event("startup")
@@ -1302,7 +1541,10 @@ def api_tasks_list():
     u = _session_state["username"]
     return {
         "tasks": [t.to_dict() for t in _task_store.list_for(u)],
-        "pending_count": _pending_store.count_pending(u) + _enc_results.count_pending(u),
+        "pending_count": (_pending_store.count_pending(u)
+                          + _enc_results.count_pending(u)
+                          + _missed_store.count_pending(u)),
+        "missed_count": _missed_store.count_pending(u),
     }
 
 
@@ -1350,9 +1592,20 @@ async def api_tasks_create(request: Request):
         if not d.is_dir():
             raise HTTPException(400, f"源文件夹不存在:{source_folder}")
         source_folder = str(d)
+    output_folder = (data.get("output_folder") or "").strip()
+    if output_folder:
+        od = Path(output_folder).expanduser()
+        try:
+            od.mkdir(parents=True, exist_ok=True)   # 输出夹不存在则创建(用户指定的落盘位置)
+        except Exception as e:
+            raise HTTPException(400, f"输出文件夹无法创建:{output_folder}({e})")
+        output_folder = str(od)
+        writer_mod.register_output_root(output_folder)
     t = _task_store.create(
         username=_session_state["username"], name=name, question=question,
         cipher_path=cipher_path, source_folder=source_folder, source_pattern=source_pattern,
+        output_folder=output_folder,
+        web_search=bool(data.get("web_search", False)),
         schedule_kind=kind, cron_expr=cron_expr,
         cron_readable=(data.get("cron_readable") or "").strip(),
         interval_minutes=int(data.get("interval_minutes", 60) or 60),
@@ -1362,7 +1615,9 @@ async def api_tasks_create(request: Request):
         day_of_month=int(data.get("day_of_month", 1) or 1),
         enabled=bool(data.get("enabled", True)),
     )
-    return t.to_dict()
+    # 立刻建好该任务的会话(kind=scheduled),使其马上出现在「定时任务」会话列表里
+    _ensure_task_session(t)
+    return _task_store.get(t.id).to_dict()
 
 
 @app.patch("/api/scheduled_tasks/{tid}")
@@ -1376,8 +1631,20 @@ async def api_tasks_patch(tid: str, request: Request):
     patch = {k: data[k] for k in ("name", "question", "enabled", "schedule_kind",
                                   "interval_minutes", "at_hour", "at_minute", "weekday",
                                   "day_of_month", "cron_expr", "cron_readable",
-                                  "cipher_path", "source_folder", "source_pattern") if k in data}
+                                  "cipher_path", "source_folder", "source_pattern",
+                                  "output_folder", "web_search") if k in data}
+    if patch.get("output_folder"):
+        od = Path(patch["output_folder"]).expanduser()
+        try:
+            od.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            raise HTTPException(400, f"输出文件夹无法创建:{patch['output_folder']}({e})")
+        patch["output_folder"] = str(od)
+        writer_mod.register_output_root(patch["output_folder"])
     t = _task_store.update(tid, **patch)
+    # 任务改名 → 同步更新它绑定的会话标题(左侧子任务名立刻跟着变)
+    if "name" in patch and t and t.session_id and _sessions.get(t.session_id):
+        _sessions.rename(t.session_id, f"⏰ {t.name}")
     return t.to_dict()
 
 
@@ -1416,10 +1683,76 @@ def api_pending_list():
     if not _is_logged_in():
         return _need_login()
     u = _session_state["username"]
-    # 两类待批:① 自由问答的待跑(PendingRun)② 密态任务的加密结果(按任务聚合)
+    # 三类:① 自由问答的待跑(PendingRun)② 密态任务的加密结果(按任务聚合)③ 漏跑预警
     runs = [dict(p.to_dict(), kind="run") for p in _pending_store.list_pending(u)]
     encrypted = [dict(a, kind="decrypt") for a in _enc_results.aggregate_by_task(u)]
-    return {"runs": runs, "encrypted": encrypted}
+    missed = [dict(m.to_dict(), kind="missed") for m in _missed_store.list_pending(u)]
+    return {"runs": runs, "encrypted": encrypted, "missed": missed}
+
+
+@app.post("/api/scheduled_tasks/missed/{mid}/dismiss")
+def api_missed_dismiss(mid: str):
+    """忽略一条漏跑预警。"""
+    if not _is_logged_in():
+        return _need_login()
+    m = _missed_store.get(mid)
+    if not m or m.username != _session_state["username"]:
+        raise HTTPException(404, "预警不存在")
+    _missed_store.set_status(mid, "dismissed")
+    return {"ok": True}
+
+
+@app.post("/api/scheduled_tasks/missed/{mid}/remediate")
+async def api_missed_remediate(mid: str, request: Request):
+    """手动补救一条漏跑:用用户指定的数据文件,把该轮重新跑一遍(密态 → 加密暂存待解密)。
+    body: {cipher_path?: 已加密文件, source_path?: 本地明文文件(将加密入库)}"""
+    if not _is_logged_in():
+        return _need_login()
+    m = _missed_store.get(mid)
+    if not m or m.username != _session_state["username"]:
+        raise HTTPException(404, "预警不存在")
+    task = _task_store.get(m.task_id)
+    data = await request.json()
+    cipher_path = (data.get("cipher_path") or "").strip()
+    source_path = (data.get("source_path") or "").strip()
+
+    if m.needs_data:
+        if source_path:
+            sp = Path(source_path).expanduser()
+            if not sp.is_file():
+                raise HTTPException(400, f"指定的文件不存在:{source_path}")
+            try:
+                info = _ingest_plaintext_path(sp, sp.name)
+                cipher_path = info["path"]
+            except Exception as e:
+                raise HTTPException(400, f"该轮文件加密入库失败:{e}")
+        elif not cipher_path:
+            raise HTTPException(400, "该任务需要数据 · 请指定本轮要处理的文件")
+        if cipher_path and not Path(cipher_path).exists():
+            raise HTTPException(400, "指定的密文文件不存在")
+
+    # 注入会话并跑(数据任务 → encrypted_sandbox 累积待解密;自由问答 → 直接跑)
+    if task is not None:
+        sid = _ensure_task_session(task)
+        output_mode = "encrypted_sandbox" if m.needs_data else "interactive"
+        _launch_run(username=m.username, task_name=task.name, question=task.question,
+                    cipher_path=cipher_path, session_id=sid,
+                    output_mode=output_mode, sched_task=task if m.needs_data else None,
+                    web_search=bool(getattr(task, "web_search", False)))
+    else:
+        # 任务已删:用预警里存的问题在一个补救会话里跑
+        sess = _sessions.create(username=m.username, title=f"⏰ 补救 · {m.task_name}",
+                                kind="scheduled")
+        _launch_run(username=m.username, task_name=m.task_name, question=m.question,
+                    cipher_path=cipher_path, session_id=sess.id)
+        sid = sess.id
+
+    _missed_store.set_status(mid, "resolved")
+    _run_history.add(
+        username=m.username, task_id=m.task_id, task_name=m.task_name,
+        ran_at=_now_iso(), status="launched", summary="漏跑补救 · 已手动重跑该轮 · 见会话",
+    )
+    return {"ok": True, "session_id": sid, "needs_approval": bool(m.needs_data)}
 
 
 @app.post("/api/scheduled_tasks/decrypt/{task_id}")
@@ -1434,11 +1767,15 @@ def api_task_decrypt(task_id: str):
         raise HTTPException(404, "该任务没有待解密的结果")
     task = _task_store.get(task_id)
     folder_name = (task.name if task else items[0].task_name) or "定时任务结果"
+    output_folder = getattr(task, "output_folder", "") if task else ""
+    if output_folder:
+        writer_mod.register_output_root(output_folder)
     runs = [{"run_id": r.run_id, "run_at": r.run_at, "manifest": r.manifest,
              "question": r.question} for r in items]
     try:
         from client.webui import sched_results
-        out_dir, outcomes = sched_results.decrypt_runs_to_folder(runs, folder_name)
+        out_dir, outcomes = sched_results.decrypt_runs_to_folder(
+            runs, folder_name, output_folder=output_folder)
     except Exception as e:
         raise HTTPException(500, f"批量解密失败:{type(e).__name__}: {e}")
 
@@ -1477,10 +1814,13 @@ def api_pending_approve(pid: str):
         raise HTTPException(404, "待批运行不存在")
     sid = p.session_id or ""
     if not _sessions.get(sid):
-        sess = _sessions.create(username=p.username, title=f"⏰ {p.task_name}")
+        sess = _sessions.create(username=p.username, title=f"⏰ {p.task_name}",
+                                kind="scheduled", task_id=p.task_id)
         sid = sess.id
+    _task = _task_store.get(p.task_id)
     _launch_run(username=p.username, task_name=p.task_name,
-                question=p.question, cipher_path=p.cipher_path, session_id=sid)
+                question=p.question, cipher_path=p.cipher_path, session_id=sid,
+                web_search=bool(getattr(_task, "web_search", False)) if _task else False)
     _pending_store.set_status(pid, "approved")
     _run_history.add(
         username=p.username, task_id=p.task_id, task_name=p.task_name,

@@ -179,12 +179,152 @@ def _looks_like_knowledge_question(user_query: str) -> bool:
     return any(m.lower() in q for m in _KNOWLEDGE_Q_MARKERS)
 
 
+# "实时 / 联网查询"标记 —— 查天气、新闻、行情等外部实时信息,与"分析用户数据"无关。
+# 命中(且没有"对这份数据操作"标记)→ 走自由聊天 / 联网,即便会话里沿用着旧密文。
+_WEB_LOOKUP_MARKERS = (
+    "天气", "气温", "下雨", "下雪", "降雨", "台风", "空气质量", "雾霾",
+    "新闻", "最新消息", "热点", "头条", "实时", "股价", "股市", "大盘", "指数",
+    "汇率", "油价", "金价", "票价", "机票", "比分", "赛事", "赛程", "票房",
+    "上映", "几点开", "现在几点", "今天几号", "今天是", "明天", "后天", "近期",
+    "搜索", "查询", "查找", "查一下", "搜一下", "查查", "搜搜",
+    "百度", "谷歌", "google", "上网查", "联网",
+)
+
+
+def _looks_like_web_lookup(user_query: str) -> bool:
+    """查外部实时信息(天气/新闻/行情等),而非对用户数据计算 → True。"""
+    if not user_query:
+        return False
+    q = user_query.lower()
+    if any(m.lower() in q for m in _DATA_OP_MARKERS):
+        return False  # 明确要对这份数据操作 → 不是外部查询
+    return any(m.lower() in q for m in _WEB_LOOKUP_MARKERS)
+
+
+# 排程意图:必须出现"重复周期"线索,才认为用户想建定时任务(避免误判普通分析)
+_SCHEDULE_MARKERS = (
+    "每天", "每日", "每周", "每星期", "每月", "每个月", "每隔", "每小时",
+    "工作日", "周末", "双休", "定时", "定期", "自动跑", "自动运行", "按时",
+    "每分钟", "每天早上", "每天晚上", "每周一", "每周五",
+)
+# 明确"创建任务"的强信号(即使没有完整周期也触发)
+_TASK_INTENT_MARKERS = ("定时任务", "创建任务", "建个任务", "设个任务", "设定任务", "schedule", "cron")
+
+
+def looks_like_schedule_request(user_query: str) -> bool:
+    """普通会话里是否在表达「创建定时任务」的意图。
+    显式"定时任务"字样直接判真;否则需要"重复周期"线索 **且** 有具体时刻或强周期信号,
+    以免把「每天的销售趋势」这类普通分析误判成建任务。纯知识问题排除。"""
+    if not user_query:
+        return False
+    q = user_query.strip()
+    if any(m in q for m in _TASK_INTENT_MARKERS):
+        return True
+    if _looks_like_knowledge_question(q):
+        return False
+    if not any(m in q for m in _SCHEDULE_MARKERS):
+        return False
+    # 具体时刻(9点 / 09:00 / 早上…)
+    has_clock = bool(re.search(r"\d{1,2}\s*[点:：]", q)) or \
+        any(w in q for w in ("早上", "早晨", "上午", "中午", "下午", "晚上", "傍晚", "凌晨", "夜里"))
+    # 强周期信号(工作日 / 每周X / 每月N号 / 每隔 / 每小时 …)
+    strong = (any(w in q for w in ("工作日", "周末", "双休", "每周", "每星期", "每月",
+                                   "每个月", "每隔", "每小时", "每分钟"))
+              or bool(re.search(r"(?:周|星期)[一二三四五六日天]", q))
+              or bool(re.search(r"\d{1,2}\s*[号日]", q)))
+    return has_clock or strong
+
+
+_TASK_EXTRACT_SYSTEM = (
+    "你是定时任务配置助手。用户用一句话描述了想定期自动执行的数据分析。"
+    "请从中抽取结构化字段,**只输出一个 JSON 对象**,不要任何解释或代码块标记。\n"
+    "字段:\n"
+    '  "name": 简短任务名(8 字内,概括要做的事,如「每日回款率」),\n'
+    '  "question": 要执行的分析问题(完整、可直接拿去算,如「按大区统计本月回款率 TOP10」),\n'
+    '  "schedule_text": 排程的中文原话(如「每天早上9点」「每周一」「每月1号」;没提到则空串),\n'
+    '  "needs_data": 是否需要对用户的数据文件计算(true/false;只是问概念/闲聊才 false)。\n'
+    "缺失的字段给空串或合理默认。只输出 JSON。"
+)
+
+
+def extract_task_slots(host_url: str, token: str, text: str) -> dict:
+    """调 LLM 从一句话里抽取定时任务槽位;再用本地解析把 schedule_text 转 cron。
+    返回 {name, question, schedule_text, cron, cron_readable, needs_data, missing[]}。"""
+    import json as _json
+
+    slots = {"name": "", "question": text.strip(), "schedule_text": "", "needs_data": True}
+    try:
+        raw = call_llm_for_freechat(
+            host_url, token,
+            f"{_TASK_EXTRACT_SYSTEM}\n\n用户描述:{text.strip()}",
+            history=None, should_cancel=None, web_search=False,
+        )
+        m = re.search(r"\{.*\}", raw or "", re.DOTALL)
+        if m:
+            parsed = _json.loads(m.group(0))
+            for k in ("name", "question", "schedule_text"):
+                if isinstance(parsed.get(k), str) and parsed[k].strip():
+                    slots[k] = parsed[k].strip()
+            if isinstance(parsed.get("needs_data"), bool):
+                slots["needs_data"] = parsed["needs_data"]
+    except Exception:
+        pass
+
+    # schedule_text → cron(复用本地自然语言解析器)
+    cron, cron_readable = "", ""
+    sched_src = slots["schedule_text"] or text
+    try:
+        from client.webui.scheduler import parse_natural_schedule
+        pr = parse_natural_schedule(sched_src)
+        if pr.get("ok"):
+            cron = pr.get("cron", "")
+            cron_readable = pr.get("readable", "")
+    except Exception:
+        pass
+    slots["cron"] = cron
+    slots["cron_readable"] = cron_readable
+
+    missing = []
+    if not slots["question"]:
+        missing.append("question")
+    if not cron:
+        missing.append("schedule")
+    slots["missing"] = missing
+    return slots
+
+
+def detect_intent_ambiguity(user_query: str, has_attachment: bool) -> Optional[dict]:
+    """检测"矛盾/不确定"的意图,需要先让用户澄清。返回澄清规格或 None。
+
+    通用框架:每个检测器命中就返回 {question, options:[{label, action}], allow_free}。
+    action ∈ wizard(创建定时任务)/ analyze(只算当前数据一次)/ freechat / free(自己说)。
+    目前规则:
+      · 排程词(每天/每周…)+ 同时带了附件 → 定时处理 vs 只算这个附件,二选一。
+    以后可在此追加更多歧义规则。
+    """
+    if not user_query:
+        return None
+    # 规则一:既像"定时任务"又带了附件 —— 到底是定时跑、还是只算这次的附件?
+    if has_attachment and looks_like_schedule_request(user_query):
+        return {
+            "kind": "schedule_vs_oneshot",
+            "question": "你的描述里既有「定时」的意思,又带了一个附件 —— 这两种做法不一样,你想要哪种?",
+            "options": [
+                {"label": "创建定时任务,按计划自动处理(附件只作示例 / 之后按文件夹取最新)", "action": "wizard"},
+                {"label": "只分析当前这个附件一次(忽略「定时」)", "action": "analyze"},
+            ],
+            "allow_free": True,
+        }
+    return None
+
+
 def looks_like_analysis(user_query: str) -> bool:
     """启发式:是否像数据分析意图。否 → 走自由聊天端点。"""
     if not user_query:
         return False
-    # 知识/概念提问优先判定为"非分析"(问 X 是什么 / X 怎么算,而非算这份数据)
-    if _looks_like_knowledge_question(user_query):
+    # 知识/概念提问、或查外部实时信息(天气/新闻/行情)→ 判为"非分析",走自由聊天/联网
+    # (即便会话里沿用着旧密文,也不会把这类问题误拉进数据分析)
+    if _looks_like_knowledge_question(user_query) or _looks_like_web_lookup(user_query):
         return False
     q = user_query.lower()
     for kw in _ANALYSIS_KEYWORDS:
@@ -880,33 +1020,37 @@ def ask(
     # 0) 意图识别 —— 不像分析就走自由聊天(允许"没附密文也能聊天")
     # 用原始 user_query 判断,不让附件内容干扰意图判断
     is_analysis = looks_like_analysis(user_query)
+    # 联网与否完全由用户的「联网搜索」开关决定:开=可联网,关=不联网(不擅自跳过按钮)。
+    # 但若问的是实时信息却没开联网 → 在回复前加一句提示,告诉用户开开关,而不是让模型干巴巴拒绝。
+    need_web_tip = (not web_search) and _looks_like_web_lookup(user_query)
+    _WEB_TIP = ("> 💡 你问的是**实时信息**,但「联网搜索」未开启,以下仅基于模型已有知识。\n"
+                "> 需要实时结果?点输入框左侧的 🌐 **联网搜索** 按钮打开后再问一次。\n\n")
+
+    def _freechat_result(text: str) -> dict:
+        if need_web_tip:
+            text = _WEB_TIP + text
+        return {"status": "done", "summary": text, "excel_path": "", "skill_calls": [], "error": ""}
 
     try:
         # 1) 没附密文 → 自由聊天(LLM 直接回答)
         if cipher_path is None:
             log("think", "未附密文文件 · 自由聊天模式")
-            log("call", "调用 LLM(freechat)")
+            log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
             _ck()
             text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
             _ck()
             log("result", "已回复")
-            return {
-                "status": "done", "summary": text,
-                "excel_path": "", "skill_calls": [], "error": "",
-            }
+            return _freechat_result(text)
 
         # 2) 有密文但意图不像分析 → 仍走自由聊天
         if not is_analysis:
             log("think", f"已附密文「{cipher_path.name}」· 但问题不像数据分析 · 自由聊天模式")
-            log("call", "调用 LLM(freechat)")
+            log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
             _ck()
             text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
             _ck()
             log("result", "已回复")
-            return {
-                "status": "done", "summary": text,
-                "excel_path": "", "skill_calls": [], "error": "",
-            }
+            return _freechat_result(text)
     except CancelledError:
         log("error", "已停止 · 用户取消")
         return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}

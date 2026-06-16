@@ -40,6 +40,8 @@ class Message:
     error: str = ""
     skill_calls: list[str] = field(default_factory=list)   # 跑了哪些 skill 名
     steps: list[dict[str, Any]] = field(default_factory=list)
+    wizard: dict[str, Any] = field(default_factory=dict)   # 非空=该助手消息触发"创建定时任务"向导(预填槽位)
+    clarify: dict[str, Any] = field(default_factory=dict)  # 非空=意图有歧义,需用户先选择(question + options)
     status: str = "done"                       # pending / running / done / failed / needs_cipher
     duration_sec: float = 0.0
     used_cipher: str = ""                      # assistant 实际用了哪份 cipher
@@ -67,6 +69,8 @@ class Message:
             error=d.get("error", ""),
             skill_calls=list(d.get("skill_calls", []) or []),
             steps=list(d.get("steps", []) or []),
+            wizard=dict(d.get("wizard", {}) or {}),
+            clarify=dict(d.get("clarify", {}) or {}),
             status=d.get("status", "done"),
             duration_sec=float(d.get("duration_sec", 0.0) or 0.0),
             used_cipher=d.get("used_cipher", ""),
@@ -79,6 +83,8 @@ class ChatSession:
     id: str
     title: str
     username: str
+    kind: str = "normal"            # normal=普通会话 / scheduled=定时任务专用会话
+    task_id: str = ""               # kind=scheduled 时关联的任务 id(供分组/跳转)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     messages: list[Message] = field(default_factory=list)
@@ -94,6 +100,8 @@ class ChatSession:
             id=d["id"],
             title=d.get("title", "新会话"),
             username=d.get("username", ""),
+            kind=d.get("kind", "normal") or "normal",
+            task_id=d.get("task_id", "") or "",
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
             updated_at=d.get("updated_at", datetime.now().isoformat(timespec="seconds")),
         )
@@ -148,12 +156,14 @@ class SessionStore:
     def get(self, sid: str) -> Optional[ChatSession]:
         return self._sessions.get(sid)
 
-    def create(self, *, username: str, title: str = "新会话") -> ChatSession:
+    def create(self, *, username: str, title: str = "新会话",
+               kind: str = "normal", task_id: str = "") -> ChatSession:
         with self._lock:
             sid = secrets.token_hex(6)
             while sid in self._sessions:
                 sid = secrets.token_hex(6)
-            sess = ChatSession(id=sid, title=title, username=username)
+            sess = ChatSession(id=sid, title=title, username=username,
+                               kind=kind, task_id=task_id)
             self._sessions[sid] = sess
             self._save(sess)
             return sess
