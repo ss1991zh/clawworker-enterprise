@@ -25,7 +25,7 @@ import tempfile
 import threading
 import time
 import traceback
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
@@ -1441,6 +1441,31 @@ def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+_REL_DATE_RE = re.compile(r"今日|今天|本日|当日|当天|现在|目前|此刻")
+
+
+def _date_adjust_question(question: str, due_at: str) -> str:
+    """漏跑补跑时,把问题里的相对日期(今日/今天/现在 · 昨天/明天/后天)替换成
+    漏跑当天对应的实际日期,避免「今日上海天气」补跑成今天的(应是漏跑那天的)。"""
+    if not question or not due_at:
+        return question
+    try:
+        d = datetime.fromisoformat(due_at)
+    except Exception:
+        return question
+
+    def lbl(delta: int) -> str:
+        dd = d + timedelta(days=delta)
+        return f"{dd.month}月{dd.day}日"
+
+    q = question
+    # 先处理带"今/天"易冲突的相对词(顺序:多日差的先替换)
+    for word, delta in (("前天", -2), ("后天", 2), ("昨天", -1), ("明天", 1)):
+        q = q.replace(word, lbl(delta))
+    q = _REL_DATE_RE.sub(lbl(0), q)   # 今日/今天/现在… → 漏跑当天
+    return q
+
+
 def _record_missed(task, due_at: str, reason: str) -> None:
     """记一条漏跑预警(去重:同任务同到点窗口只记一条 pending)。"""
     try:
@@ -1731,11 +1756,13 @@ async def api_missed_remediate(mid: str, request: Request):
         if cipher_path and not Path(cipher_path).exists():
             raise HTTPException(400, "指定的密文文件不存在")
 
-    # 注入会话并跑(数据任务 → encrypted_sandbox 累积待解密;自由问答 → 直接跑)
+    # 注入会话并跑(数据任务 → encrypted_sandbox 累积待解密;自由问答 → 直接跑)。
+    # 补跑时把问题里的相对日期(今日/今天…)锚定到漏跑当天,避免实时问题跑成今天的。
     if task is not None:
         sid = _ensure_task_session(task)
         output_mode = "encrypted_sandbox" if m.needs_data else "interactive"
-        _launch_run(username=m.username, task_name=task.name, question=task.question,
+        q = _date_adjust_question(task.question, m.due_at)
+        _launch_run(username=m.username, task_name=task.name, question=q,
                     cipher_path=cipher_path, session_id=sid,
                     output_mode=output_mode, sched_task=task if m.needs_data else None,
                     web_search=bool(getattr(task, "web_search", False)))
@@ -1743,7 +1770,8 @@ async def api_missed_remediate(mid: str, request: Request):
         # 任务已删:用预警里存的问题在一个补救会话里跑
         sess = _sessions.create(username=m.username, title=f"⏰ 补救 · {m.task_name}",
                                 kind="scheduled")
-        _launch_run(username=m.username, task_name=m.task_name, question=m.question,
+        _launch_run(username=m.username, task_name=m.task_name,
+                    question=_date_adjust_question(m.question, m.due_at),
                     cipher_path=cipher_path, session_id=sess.id)
         sid = sess.id
 

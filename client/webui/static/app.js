@@ -1989,19 +1989,23 @@ function renderTPMissed() {
   const t = _curTask();
   const tid = state.currentTaskId;
   const missed = (state.tasksPending?.missed || []).filter(m => m.task_id === tid);
+  const isData = !!(t && t.needs_approval);
   let html = '<h2 class="tp-h">漏跑</h2><div id="tpAlert"></div>';
   html += `<div class="alert-box info" style="line-height:1.7;">
     「漏跑」指<strong>到了设定时间但没按时执行</strong>的运行 —— 通常是那一刻<strong>客户端没开 / 崩溃 / 电脑休眠</strong>,系统不会自作主张补跑,而是列在这里等你处理。<br>
-    · <strong>手动选择文件</strong>:补跑这一轮 —— ${t && t.needs_approval ? "弹出文件选择,挑这轮要处理的数据文件,再按密态流程算(算完进「待解密文件」)" : "直接补跑一次(无需数据)"};<br>
+    ${isData
+      ? "· <strong>手动选择文件</strong>:弹出文件选择,挑这轮要处理的数据文件,再按密态流程算(算完进「待解密文件」);"
+      : "· <strong>重新执行</strong>:立刻补跑这一轮(无需选文件);若问题含相对日期(如「今日」),会自动改成<strong>漏跑当天</strong>的日期再跑,避免跑成今天的;"}<br>
     · <strong>忽略</strong>:这轮不补了,清掉这条预警。
   </div>`;
   if (!missed.length) html += '<div class="alert-box info">当前没有漏跑 👍</div>';
   missed.forEach(m => {
+    const btnLabel = m.needs_data ? "手动选择文件" : "重新执行";
     html += `<div class="list-item missed"><div class="grow">
         <div class="t">⚠ 漏跑 <span class="badge danger">未执行</span></div>
         <div class="d" style="font-size:11px;">本应执行:${esc((m.due_at||"").slice(0,16).replace("T"," "))} · ${esc(m.reason||"")}</div>
       </div>
-      <button class="btn-primary btn-sm" data-tpremed="${esc(m.id)}" data-needs="${m.needs_data?1:0}">手动选择文件</button>
+      <button class="btn-primary btn-sm" data-tpremed="${esc(m.id)}" data-needs="${m.needs_data?1:0}">${btnLabel}</button>
       <button class="btn-ghost btn-sm" data-tpmissx="${esc(m.id)}">忽略</button></div>`;
   });
   $("taskPanelBody").innerHTML = html;
@@ -2011,6 +2015,7 @@ function renderTPMissed() {
       try { const p = await api("POST", "/api/pick_file"); if (p.cancelled || !p.path) return; sp = p.path; }
       catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">选文件失败:${esc(e.message)}</div>`; return; }
     }
+    const orig = b.textContent;
     b.disabled = true; b.textContent = "补跑中…";
     try {
       await api("POST", `/api/scheduled_tasks/missed/${b.dataset.tpremed}/remediate`, { source_path: sp });
@@ -2018,7 +2023,7 @@ function renderTPMissed() {
       await loadSessions();   // 立即刷新侧栏:跳动…出现、红警示按需更新
       if (state.currentSid) await selectSession(state.currentSid);
       toast("已补跑该轮 · 见会话");
-    } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">补跑失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = "手动选择文件"; }
+    } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">补跑失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = orig; }
   }));
   $("taskPanelBody").querySelectorAll("[data-tpmissx]").forEach(b => b.addEventListener("click", async () => {
     await api("POST", `/api/scheduled_tasks/missed/${b.dataset.tpmissx}/dismiss`);
