@@ -15,8 +15,26 @@
       <a href="/admin/llm" class="{% if active=='llm' %}active{% endif %}">LLM 配置</a>
       <a href="/admin/sessions" class="{% if active=='sessions' %}active{% endif %}">会话</a>
       <a href="/admin/ops" class="{% if active=='ops' %}active{% endif %}">运维</a>
+      <a href="/admin/account" class="{% if active=='account' %}active{% endif %}">管理员</a>
     </nav>
+    <button class="notice-bell" id="adminNoticeBell" type="button" title="站内信" aria-label="站内信">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+           stroke-linecap="round" stroke-linejoin="round">
+        <path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/>
+        <path d="M13.73 21a2 2 0 0 1-3.46 0"/>
+      </svg>
+      <span class="notice-dot" id="adminNoticeDot" hidden></span>
+    </button>
+    <div class="notice-pop" id="adminNoticePop" hidden>
+      <div class="notice-pop__head"><span>站内信</span>
+        <button class="notice-pop__x" id="adminNoticeClose" type="button" aria-label="关闭">✕</button></div>
+      <div class="notice-pop__body" id="adminNoticeList"></div>
+    </div>
+    <form method="post" action="/admin/logout" class="logout-form">
+      <button class="logout-btn" type="submit" title="退出登录">退出</button>
+    </form>
   </header>
+  <div class="notice-scrim" id="adminNoticeScrim" hidden></div>
 
   <main class="container">
     {% if messages %}
@@ -30,5 +48,6 @@
       <a href="/docs" target="_blank">Swagger API 文档</a>
     </div>
   </main>
+  <script src="/admin/static/admin.js?v={{ asset_ver('admin.js') }}"></script>
 </body>
 </html>

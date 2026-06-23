@@ -81,6 +81,17 @@ img.logo-img {
 }
 .new-btn:hover { background: var(--blue-dark); }
 
+/* 侧栏「定时任务管理」按钮:尺寸 / 间距与「新建会话」完全一致(主色调蓝) */
+.overview-btn {
+  margin: 14px; padding: 11px;
+  background: var(--blue); color: #fff;
+  border: none; border-radius: 12px;
+  font-size: 14px; font-weight: 600; cursor: pointer; transition: background .15s;
+  display: flex; align-items: center; justify-content: center; gap: 6px;
+}
+.overview-btn:hover { background: var(--blue-dark); }
+.overview-btn .ic { width: 18px; height: 18px; }
+
 .session-list {
   flex: 1;
   overflow-y: auto;
@@ -167,6 +178,73 @@ img.logo-img {
 }
 .settings-btn .ic { width: 18px; height: 18px; }
 
+/* ============ 站内信 ============ */
+.sidebar__title { flex: 1; min-width: 0; }
+.notice-btn {
+  position: relative; flex-shrink: 0; margin-left: auto;
+  width: 34px; height: 34px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-muted); cursor: pointer;
+  display: grid; place-items: center; transition: all .15s;
+}
+.notice-btn:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-light); }
+.notice-btn .ic { width: 18px; height: 18px; }
+.notice-dot {
+  position: absolute; top: 4px; right: 4px;
+  width: 9px; height: 9px; border-radius: 50%;
+  background: var(--danger); border: 2px solid var(--surface);
+}
+.notice-dot[hidden] { display: none; }
+
+.notice-scrim { display: none; position: fixed; inset: 0; z-index: 40; background: transparent; }
+.notice-scrim.open { display: block; }
+.notice-panel {
+  display: none; position: fixed; z-index: 41;
+  left: 14px; top: 64px; width: 360px; max-width: calc(100vw - 28px);
+  max-height: min(72vh, 600px);
+  background: var(--surface); border: 1px solid var(--border); border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(15,23,42,.22);
+  flex-direction: column; overflow: hidden;
+}
+.notice-panel.open { display: flex; }
+.notice-panel__head {
+  flex-shrink: 0; display: flex; align-items: center; justify-content: space-between;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
+  font-size: 14px; font-weight: 600;
+}
+.notice-panel__x {
+  border: none; background: transparent; cursor: pointer; color: var(--text-muted);
+  font-size: 14px; width: 26px; height: 26px; border-radius: 7px; line-height: 1;
+}
+.notice-panel__x:hover { background: var(--bg); color: var(--text); }
+.notice-panel__body { overflow-y: auto; padding: 6px; }
+
+.notice-empty { padding: 36px 16px; text-align: center; color: var(--text-muted); font-size: 13px; }
+.notice-item {
+  position: relative; padding: 11px 12px 11px 16px; border-radius: 10px;
+  border: 1px solid transparent;
+}
+.notice-item + .notice-item { margin-top: 2px; }
+.notice-item:hover { background: var(--bg); }
+.notice-item.unread { background: var(--blue-light); }
+.notice-item.unread:hover { background: #e4edff; }
+.notice-item::before {
+  content: ""; position: absolute; left: 6px; top: 13px; bottom: 13px;
+  width: 3px; border-radius: 2px; background: var(--text-muted);
+}
+.notice-item.info::before    { background: var(--blue); }
+.notice-item.warning::before { background: #d97706; }
+.notice-item.critical::before { background: var(--danger); }
+.notice-item__t { font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.notice-item__lv {
+  font-size: 10.5px; font-weight: 700; padding: 1px 6px; border-radius: 999px; flex-shrink: 0;
+}
+.notice-item.info .notice-item__lv    { background: var(--blue-light); color: var(--blue); }
+.notice-item.warning .notice-item__lv { background: #fef3c7; color: #b45309; }
+.notice-item.critical .notice-item__lv { background: #fee2e2; color: var(--danger); }
+.notice-item__s { font-size: 12px; color: var(--text); line-height: 1.5; margin-top: 4px; white-space: normal; }
+.notice-item__time { font-size: 11px; color: var(--text-muted); margin-top: 5px; }
+
 /* ============================================================
  *  Main panel
  * ============================================================ */
@@ -215,6 +293,8 @@ main {
   width: 100%; max-width: 760px; margin: 0 auto;
   display: flex; flex-direction: column; gap: 18px;
 }
+/* 总概览全屏:不受聊天 760px 宽度限制,铺满整个主区域 */
+.chat.ovmode { max-width: none; }
 
 /* ============================================================
  *  Welcome
@@ -275,6 +355,25 @@ main {
 .msg.bot .bubble { background: var(--surface); border: none; border-bottom-left-radius: 4px; }
 
 /* AI 回复 markdown 排版(标题/列表/加粗/行内代码/代码块/链接) */
+.run-meta { margin-top: 8px; padding-left: 16px; font-size: 11.5px; color: var(--text-muted); letter-spacing: .2px; }
+/* 漏跑补救说明:执行时间下方、左对齐,作为该轮对话的一部分 */
+.run-remed {
+  margin-top: 12px; margin-left: 16px; display: inline-block;
+  font-size: 12px; line-height: 1.5; padding: 5px 12px; border-radius: 8px;
+  color: #166534; background: #ecfdf5; border: 1px solid #a7f3d0;
+}
+
+/* 系统事件(漏跑/忽略/补救):会话里的居中提示行 */
+.msg-event { display: flex; justify-content: center; margin: 10px 0; }
+.msg-event__t {
+  font-size: 12px; line-height: 1.5; text-align: center; max-width: 92%;
+  padding: 5px 14px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text-muted);
+}
+.msg-event.missed .msg-event__t { color: #b45309; background: #fff7ed; border-color: #fed7aa; }
+/* 手动补救:放在执行时间下方、左对齐(忽略/漏跑仍居中) */
+.msg-event.remediated { justify-content: flex-start; margin-top: 2px; padding-left: 16px; }
+.msg-event.remediated .msg-event__t { color: #166534; background: #ecfdf5; border-color: #a7f3d0; text-align: left; }
 .bubble.md { white-space: normal; }
 .bubble.md > :first-child { margin-top: 0; }
 .bubble.md > :last-child { margin-bottom: 0; }
@@ -1210,6 +1309,66 @@ body.login-body {
 .tp-tab.active { color: var(--blue); border-bottom-color: var(--blue); }
 .task-panel .modal__body { padding: 20px 24px; }
 .tp-h { font-size: 16px; margin: 0 0 14px; }
+
+/* ============ 自启 / 运维 Tab ============ */
+.ops-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-top: 6px; }
+.ops-card { background: var(--bg); border-radius: 12px; padding: 14px 16px; border: 1px solid var(--border); }
+.ops-card__label { font-size: 12px; color: var(--text-muted); }
+.ops-card__val { font-size: 18px; font-weight: 600; margin: 4px 0 2px; }
+.ops-card__val.ok { color: #15803d; }
+.ops-card__val.bad { color: var(--danger); }
+.ops-card__hint { font-size: 11.5px; color: var(--text-muted); }
+
+/* ============ 定时任务总概览(全屏,渲染进 #chat · 铺满整个区域)============ */
+.ov-wrap { width: 100%; max-width: none; margin: 0; padding: 22px 32px 40px; box-sizing: border-box; }
+.ov-head { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
+.ov-head h2 { font-size: 18px; margin: 0; flex: 1; }
+.ov-search-wrap { position: relative; display: inline-flex; align-items: center; }
+.ov-search {
+  width: 240px; height: 38px; box-sizing: border-box; padding: 0 32px 0 12px;
+  border: 1px solid var(--border); border-radius: 10px;
+  font-size: 13px; font-family: inherit; outline: none; background: var(--bg); color: var(--text);
+}
+.ov-search:focus { border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,.12); background: #fff; }
+.ov-search-x {
+  position: absolute; right: 7px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; padding: 0; border: none; border-radius: 50%;
+  background: rgba(15,23,42,.08); color: var(--text-muted); cursor: pointer;
+  display: flex; align-items: center; justify-content: center; font-size: 11px; line-height: 1;
+}
+.ov-search-x:hover { background: rgba(15,23,42,.16); color: var(--text); }
+.ov-search-x[hidden] { display: none; }
+.ov-wrap .ops-cards { margin-bottom: 16px; }
+.ov-row { align-items: center; }
+.ov-row:hover { border-color: var(--blue-light2, #c7d8ff); }
+.ov-row .grow .d { margin-top: 4px; }
+/* 子任务的"任务描述"用蓝框框起(同定时任务卡)—— inline-block 让框正好抱住内容 */
+.ov-desc {
+  display: inline-block; max-width: 100%; box-sizing: border-box;
+  margin-top: 8px; padding: 7px 12px;
+  border: 1px solid var(--blue-ring); border-radius: 10px; background: var(--blue-light);
+  font-size: 12.5px; color: var(--text); line-height: 1.45; white-space: normal;
+}
+.ov-fns { display: flex; flex-wrap: nowrap; gap: 6px; justify-content: flex-end; flex-shrink: 0; }
+.ov-fns .btn-sm { white-space: nowrap; }
+.ov-del { color: var(--danger); }
+.ov-del:hover { background: #fef2f2; border-color: #fecaca; }
+/* 行内按钮上的待处理计数(漏跑 / 待解密文件)*/
+.ov-cnt {
+  display: inline-block; min-width: 17px; margin-left: 4px; padding: 0 5px;
+  border-radius: 999px; background: rgba(15,23,42,.08);
+  font-size: 11px; font-weight: 700; line-height: 17px; text-align: center; vertical-align: middle;
+}
+.ov-cnt.danger { background: #fee2e2; color: var(--danger); }
+.ov-wrap .task-panel__tabs { margin: 4px 0 16px; }
+
+/* 新建定时任务:单页表单 —— 弹窗按内容自适应高度(一屏展示),间距适中不拥挤 */
+.modal.task-panel.ct-mode { height: auto; max-height: 92vh; }
+.ct-form .tp-h { margin: 0 0 16px; }
+.ct-form .field { margin-bottom: 15px; }
+.ct-form .field label { margin-bottom: 6px; }
+.ct-form .wiz-radio { padding: 7px 2px; }
+.ct-form #ctCreate { margin-top: 6px; width: 100%; }
 .tp-hist-filter { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; font-size: 13px; }
 .tp-hist-filter label { color: var(--text-muted); }
 .tp-hist-filter input, .tp-hist-filter select {

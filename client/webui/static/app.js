@@ -125,6 +125,7 @@ const state = {
   currentSid: null,
   currentSession: null,
   currentTaskId: "",       // 当前定时会话对应的任务 id(供顶栏 4 面板)
+  ov: false,               // 总概览全屏模式:false | "list" | "detail"
   lastSidByView: { normal: null, scheduled: null },  // 每个视图最后停留的会话(切换时自动回到)
   lastSeen: (() => { try { return JSON.parse(localStorage.getItem("cw_seen") || "{}"); } catch (e) { return {}; } })(),  // sid → 上次查看时的 updated_at(未读判定)
   _seenBaselined: false,   // 首次加载会话后,把现有会话设为已读基线
@@ -216,17 +217,17 @@ function renderSessionList() {
   const view = state.sessionView || "normal";
   const normal = state.sessions.filter(s => !isSchedSess(s));
   const sched = state.sessions.filter(isSchedSess);
-  // 切换条上的计数
+  // 切换条上的计数:普通=会话数;定时任务=任务总数(与「定时任务管理」一致,而非已打开的会话数)
   document.querySelectorAll("#sessToggle .sess-toggle__btn").forEach(b => {
     b.classList.toggle("active", b.dataset.view === view);
-    const n = b.dataset.view === "scheduled" ? sched.length : normal.length;
+    const n = b.dataset.view === "scheduled" ? (state.tasks || []).length : normal.length;
     b.dataset.count = n;
   });
 
   const list = view === "scheduled" ? sched : normal;
   if (!list.length) {
     el.innerHTML = view === "scheduled"
-      ? '<div class="session-empty">还没有定时任务会话<br>在普通会话里说「每天9点…」或到设置里创建</div>'
+      ? '<div class="session-empty">还没有定时任务会话<br>点上方「定时任务管理」,在任务上点「查看会话」即可在此打开</div>'
       : '<div class="session-empty">还没有普通会话<br>点击上方"新建会话"</div>';
     return;
   }
@@ -261,9 +262,15 @@ function renderSessionList() {
   el.querySelectorAll("[data-del]").forEach(b => {
     b.addEventListener("click", async e => {
       e.stopPropagation();
-      if (!confirm("删除这个会话?其消息记录会一并丢失。")) return;
-      await api("DELETE", `/api/sessions/${b.dataset.del}`);
-      if (b.dataset.del === state.currentSid) {
+      const sid = b.dataset.del;
+      const s = (state.sessions || []).find(x => x.id === sid) || {};
+      const isSched = isSchedSess(s);
+      const msg = isSched
+        ? "从列表移除这个定时任务会话?\n\n任务会继续运行,历次运行内容不会丢失;点该任务的「查看会话」可随时找回。"
+        : "删除这个会话?其消息记录会一并丢失。";
+      if (!confirm(msg)) return;
+      await api("DELETE", `/api/sessions/${sid}`);
+      if (sid === state.currentSid) {
         state.currentSid = null; state.currentSession = null;
         showWelcome();
       }
@@ -284,7 +291,8 @@ function setSessionView(view) {
   try { localStorage.setItem("cw_sess_view", state.sessionView); } catch (e) {}
   const sched = state.sessionView === "scheduled";
   if ($("newBtn")) $("newBtn").style.display = sched ? "none" : "";
-  if ($("newTaskBtn")) $("newTaskBtn").style.display = sched ? "" : "none";
+  // 「新建定时任务」入口已移至「定时任务管理」页内(顶部 ovNew 按钮)
+  if ($("overviewBtn")) $("overviewBtn").style.display = sched ? "" : "none";
   renderSessionList();
 }
 
@@ -301,6 +309,15 @@ async function selectViewSession(view) {
 }
 
 // 当前会话是否定时任务会话 → 禁用输入框 + 顶栏显示 4 个任务面板入口
+// 「定时任务管理」(总览)里不需要发送框 —— 隐藏整个 footer;
+// 但创建定时任务向导(wizBar)也在 footer 里,向导激活时要保留可见。
+function _syncFooter() {
+  const f = document.querySelector("footer");
+  const wizActive = $("wizBar") && !$("wizBar").hidden;
+  const hide = !!state.ov && !wizActive;
+  if (f) f.style.display = hide ? "none" : "";
+}
+
 function updateSessionChrome() {
   const meta = (state.sessions || []).find(x => x.id === state.currentSid);
   const sched = !!(meta && isSchedSess(meta));
@@ -334,9 +351,12 @@ function updateSessionChrome() {
     if (mb) { mb.style.display = mc > 0 ? "" : "none"; mb.textContent = mc > 99 ? "99+" : mc; }
   }
   refreshTasksBadge();   // 立即按当前任务刷新红点(不等 30s 轮询)
+  _syncFooter();         // 总览模式隐藏发送框
 }
 
 async function selectSession(sid) {
+  state.ov = false; clearInterval(_gsTimer);   // 退出总概览全屏模式
+  try { localStorage.removeItem("cw_ov"); } catch (e) {}
   // 选中的若是定时任务会话,自动切到「定时任务」视图,使其在侧栏可见
   const meta = (state.sessions || []).find(x => x.id === sid);
   if (meta && isSchedSess(meta) && state.sessionView !== "scheduled") setSessionView("scheduled");
@@ -375,10 +395,14 @@ async function selectSession(sid) {
 
 // ============ Chat 渲染 ============
 function showWelcome() {
+  state.ov = false; clearInterval(_gsTimer);
+  try { localStorage.removeItem("cw_ov"); } catch (e) {}
+  $("chat").classList.remove("ovmode");
   $("chat").innerHTML = "";
   $("chat").appendChild(welcomeNode());
   state.currentSid = null;
   if ($("taskActions")) $("taskActions").style.display = "none";
+  _syncFooter();
 }
 
 function welcomeNode() {
@@ -410,6 +434,7 @@ function welcomeNode() {
 
 function renderChat() {
   const chat = $("chat");
+  chat.classList.remove("ovmode");   // 退出总概览全屏
   chat.innerHTML = "";
   const msgs = state.currentSession?.messages || [];
   if (!msgs.length) {
@@ -433,11 +458,28 @@ function schedEmptyNode() {
   return w;
 }
 
+// 定时任务会话:一轮执行的页脚(执行日期/时间 · 耗时 · token 用量)
+function runMetaHtml(m) {
+  const dt = m.created_at || "";
+  const date = dt.slice(0, 10), time = dt.slice(11, 19);
+  const dur = m.duration_sec ? ` · 耗时 ${m.duration_sec}s` : "";
+  const tok = ` · 消耗 ${(m.tokens || 0).toLocaleString()} tokens`;
+  const when = (date || time) ? `执行于 ${esc(date)} ${esc(time)}` : "已执行";
+  return `<div class="run-meta">${when}${dur}${tok}</div>`;
+}
+
 function renderMessage(m) {
   const wrap = document.createElement("div");
-  wrap.className = `msg ${m.role === "user" ? "user" : "bot"}`;
   wrap.dataset.mid = m.id;
 
+  // 系统事件(漏跑 / 忽略 / 补救):居中提示行,不是对话气泡
+  if (m.role === "event") {
+    wrap.className = `msg-event ${esc(m.event_kind || "")}`;
+    wrap.innerHTML = `<span class="msg-event__t">${esc(m.content || "")}</span>`;
+    return wrap;
+  }
+
+  wrap.className = `msg ${m.role === "user" ? "user" : "bot"}`;
   const avatar = `<div class="avatar">${m.role === "user" ? "我" : "爪"}</div>`;
   let content = `<div class="msg__content">`;
 
@@ -565,12 +607,21 @@ function renderMessage(m) {
               <div class="wiz-card__ic">${SESS_CLOCK_INLINE}</div>
               <div class="wiz-card__body">
                 <div class="wiz-card__t">创建定时任务</div>
-                <div class="wiz-card__s">我已根据你的描述预填好,点开按一步步补全确认。</div>
+                <div class="wiz-card__s">我已根据你的描述预填好,点开核对并补全即可创建。</div>
               </div>
-              <button class="wiz-card__btn" data-wiz-open="${esc(m.id)}">去设置</button>
+              <button class="wiz-card__btn" data-wiz-open="${esc(m.id)}">去创建</button>
             </div>`;
         }
       }
+    }
+    // 定时任务会话:每轮执行完,下方显示执行日期/时间 + token 用量
+    if (!running && !awaitingDecrypt && state.currentSession
+        && state.currentSession.kind === "scheduled" && m.created_at) {
+      content += runMetaHtml(m);
+    }
+    // 漏跑补救说明:附在本轮执行时间下方,与该轮对话同属一个整体
+    if (!running && !awaitingDecrypt && m.remediation_note) {
+      content += `<div class="run-remed">${esc(m.remediation_note)}</div>`;
     }
   }
   content += `</div>`;
@@ -609,7 +660,7 @@ function renderMessage(m) {
     });
   });
 
-  // 创建定时任务向导:只由卡片「去设置」按钮手动打开,**不再自动弹窗**(避免莫名弹出)
+  // 创建定时任务表单:只由卡片「去创建」按钮手动打开,**不再自动弹窗**(避免莫名弹出)
   wrap.querySelectorAll("[data-wiz-open]").forEach(b => {
     b.addEventListener("click", () => openTaskWizard(m.wizard || {}, m.id));
   });
@@ -1066,6 +1117,7 @@ function pickExistingCipher(path, name) {
 // ============ 设置 Modal ============
 const TABS = {
   general: { title: "连接 / 计算", render: renderGeneralTab },
+  ops:     { title: "自启 / 运维", render: renderOpsTab },
   skills:  { title: "Skill 管理", render: renderSkillsTab },
   keys:    { title: "同态密钥", render: renderKeysTab },
   account: { title: "账户", render: renderAccountTab },
@@ -1080,7 +1132,7 @@ function openModal(tab) {
   });
   TABS[currentTab].render();
 }
-function closeModal() { $("modalMask").classList.remove("open"); }
+function closeModal() { $("modalMask").classList.remove("open"); clearInterval(_opsTimer); }
 
 async function renderGeneralTab() {
   const cfg = await api("GET", "/api/config");
@@ -1114,6 +1166,66 @@ async function renderGeneralTab() {
   });
 }
 
+// ============ 自启 / 运维 Tab(客户端自身开机自启 + 崩溃重启)============
+let _opsTimer = null;
+async function renderOpsTab() {
+  $("modalBody").innerHTML = `
+    <h2>${TABS.ops.title}</h2>
+    <p class="sub">让本机的用户端(数据面 :8444)开机自动启动、崩溃后自动重启。仅作用于这台电脑。</p>
+    <div id="opsAlert"></div>
+
+    <div class="ops-cards" id="opsCards"></div>
+
+    <div class="field" style="margin-top:18px; display:flex; gap:10px; flex-wrap:wrap;">
+      <button class="btn-primary" id="opsEnable">启用开机自启 + 守护</button>
+      <button class="btn-danger" id="opsDisable">停用</button>
+      <button class="btn-ghost" id="opsStart">仅启动守护(本次)</button>
+      <button class="btn-ghost" id="opsStop">停止守护</button>
+    </div>
+
+    <div class="alert-box info" style="margin-top:16px; line-height:1.7;">
+      <strong>原理:</strong>开机自启在登录时拉起一个守护进程 <code>client_supervisor.py</code>,
+      由它启动、健康探测、崩溃后退避重启用户端(:8444)。三平台一致:
+      macOS 用 <code>LaunchAgent</code>、Linux 用 <code>systemd --user</code>、Windows 用计划任务。
+      与控制面 Host 的守护相互独立,互不影响。<br>
+      <strong>停用</strong>会移除开机自启并停止守护(用户端本身保留,界面不掉线)。
+    </div>`;
+
+  const renderCards = (s) => {
+    const sup = s.supervisor || {}, au = s.autostart || {}, cl = s.client || {};
+    $("opsCards").innerHTML = `
+      <div class="ops-card"><div class="ops-card__label">开机自启</div>
+        <div class="ops-card__val ${au.installed ? "ok" : "bad"}">${au.installed ? "已启用" : "未启用"}</div>
+        <div class="ops-card__hint">${esc(au.detail || "")}</div></div>
+      <div class="ops-card"><div class="ops-card__label">守护进程</div>
+        <div class="ops-card__val ${sup.running ? "ok" : "bad"}">${sup.running ? "运行中" : "未运行"}</div>
+        <div class="ops-card__hint">${sup.pid ? "pid " + sup.pid : "崩溃自愈未生效"}</div></div>
+      <div class="ops-card"><div class="ops-card__label">用户端 · :${cl.port || 8444}</div>
+        <div class="ops-card__val ${cl.healthy ? "ok" : "bad"}">${cl.healthy ? "健康" : "不可达"}</div>
+        <div class="ops-card__hint">${cl.managed ? "受守护 · 重启 " + (cl.restarts || 0) + " 次" : "未受守护"}</div></div>`;
+  };
+  const refresh = async () => {
+    try { renderCards(await api("GET", "/api/ops/status")); } catch (e) {}
+  };
+  await refresh();
+  clearInterval(_opsTimer);
+  _opsTimer = setInterval(() => { if ($("opsCards")) refresh(); else clearInterval(_opsTimer); }, 4000);
+
+  const act = async (path, btn, busy) => {
+    const orig = btn.textContent; btn.disabled = true; btn.textContent = busy;
+    try {
+      const r = await api("POST", path);
+      $("opsAlert").innerHTML = `<div class="alert-box success">${esc(r.msg || "已完成")}</div>`;
+    } catch (e) {
+      $("opsAlert").innerHTML = `<div class="alert-box">操作失败:${esc(e.message)}</div>`;
+    } finally { btn.disabled = false; btn.textContent = orig; await refresh(); }
+  };
+  $("opsEnable").addEventListener("click", e => act("/api/ops/autostart/enable", e.target, "启用中…"));
+  $("opsDisable").addEventListener("click", e => { if (confirm("停用开机自启并停止守护?用户端会继续运行,但崩溃后不再自动重启。")) act("/api/ops/autostart/disable", e.target, "停用中…"); });
+  $("opsStart").addEventListener("click", e => act("/api/ops/supervisor/start", e.target, "启动中…"));
+  $("opsStop").addEventListener("click", e => act("/api/ops/supervisor/stop", e.target, "停止中…"));
+}
+
 // ============ 定时任务 Tab ============
 // ============ 创建定时任务向导(内联在输入框上方 · 一步步补全)============
 let _wizBound = false;
@@ -1129,27 +1241,12 @@ function closeTaskWizard() {
   state.wizard = null;
   const bar = $("wizBar");
   if (bar) bar.hidden = true;
+  _syncFooter();   // 向导关闭后,若仍在总览则重新隐藏 footer
 }
 
+// 新建定时任务统一走单页表单弹窗(取代旧的底部分步向导);prefill 来自普通会话的意图抽取
 function openTaskWizard(prefill, fromMid) {
-  prefill = prefill || {};
-  const slots = {
-    question: prefill.question || "",
-    schedule_text: prefill.schedule_text || prefill.cron_readable || "",
-    cron: prefill.cron || "",
-    cron_readable: prefill.cron_readable || "",
-    name: prefill.name || "",
-    needs_data: prefill.needs_data !== false,
-    data_source: (prefill.needs_data === false) ? "none" : "folder",
-    source_folder: "", output_folder: "",
-    web_search: prefill.needs_data === false,   // 无数据(查天气/新闻/资料)默认开联网
-  };
-  // 大模型已抽取到的(问题/排程)直接采用,从第一个**缺失**的步骤开始,不让用户重选一遍
-  state.wizard = { stepKey: _firstIncompleteStep(slots), slots, fromMid: fromMid || "" };
-  bindWizard();
-  const bar = $("wizBar");
-  if (bar) { bar.hidden = false; bar.scrollIntoView({ block: "nearest", behavior: "smooth" }); }
-  renderWizard();
+  openCreateTaskForm(prefill || {}, fromMid);
 }
 
 // 判断输入是否为"明确的任务/指令"(拒绝随便输入「1」「...」之类)
@@ -1800,6 +1897,14 @@ function renderTaskHistory() {
 
 // 顶栏「待批运行」红点 —— 显示**当前定时任务**的未处理数(待解密 + 漏跑)
 // 顶栏两个红点 **独立计算**:待解密文件=密态待解密次数;漏跑=漏跑条数(互不相加)
+// 轻量刷新「定时任务」总数(只取任务列表)→ 更新切换条数字。任务仅在创建/删除时变,故事件驱动调用。
+async function refreshTaskCount() {
+  try { const r = await api("GET", "/api/scheduled_tasks"); state.tasks = r.tasks || []; }
+  catch (e) { return; }
+  const b = document.querySelector('#sessToggle .sess-toggle__btn[data-view="scheduled"]');
+  if (b) b.dataset.count = (state.tasks || []).length;
+}
+
 async function refreshTasksBadge() {
   const tb = $("tasksBadge"), mb = $("missedBadge");
   const missBtn = document.querySelector('#taskActions [data-tpanel="missed"]');
@@ -1816,101 +1921,199 @@ async function refreshTasksBadge() {
   } catch {}
 }
 
-// ============ 定时任务面板(选中定时会话 → 顶栏 4 入口,各自独立界面)============
-// 当前任务的 3 个面板(待批/编辑/历史)—— 都是"当前会话这个任务"的
+// ============ 定时任务面板:可在弹窗(选中会话时顶栏入口)或「总概览」全屏内联复用 ============
 const TASK_PANEL_TABS = [
+  { key: "status",  label: "运行状态" },
   { key: "pending", label: "待解密文件" },
+  { key: "missed",  label: "漏跑" },
   { key: "edit",    label: "编辑任务" },
   { key: "history", label: "运行历史" },
 ];
 
-function closeTaskPanel() { $("taskPanelMask")?.classList.remove("open"); }
+let _tpHost = "modal";   // "modal"=弹窗 | "overview"=总概览全屏内联;决定面板渲染到哪个容器
+function _tpBody() { return _tpHost === "overview" ? $("ovBody") : $("taskPanelBody"); }
+function _tpTabs() { return _tpHost === "overview" ? $("ovTabs") : $("taskPanelTabs"); }
+let _gsTimer = null;
 
-// 顶栏「待批运行 / 编辑任务 / 运行历史」→ 当前任务的 3-tab 面板
+function closeTaskPanel() {
+  if (_tpHost === "overview") { _tpHost = "modal"; renderOverviewList(); return; }  // 全屏内联 → 返回总概览
+  $("taskPanelMask")?.classList.remove("open");
+  document.querySelector("#taskPanelMask .task-panel")?.classList.remove("ct-mode");   // 复位创建表单的自适应高度
+  const tabs = $("taskPanelTabs"); if (tabs) tabs.style.display = "";
+}
+
+// 顶栏入口(选中定时会话时)→ 弹窗形式的任务面板
 async function openTaskPanel(view) {
   if (!state.currentTaskId) { toast("该会话未关联任务"); return; }
+  _tpHost = "modal";
+  const tabs = $("taskPanelTabs"); if (tabs) tabs.style.display = "";   // 复位(新建表单会把它隐藏)
+  document.querySelector("#taskPanelMask .task-panel")?.classList.remove("ct-mode");
   $("taskPanelMask").classList.add("open");
   $("taskPanelBody").innerHTML = '<div class="alert-box info">加载中…</div>';
   await loadTasksData();
-  renderTaskPanel(view || "pending");
+  renderTaskPanel(view || "status");
 }
-
-// 顶栏「运行状态」→ 单独的全局界面(查看所有定时任务),不与上面 3 个混在一起
-async function openGlobalStatus() {
-  $("taskPanelMask").classList.add("open");
-  $("taskPanelBody").innerHTML = '<div class="alert-box info">加载中…</div>';
-  await loadTasksData();
-  renderGlobalStatus();
-}
+function openMissedPanel() { return openTaskPanel("missed"); }
 
 function _curTask() { return (state.tasks || []).find(t => t.id === state.currentTaskId); }
+
+// ============ 总概览(全屏,渲染进 #chat;非弹窗)============
+async function openOverview() {
+  state.ov = "list";
+  state.currentSid = null; state.currentSession = null;
+  // 记住正处于「定时任务管理」总览,刷新后恢复到这里(而不是跳去某个会话)
+  try { localStorage.removeItem("cw_cur_sid"); localStorage.setItem("cw_ov", "1"); } catch (e) {}
+  updateSessionChrome();             // 隐藏顶栏任务入口
+  renderSessionList();               // 侧栏取消选中高亮
+  $("chat").innerHTML = '<div class="ov-wrap"><div class="alert-box info">加载中…</div></div>';
+  await loadSessions(); await loadTasksData();
+  renderOverviewList();
+  clearInterval(_gsTimer);
+  _gsTimer = setInterval(async () => {
+    if (state.ov !== "list") { clearInterval(_gsTimer); return; }
+    if (state.ovComposing) return;   // 输入法组词中,别重渲毁掉搜索框
+    await loadSessions(); await loadTasksData();
+    if (state.ov === "list" && !state.ovComposing) renderOverviewList();
+  }, 4000);
+}
+
+function renderOverviewList() {
+  state.ov = "list"; _tpHost = "modal";
+  $("chat").classList.add("ovmode");
+  // 重渲前记住搜索框的焦点/光标位置(4s 自动刷新或输入时都不丢焦点)
+  const _se = document.getElementById("ovSearch");
+  const _seFocused = _se && document.activeElement === _se;
+  const _seCaret = _se ? _se.selectionStart : null;
+  const list = state.tasks || [];
+  const sessById = {};
+  (state.sessions || []).forEach(s => { if (s.task_id) sessById[s.task_id] = s; });
+  // 待解密 / 漏跑 计数都按**任务**取(来自 /pending,与会话是否打开/隐藏无关)
+  const encByTask = {};   // 每个任务的待解密密文条数
+  (state.tasksPending?.encrypted || []).forEach(a => { encByTask[a.task_id] = a.count || 0; });
+  const missedByTask = {};
+  (state.tasksPending?.missed || []).forEach(m => { missedByTask[m.task_id] = (missedByTask[m.task_id] || 0) + 1; });
+  const enabled = list.filter(t => t.enabled).length;
+  const runningN = list.filter(t => (sessById[t.id] || {}).running).length;
+  const missedN = (state.tasksPending?.missed || []).length;
+  // 搜索过滤(任务名 / 问题指令);卡片统计仍用全量
+  const q = (state.ovQuery || "").trim().toLowerCase();
+  const shown = q ? list.filter(t =>
+    (t.name || "").toLowerCase().includes(q) || (t.question || "").toLowerCase().includes(q)) : list;
+  let html = `<div class="ov-wrap">
+    <div class="ov-head"><h2>定时任务管理</h2>
+      <div class="ov-search-wrap">
+        <input type="text" id="ovSearch" class="ov-search" placeholder="搜索任务名 / 指令…" value="${esc(state.ovQuery || "")}">
+        <button class="ov-search-x" id="ovSearchX" title="清空"${(state.ovQuery || "") ? "" : " hidden"}>✕</button>
+      </div>
+      <button class="btn-primary btn-sm" id="ovNew">+ 新建定时任务</button></div>
+    <div class="ops-cards">
+      <div class="ops-card"><div class="ops-card__label">任务总数</div><div class="ops-card__val">${list.length}</div><div class="ops-card__hint">${enabled} 启用 · ${list.length - enabled} 停用</div></div>
+      <div class="ops-card"><div class="ops-card__label">正在执行</div><div class="ops-card__val ${runningN ? "ok" : ""}">${runningN}</div><div class="ops-card__hint">实时运行中</div></div>
+      <div class="ops-card"><div class="ops-card__label">漏跑待处理</div><div class="ops-card__val ${missedN ? "bad" : ""}">${missedN}</div><div class="ops-card__hint">未按时执行</div></div>
+    </div>
+    <div id="opsAlertOv"></div>`;
+  if (!list.length) html += '<div class="alert-box info">还没有定时任务 · 点右上角「新建定时任务」创建</div>';
+  else if (!shown.length) html += `<div class="alert-box info">没有匹配「${esc(state.ovQuery || "")}」的任务</div>`;
+  else html += shown.map(t => {
+    const s = sessById[t.id] || {};
+    const run = s.running ? '<span class="badge use">● 执行中…</span>'
+      : (t.enabled ? '<span class="badge ok">空闲·待触发</span>' : '<span class="badge no">已停用</span>');
+    const mc = missedByTask[t.id] || 0;
+    const miss = mc > 0 ? `<span class="badge danger">漏跑 ${mc}</span>` : "";
+    // 把详情里的功能直接铺到行上(单行展示);点击打开对应 tab 的弹窗面板
+    // 顺序:查看会话 · 运行状态 · 漏跑 · 待解密文件 · 编辑任务 · 运行历史 · 删除任务
+    const tid = esc(t.id);
+    const encN = encByTask[t.id] || 0;
+    const fns = [`<button class="btn-ghost btn-sm" data-ovsess="${tid}">查看会话</button>`];
+    fns.push(`<button class="btn-ghost btn-sm" data-ovfn="status" data-tid="${tid}">运行状态</button>`);
+    if (mc > 0) fns.push(`<button class="btn-ghost btn-sm" data-ovfn="missed" data-tid="${tid}" style="color:var(--danger);border-color:#fecaca;">漏跑<span class="ov-cnt danger">${mc}</span></button>`);
+    if (t.needs_approval) fns.push(`<button class="btn-ghost btn-sm" data-ovfn="pending" data-tid="${tid}">待解密文件${encN > 0 ? `<span class="ov-cnt">${encN}</span>` : ""}</button>`);
+    fns.push(`<button class="btn-ghost btn-sm" data-ovfn="edit" data-tid="${tid}">编辑任务</button>`);
+    fns.push(`<button class="btn-ghost btn-sm" data-ovfn="history" data-tid="${tid}">运行历史</button>`);
+    fns.push(`<button class="btn-ghost btn-sm ov-del" data-ovdel="${tid}" data-name="${esc(t.name)}">删除任务</button>`);
+    return `
+    <div class="list-item ov-row">
+      <div class="grow">
+        <div class="t">${esc(t.name)}
+          ${t.needs_approval ? '<span class="badge warn">密态</span>' : '<span class="badge ok">问答</span>'}
+          ${t.web_search ? '<span class="badge use">联网</span>' : ''} ${run} ${miss}</div>
+        <div class="d">${esc(scheduleText(t))} · 下次:${esc((t.next_run||"").slice(0,16).replace("T"," ")||"—")} · 上次:${esc((t.last_fired||"").slice(0,16).replace("T"," ")||"未跑")}</div>
+        <div class="ov-desc">${esc((t.question||"").slice(0,120))}${(t.question||"").length>120?'…':''}</div>
+      </div>
+      <div class="ov-fns">${fns.join("")}</div>
+    </div>`;
+  }).join("");
+  html += "</div>";
+  $("chat").innerHTML = html;
+  // 搜索:输入即过滤(局部重渲并恢复焦点/光标);兼容中文输入法 —— 组词期间不重渲
+  const se = $("ovSearch");
+  if (se) {
+    const doSearch = () => { state.ovQuery = se.value; renderOverviewList(); };
+    se.addEventListener("compositionstart", () => { state.ovComposing = true; });
+    se.addEventListener("compositionend", () => { state.ovComposing = false; doSearch(); });
+    se.addEventListener("input", (e) => { if (e.isComposing || state.ovComposing) return; doSearch(); });
+    $("ovSearchX")?.addEventListener("click", () => {
+      state.ovQuery = ""; state.ovComposing = false; renderOverviewList();
+      const n = $("ovSearch"); if (n) n.focus();
+    });
+    if (_seFocused) { se.focus(); if (_seCaret != null) try { se.setSelectionRange(_seCaret, _seCaret); } catch (e) {} }
+  }
+  $("ovNew")?.addEventListener("click", () => openTaskWizard({}));
+  // 查看会话:确保任务有会话(历次运行累积于此,关闭/切走不清除),再跳转
+  $("chat").querySelectorAll("[data-ovsess]").forEach(b => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    try {
+      const r = await api("POST", `/api/scheduled_tasks/${b.dataset.ovsess}/session`);
+      if (r && r.session_id) {
+        await loadSessions();          // 新建/已存在的会话先纳入列表,selectSession 才能正确识别为定时会话
+        setSessionView("scheduled");
+        await selectSession(r.session_id);
+      }
+    } catch (err) { toast("打开会话失败:" + (err.message || err)); }
+  }));
+  // 删除任务:二次确认 → 删任务 + 关联会话/记录一并清除
+  $("chat").querySelectorAll("[data-ovdel]").forEach(b => b.addEventListener("click", async (e) => {
+    e.stopPropagation();
+    const id = b.dataset.ovdel, nm = b.dataset.name || "该任务";
+    if (!confirm(`确认删除定时任务「${nm}」?\n\n该任务、它的聊天会话与全部运行历史都会被清除,且不可恢复。`)) return;
+    b.disabled = true; b.textContent = "删除中…";
+    try {
+      await api("DELETE", `/api/scheduled_tasks/${id}`);
+      if (state.currentTaskId === id) state.currentTaskId = "";
+      toast("任务及其会话已删除");
+      await loadTasksData(); await loadSessions(); refreshTasksBadge();   // 先刷新任务 → 切换条数字立即更新
+      renderOverviewList();
+    } catch (err) { toast("删除失败:" + (err.message || err)); b.disabled = false; b.textContent = "删除任务"; }
+  }));
+  $("chat").querySelectorAll("[data-ovfn]").forEach(b => b.addEventListener("click", (e) => {
+    e.stopPropagation();
+    state.currentTaskId = b.dataset.tid;
+    openTaskPanel(b.dataset.ovfn);   // 弹窗面板(之前的界面),定位到对应 tab
+  }));
+}
 
 function renderTaskPanel(view) {
   const t = _curTask();
   // 无数据(问答/查询)任务没有"待解密文件",tab 里也不显示
   const isData = !!(t && t.needs_approval);
   const tabsList = TASK_PANEL_TABS.filter(tab => tab.key !== "pending" || isData);
-  if (view === "pending" && !isData) view = "edit";   // 兜底:无数据时不进待解密
-  const tabs = $("taskPanelTabs");
+  if (view === "pending" && !isData) view = "status";   // 兜底:无数据时不进待解密
+  const tabs = _tpTabs();
   tabs.innerHTML = tabsList.map(tb =>
     `<button class="tp-tab ${tb.key === view ? "active" : ""}" data-tpv="${tb.key}">${tb.label}</button>`).join("");
   tabs.querySelectorAll("[data-tpv]").forEach(b =>
     b.addEventListener("click", () => renderTaskPanel(b.dataset.tpv)));
-  if (!t) { $("taskPanelBody").innerHTML = '<div class="alert-box">任务不存在(可能已删除)</div>'; return; }
-  ({ pending: renderTPPending, history: renderTPHistory, edit: renderTPEdit }[view] || renderTPEdit)(t);
+  if (!t) { _tpBody().innerHTML = '<div class="alert-box">任务不存在(可能已删除)</div>'; return; }
+  ({ status: renderTPStatus, pending: renderTPPending, missed: renderTPMissed,
+     history: renderTPHistory, edit: renderTPEdit }[view] || renderTPStatus)(t);
 }
 
 async function _reloadPanel(view) { await loadTasksData(); renderTaskPanel(view); refreshTasksBadge(); }
 
-// —— 运行状态:全部定时任务总览(全局,非当前会话作用域)——
-function renderGlobalStatus() {
-  $("taskPanelTabs").innerHTML = '<span class="tp-tab active" style="cursor:default;">运行状态 · 全部定时任务</span>';
-  const list = state.tasks || [];
-  let html = '<h2 class="tp-h">全部定时任务</h2><div id="tpAlert"></div>';
-  if (!list.length) html += '<div class="alert-box info">还没有定时任务 · 在「定时任务」视图点「新建定时任务」</div>';
-  else html += list.map(t => `
-    <div class="list-item">
-      <div class="grow">
-        <div class="t">${esc(t.name)}
-          ${t.needs_approval ? '<span class="badge warn">密态·需批准</span>' : '<span class="badge ok">自由问答</span>'}
-          ${t.web_search ? '<span class="badge use">联网搜索·开</span>' : '<span class="badge no">联网搜索·关</span>'}
-          ${t.enabled ? '<span class="badge ok">运行中</span>' : '<span class="badge no">已停用</span>'}</div>
-        <div class="d">${esc(scheduleText(t))} · 下次:${esc((t.next_run||"").slice(0,16).replace("T"," ")||"—")}</div>
-        <div class="d" style="white-space:normal;">${esc((t.question||"").slice(0,70))}${(t.question||"").length>70?'…':''}</div>
-      </div>
-      ${t.session_id ? `<button class="btn-ghost btn-sm" data-gsopen="${esc(t.session_id)}">查看会话</button>` : ""}
-      <button class="btn-ghost btn-sm" data-gsrun="${esc(t.id)}">立即跑</button>
-      <button class="btn-ghost btn-sm" data-gstoggle="${esc(t.id)}" data-en="${t.enabled?1:0}">${t.enabled?'停用':'启用'}</button>
-      <button class="btn-danger" data-gsdel="${esc(t.id)}">删除</button>
-    </div>`).join("");
-  $("taskPanelBody").innerHTML = html;
-  const body = $("taskPanelBody");
-  body.querySelectorAll("[data-gsopen]").forEach(b => b.addEventListener("click", async () => {
-    closeTaskPanel(); setSessionView("scheduled"); await loadSessions(); await selectSession(b.dataset.gsopen);
-  }));
-  body.querySelectorAll("[data-gsrun]").forEach(b => b.addEventListener("click", async () => {
-    b.disabled = true; b.textContent = "触发中…";
-    try {
-      await api("POST", `/api/scheduled_tasks/${b.dataset.gsrun}/run_now`);
-      toast("已触发运行一次");
-      await loadSessions();   // 立即刷新侧栏:该任务会话出现跳动的 …
-      await loadTasksData(); renderGlobalStatus(); refreshTasksBadge();
-    } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">触发失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = "立即跑"; }
-  }));
-  body.querySelectorAll("[data-gstoggle]").forEach(b => b.addEventListener("click", async () => {
-    try { await api("PATCH", `/api/scheduled_tasks/${b.dataset.gstoggle}`, { enabled: b.dataset.en !== "1" }); await loadTasksData(); renderGlobalStatus(); }
-    catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">操作失败:${esc(e.message)}</div>`; }
-  }));
-  body.querySelectorAll("[data-gsdel]").forEach(b => b.addEventListener("click", async () => {
-    if (!confirm("删除这个定时任务?")) return;
-    try { await api("DELETE", `/api/scheduled_tasks/${b.dataset.gsdel}`); await loadSessions(); await loadTasksData(); renderGlobalStatus(); refreshTasksBadge(); }
-    catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">删除失败:${esc(e.message)}</div>`; }
-  }));
-}
 
 // —— 运行状态(= 我的任务那块)——
 function renderTPStatus(t) {
-  $("taskPanelBody").innerHTML = `
+  _tpBody().innerHTML = `
     <h2 class="tp-h">运行状态</h2>
     <div id="tpAlert"></div>
     <div class="list-item">
@@ -1931,14 +2134,15 @@ function renderTPStatus(t) {
       <button class="btn-ghost" id="tpToggle">${t.enabled ? "停用" : "启用"}</button>
       <button class="btn-danger" id="tpDel">删除任务</button>
     </div>`;
+  const inOv = !!state.ov;   // 从「定时任务管理」打开的弹窗:操作后留在弹窗并刷新,关闭后回到管理列表
   $("tpRun").addEventListener("click", async () => {
     const b = $("tpRun"); b.disabled = true; b.textContent = "触发中…";
     try {
       await api("POST", `/api/scheduled_tasks/${t.id}/run_now`);
-      closeTaskPanel();
-      await loadSessions();   // 刷新侧栏运行态(跳动的 …)
-      if (state.currentSid) await selectSession(state.currentSid);   // 回到该会话看实时运行
+      await loadSessions();   // 刷新侧栏/总概览运行态(跳动的 …)
       toast("已触发运行一次");
+      if (inOv) { await _reloadPanel("status"); }       // 弹窗:留在面板并刷新
+      else { closeTaskPanel(); if (state.currentSid) await selectSession(state.currentSid); }
     } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">触发失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = "立即运行一次"; }
   });
   $("tpToggle").addEventListener("click", async () => {
@@ -1946,9 +2150,14 @@ function renderTPStatus(t) {
     catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">操作失败:${esc(e.message)}</div>`; }
   });
   $("tpDel").addEventListener("click", async () => {
-    if (!confirm(`删除定时任务「${t.name}」?其会话记录保留,但不再自动运行。`)) return;
-    try { await api("DELETE", `/api/scheduled_tasks/${t.id}`); closeTaskPanel(); await loadSessions(); showWelcome(); refreshTasksBadge(); toast("任务已删除"); }
-    catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">删除失败:${esc(e.message)}</div>`; }
+    if (!confirm(`确认删除定时任务「${t.name}」?\n\n该任务、它的聊天会话与全部运行历史都会被清除,且不可恢复。`)) return;
+    try {
+      await api("DELETE", `/api/scheduled_tasks/${t.id}`);
+      await refreshTaskCount(); await loadSessions(); refreshTasksBadge(); toast("任务已删除");
+      closeTaskPanel();
+      if (inOv) { await loadTasksData(); renderOverviewList(); }   // 回定时任务管理列表
+      else { showWelcome(); }
+    } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">删除失败:${esc(e.message)}</div>`; }
   });
 }
 
@@ -1964,8 +2173,8 @@ function renderTPPending(t) {
       </div>
       <button class="btn-primary btn-sm" data-tpdec="${esc(a.task_id)}">解密 → 输出文件夹</button></div>`;
   });
-  $("taskPanelBody").innerHTML = html;
-  $("taskPanelBody").querySelectorAll("[data-tpdec]").forEach(b => b.addEventListener("click", async () => {
+  const body = _tpBody(); body.innerHTML = html;
+  body.querySelectorAll("[data-tpdec]").forEach(b => b.addEventListener("click", async () => {
     b.disabled = true; b.textContent = "解密中…";
     try {
       const r = await api("POST", `/api/scheduled_tasks/decrypt/${b.dataset.tpdec}`);
@@ -1975,17 +2184,8 @@ function renderTPPending(t) {
   }));
 }
 
-// —— 漏跑(独立面板,顶栏「漏跑」入口)——
-async function openMissedPanel() {
-  if (!state.currentTaskId) { toast("该会话未关联任务"); return; }
-  $("taskPanelMask").classList.add("open");
-  $("taskPanelBody").innerHTML = '<div class="alert-box info">加载中…</div>';
-  await loadTasksData();
-  renderTPMissed();
-}
-
+// —— 漏跑(作为任务面板的一个 tab)——
 function renderTPMissed() {
-  $("taskPanelTabs").innerHTML = '<span class="tp-tab active" style="cursor:default;">漏跑 · 未按时执行</span>';
   const t = _curTask();
   const tid = state.currentTaskId;
   const missed = (state.tasksPending?.missed || []).filter(m => m.task_id === tid);
@@ -2008,8 +2208,9 @@ function renderTPMissed() {
       <button class="btn-primary btn-sm" data-tpremed="${esc(m.id)}" data-needs="${m.needs_data?1:0}">${btnLabel}</button>
       <button class="btn-ghost btn-sm" data-tpmissx="${esc(m.id)}">忽略</button></div>`;
   });
-  $("taskPanelBody").innerHTML = html;
-  $("taskPanelBody").querySelectorAll("[data-tpremed]").forEach(b => b.addEventListener("click", async () => {
+  const body = _tpBody(); body.innerHTML = html;
+  const inOv = !!state.ov;   // 「定时任务管理」弹窗:补跑后留在面板刷新
+  body.querySelectorAll("[data-tpremed]").forEach(b => b.addEventListener("click", async () => {
     let sp = "";
     if (b.dataset.needs === "1") {
       try { const p = await api("POST", "/api/pick_file"); if (p.cancelled || !p.path) return; sp = p.path; }
@@ -2019,18 +2220,16 @@ function renderTPMissed() {
     b.disabled = true; b.textContent = "补跑中…";
     try {
       await api("POST", `/api/scheduled_tasks/missed/${b.dataset.tpremed}/remediate`, { source_path: sp });
-      closeTaskPanel();
-      await loadSessions();   // 立即刷新侧栏:跳动…出现、红警示按需更新
-      if (state.currentSid) await selectSession(state.currentSid);
-      toast("已补跑该轮 · 见会话");
+      await loadSessions(); refreshTasksBadge();   // 刷新侧栏/总概览:跳动…、红警示
+      if (inOv) { await _reloadPanel("missed"); toast("已补跑该轮"); }
+      else { closeTaskPanel(); if (state.currentSid) await selectSession(state.currentSid); toast("已补跑该轮 · 见会话"); }
     } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">补跑失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = orig; }
   }));
-  $("taskPanelBody").querySelectorAll("[data-tpmissx]").forEach(b => b.addEventListener("click", async () => {
+  body.querySelectorAll("[data-tpmissx]").forEach(b => b.addEventListener("click", async () => {
     await api("POST", `/api/scheduled_tasks/missed/${b.dataset.tpmissx}/dismiss`);
-    await loadTasksData();
+    await loadTasksData(); await loadSessions(); refreshTasksBadge();
     const left = (state.tasksPending?.missed || []).filter(m => m.task_id === state.currentTaskId).length;
-    if (left) renderTPMissed(); else { closeTaskPanel(); }
-    await loadSessions();   // 刷新侧栏红警示
+    renderTaskPanel(left ? "missed" : "status");   // 还有漏跑就留在漏跑,否则切到运行状态
   }));
 }
 
@@ -2059,7 +2258,7 @@ function renderTPHistory(t) {
       <div class="t"><span class="badge ${HIST_STATUS_BADGE[r.status]||"no"}">${esc(_histStatusCN(r.status))}</span></div>
       <div class="d">${esc((r.ran_at||"").slice(0,16).replace("T"," "))} · ${esc(r.summary||"")}</div>
     </div></div>`).join("");
-  $("taskPanelBody").innerHTML = html;
+  _tpBody().innerHTML = html;
   $("tpHistDate").addEventListener("change", e => { _tpHistFilter.date = e.target.value; renderTPHistory(t); });
   $("tpHistStatus").addEventListener("change", e => { _tpHistFilter.status = e.target.value; renderTPHistory(t); });
   $("tpHistClear").addEventListener("click", () => { _tpHistFilter.date = ""; _tpHistFilter.status = ""; renderTPHistory(t); });
@@ -2105,7 +2304,7 @@ function renderTPEdit(t) {
   const typeTag = isData
     ? '<span class="badge warn">密态分析 · 有数据绑定</span>'
     : '<span class="badge ok">问答任务 · 无数据绑定</span>';
-  $("taskPanelBody").innerHTML = `
+  _tpBody().innerHTML = `
     <h2 class="tp-h">编辑定时任务 ${typeTag}</h2>
     <div id="tpAlert"></div>
     ${common}
@@ -2152,6 +2351,144 @@ function renderTPEdit(t) {
       loadSessions();   // 后台刷新侧栏(改名后子任务名跟着变),不阻塞、不动当前面板
     } catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">保存失败:${esc(e.message)}</div>`; b.disabled = false; b.textContent = "保存修改"; }
   });
+}
+
+// ============ 新建定时任务:单页表单(弹窗,覆盖输入框)============
+// 取代原先底部一步步的向导 —— 所有内容一次性铺在一个表单里(类似「编辑任务」)。
+function openCreateTaskForm(prefill, fromMid) {
+  _tpHost = "modal";
+  state._createFrom = fromMid || "";
+  const tabs = $("taskPanelTabs");
+  if (tabs) { tabs.innerHTML = ""; tabs.style.display = "none"; }   // 创建表单不需要 tab
+  document.querySelector("#taskPanelMask .task-panel")?.classList.add("ct-mode");  // 弹窗自适应高度,一屏展示
+  $("taskPanelMask").classList.add("open");
+  renderCreateTaskForm(prefill || {});
+}
+
+function renderCreateTaskForm(s) {
+  s = s || {};
+  const dsNone = (s.needs_data === false);
+  const body = $("taskPanelBody");
+  body.innerHTML = `
+    <div class="ct-form">
+    <h2 class="tp-h">新建定时任务</h2>
+    <div id="tpAlert"></div>
+    <div class="field"><label>任务名 <span class="hint-inline">留空=自动取问题前几个字</span></label>
+      <input type="text" id="ctName" value="${esc(s.name || "")}" placeholder="给任务起个名(可留空)"></div>
+    <div class="field"><label>问题 / 指令</label>
+      <textarea id="ctQuestion" rows="2" placeholder="例:按大区统计本月回款率 TOP10 / 查上海明天天气 / 汇总今天的行业新闻">${esc(s.question || "")}</textarea></div>
+    <div class="field"><label>周期<span class="hint-inline">如 每天早上9点 / 每周一三五9点 / 每月1号</span></label>
+      <input type="text" id="ctCronNL" value="${esc(s.schedule_text || s.cron_readable || "")}" placeholder="用大白话写时间,自动转成排程">
+      <div id="ctCronResult" class="cron-result">识别结果会显示在这里</div>
+      <input type="hidden" id="ctCron" value="${esc(s.cron || "")}">
+    </div>
+    <div class="field"><label>数据来源</label>
+      <label class="wiz-radio"><input type="radio" name="ctDS" value="folder" ${dsNone ? "" : "checked"}>
+        <span>绑定数据文件夹(每次取最新文件自动加密分析)<b class="wiz-rec">密态分析</b></span></label>
+      <label class="wiz-radio"><input type="radio" name="ctDS" value="none" ${dsNone ? "checked" : ""}>
+        <span>不需要数据(定期问答 / 查天气、新闻、资料等)</span></label>
+    </div>
+    <div id="ctDataFields">
+      <div class="field"><label>数据文件夹 <span class="hint-inline">每次取最新文件加密分析</span></label>
+        <div class="folder-pick">
+          <input type="text" id="ctFolder" value="${esc(s.source_folder || "")}" placeholder="点右侧选择,或粘贴绝对路径">
+          <button type="button" class="wiz-pick" id="ctFolderBtn">${FOLDER_ICON_SVG}选择文件夹</button>
+        </div></div>
+      <div class="field"><label>输出文件夹 <span class="hint-inline">留空=默认 下载/任务名</span></label>
+        <div class="folder-pick">
+          <input type="text" id="ctOutput" value="${esc(s.output_folder || "")}" placeholder="点右侧选择,或粘贴绝对路径">
+          <button type="button" class="wiz-pick" id="ctOutputBtn">${FOLDER_ICON_SVG}选择文件夹</button>
+        </div></div>
+    </div>
+    <div class="field">
+      <label class="cw-switch">
+        <input type="checkbox" id="ctWeb" ${s.web_search ? "checked" : ""}>
+        <span class="cw-switch__body">
+          <span class="cw-switch__head">联网搜索<span class="cw-switch__state"></span></span>
+          <span class="hint-inline">无数据查实时天气/新闻/资料;有数据时让 AI 上网找公式/口径</span>
+        </span>
+        <span class="cw-switch__track"><span class="cw-switch__thumb"></span></span>
+      </label>
+    </div>
+    <button class="btn-primary" id="ctCreate">创建任务</button>
+    </div>`;
+  // 数据来源切换:显隐 数据/输出 字段
+  const syncDS = () => {
+    const none = body.querySelector('input[name="ctDS"]:checked')?.value === "none";
+    $("ctDataFields").style.display = none ? "none" : "";
+  };
+  body.querySelectorAll('input[name="ctDS"]').forEach(r => r.addEventListener("change", syncDS));
+  syncDS();
+  // 大白话 → cron 实时解析
+  let timer = null;
+  const parse = async () => {
+    const text = $("ctCronNL").value.trim(); const box = $("ctCronResult");
+    if (!text) { box.className = "cron-result"; box.textContent = "识别结果会显示在这里"; $("ctCron").value = ""; return; }
+    try {
+      const r = await api("POST", "/api/scheduled_tasks/parse_schedule", { text });
+      if (r.ok) { box.className = "cron-result ok"; box.innerHTML = `✓ <strong>${esc(r.readable)}</strong> <span class="cron-code">${esc(r.cron)}</span>`; $("ctCron").value = r.cron; }
+      else { box.className = "cron-result bad"; box.textContent = r.error || "没识别出来"; $("ctCron").value = ""; }
+    } catch (e) { box.className = "cron-result bad"; box.textContent = "解析失败"; }
+  };
+  $("ctCronNL").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(parse, 350); });
+  if ($("ctCronNL").value.trim()) parse();
+  // 文件夹选择
+  const pick = (btn, inp) => $(btn).addEventListener("click", async () => {
+    try { const r = await api("POST", "/api/pick_folder"); if (!r.cancelled && r.path) $(inp).value = r.path; }
+    catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">选择失败:${esc(e.message)}</div>`; }
+  });
+  pick("ctFolderBtn", "ctFolder"); pick("ctOutputBtn", "ctOutput");
+  $("ctCreate").addEventListener("click", submitCreateTask);
+}
+
+async function submitCreateTask() {
+  const body = $("taskPanelBody");
+  const name = $("ctName").value.trim();
+  const question = $("ctQuestion").value.trim();
+  const cron = $("ctCron").value.trim();
+  const none = body.querySelector('input[name="ctDS"]:checked')?.value === "none";
+  const source_folder = none ? "" : $("ctFolder").value.trim();
+  const output_folder = none ? "" : $("ctOutput").value.trim();
+  if (!question) { $("tpAlert").innerHTML = '<div class="alert-box">请填写问题 / 指令</div>'; return; }
+  if (!cron) { $("tpAlert").innerHTML = '<div class="alert-box">排程没识别成功,换个写法,如「每天早上9点」</div>'; return; }
+  if (!none && !source_folder) { $("tpAlert").innerHTML = '<div class="alert-box">请选择数据文件夹(或改选「不需要数据」)</div>'; return; }
+  const b = $("ctCreate"); b.disabled = true; b.textContent = "创建中…";
+  let newTask = null;
+  try {
+    newTask = await api("POST", "/api/scheduled_tasks", {
+      name: name || question.slice(0, 8),
+      question,
+      schedule_kind: "cron", cron_expr: cron,
+      cron_readable: ($("ctCronResult").querySelector("strong")?.textContent || ""),
+      source_folder, output_folder,
+      web_search: !!($("ctWeb") && $("ctWeb").checked),
+      enabled: true,
+    });
+  } catch (e) {
+    $("tpAlert").innerHTML = `<div class="alert-box">创建失败:${esc(e.message)}</div>`;
+    b.disabled = false; b.textContent = "创建任务"; return;
+  }
+  const fromMid = state._createFrom; state._createFrom = "";
+  const fromOverview = (state.ov === "list");
+  closeTaskPanel();
+  const tabs = $("taskPanelTabs"); if (tabs) tabs.style.display = "";   // 复位 tab 显隐
+  // 来自普通会话的触发卡 → 标记「已创建」
+  if (fromMid && state.currentSid) {
+    try { await api("POST", `/api/sessions/${state.currentSid}/messages/${fromMid}/wizard_done`); } catch (_) {}
+    const msg = state.currentSession?.messages?.find(x => x.id === fromMid);
+    if (msg) {
+      msg.wizard = Object.assign({}, msg.wizard, { created: true });
+      const node = document.querySelector(`.msg[data-mid="${fromMid}"]`);
+      if (node) node.replaceWith(renderMessage(msg));
+    }
+  }
+  try {
+    await refreshTaskCount();   // 切换条「定时任务」数字 +1
+    await loadSessions();
+    if (fromOverview) { await loadTasksData(); renderOverviewList(); }   // 在管理页创建 → 刷新列表
+    else { setSessionView("scheduled"); if (newTask && newTask.session_id) await selectSession(newTask.session_id); }
+  } catch (_) {}
+  toast("定时任务已创建 ✓");
 }
 
 // ============ Skill 管理 Tab ============
@@ -2662,12 +2999,72 @@ async function renderAccountTab() {
   });
 }
 
+// ============ 站内信(只读通知)============
+const NOTICE_LV = { info: "提示", warning: "注意", critical: "严重" };
+
+async function loadNotices() {
+  try {
+    const r = await api("GET", "/api/notices");
+    state.notices = r.items || [];
+    state.noticeUnread = r.unread || 0;
+  } catch (e) { return; }   // 未登录/网络问题:静默
+  renderNoticeDot();
+  if (state.noticeOpen) renderNoticePanel();
+}
+
+function renderNoticeDot() {
+  const d = $("noticeDot");
+  if (d) d.hidden = !(state.noticeUnread > 0);
+}
+
+function _noticeTime(iso) { return ((iso || "").replace("T", " ").slice(0, 16)) || "—"; }
+
+function renderNoticePanel() {
+  const box = $("noticeList");
+  if (!box) return;
+  const items = state.notices || [];
+  if (!items.length) { box.innerHTML = '<div class="notice-empty">暂无站内信</div>'; return; }
+  box.innerHTML = items.map(n => `
+    <div class="notice-item ${esc(n.level)} ${n.read ? "" : "unread"}">
+      <div class="notice-item__t"><span>${esc(n.title)}</span>
+        <span class="notice-item__lv">${esc(NOTICE_LV[n.level] || "提示")}</span></div>
+      <div class="notice-item__s">${esc(n.summary)}</div>
+      <div class="notice-item__time">${esc(_noticeTime(n.created_at))}</div>
+    </div>`).join("");
+}
+
+async function openNotices() {
+  state.noticeOpen = true;
+  $("noticePanel").classList.add("open");
+  $("noticeScrim").classList.add("open");
+  await loadNotices();
+  renderNoticePanel();
+  // 打开即全部已读 → 小红点消失
+  if (state.noticeUnread > 0) {
+    try { await api("POST", "/api/notices/read"); } catch (e) {}
+    state.noticeUnread = 0;
+    (state.notices || []).forEach(n => { n.read = true; });
+    renderNoticeDot(); renderNoticePanel();
+  }
+}
+
+function closeNotices() {
+  state.noticeOpen = false;
+  $("noticePanel").classList.remove("open");
+  $("noticeScrim").classList.remove("open");
+}
+
 // ============ 事件绑定 ============
 function bindEvents() {
   $("newBtn").addEventListener("click", createSession);
   // 会话视图切换:普通 / 定时任务 —— 切换后自动回到该视图上次停留的会话
   document.querySelectorAll("#sessToggle .sess-toggle__btn").forEach(b => {
-    b.addEventListener("click", async () => { setSessionView(b.dataset.view); await selectViewSession(b.dataset.view); });
+    b.addEventListener("click", async () => {
+      setSessionView(b.dataset.view);
+      // 切到「定时任务」→ 直接展示「定时任务管理」总览;切回「普通会话」→ 回到该视图会话
+      if (b.dataset.view === "scheduled") await openOverview();
+      else await selectViewSession("normal");
+    });
   });
   $("sendBtn").addEventListener("click", sendMessage);
 
@@ -2732,6 +3129,11 @@ function bindEvents() {
     if (e.dataTransfer.files && e.dataTransfer.files.length) handleFileAttach(e.dataTransfer.files);
   });
 
+  // 站内信
+  $("noticeBtn")?.addEventListener("click", () => state.noticeOpen ? closeNotices() : openNotices());
+  $("noticeClose")?.addEventListener("click", closeNotices);
+  $("noticeScrim")?.addEventListener("click", closeNotices);
+
   // settings
   $("settingsBtn").addEventListener("click", () => openModal("general"));
   $("modalClose").addEventListener("click", closeModal);
@@ -2748,16 +3150,12 @@ function bindEvents() {
     if (e.target === $("filesMask")) closeFilesModal();
   });
 
-  // 侧栏「新建定时任务」→ 打开创建向导
-  $("newTaskBtn")?.addEventListener("click", () => openTaskWizard({}));
+  // 侧栏「定时任务管理」→ 打开管理页(页内顶部有「新建定时任务」)
+  $("overviewBtn")?.addEventListener("click", () => openOverview());
 
-  // 定时任务会话顶栏:运行状态=全局总览;其余 3 个=当前任务
+  // 定时任务会话顶栏:打开对应 tab 的弹窗任务面板
   document.querySelectorAll("#taskActions [data-tpanel]").forEach(b => {
-    b.addEventListener("click", () => {
-      if (b.dataset.tpanel === "status") openGlobalStatus();
-      else if (b.dataset.tpanel === "missed") openMissedPanel();
-      else openTaskPanel(b.dataset.tpanel);
-    });
+    b.addEventListener("click", () => openTaskPanel(b.dataset.tpanel));
   });
   $("taskPanelClose")?.addEventListener("click", closeTaskPanel);
   $("taskPanelMask")?.addEventListener("click", e => {
@@ -2781,15 +3179,27 @@ function bindEvents() {
   bindEvents();
   setSessionView(state.sessionView);   // 同步「新建会话/新建定时任务」按钮显隐
   await loadSessions();
-  // 恢复上次选中的会话(刷新后保持);失效则回退到第一条。
-  // 直接选中目标会话,**不先画欢迎页**,避免"先闪新会话页再切回"的抖动。
-  let restore = "";
-  try { restore = localStorage.getItem("cw_cur_sid") || ""; } catch (e) {}
-  const target = (restore && state.sessions.some(s => s.id === restore))
-    ? restore : (state.sessions[0] && state.sessions[0].id);
-  if (target) await selectSession(target);
-  else showWelcome();
+  // 刷新前若停在「定时任务管理」总览 → 恢复到总览(而不是跳去某个会话)
+  let wasOv = false;
+  try { wasOv = localStorage.getItem("cw_ov") === "1"; } catch (e) {}
+  if (wasOv) {
+    setSessionView("scheduled");
+    await openOverview();
+  } else {
+    // 恢复上次选中的会话(刷新后保持);失效则回退到第一条。
+    // 直接选中目标会话,**不先画欢迎页**,避免"先闪新会话页再切回"的抖动。
+    let restore = "";
+    try { restore = localStorage.getItem("cw_cur_sid") || ""; } catch (e) {}
+    const target = (restore && state.sessions.some(s => s.id === restore))
+      ? restore : (state.sessions[0] && state.sessions[0].id);
+    if (target) await selectSession(target);
+    else showWelcome();
+  }
   loadFiles();   // 非阻塞:密文文件列表后台加载,不拖慢首屏
+  refreshTaskCount();   // 「定时任务」切换条数字 = 任务总数
+  // 站内信:首刷 + 每 15s 轮询(近实时;读取即同步,天然补发停机期间的消息)
+  loadNotices();
+  setInterval(loadNotices, 15000);
   // 定时任务待批红点:首刷 + 每 30s 轮询
   refreshTasksBadge();
   setInterval(refreshTasksBadge, 30000);

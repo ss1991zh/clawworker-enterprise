@@ -47,6 +47,9 @@ llm_config_store = LLMConfigStore()
 provider_manager = ProviderManager(llm_config_store)
 call_stats = CallStatStore()
 
+from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
+admin_auth = AdminAuth()
+
 
 def _bootstrap_legacy_env_config() -> None:
     """
@@ -104,8 +107,22 @@ app.include_router(
         llm_config_store=llm_config_store,
         provider_manager=provider_manager,
         call_stats=call_stats,
+        admin_auth=admin_auth,
     )
 )
+
+
+# Admin 登录闸门:未登录访问 /admin/* 一律跳登录页(登录页 / 静态资源放行)
+@app.middleware("http")
+async def _admin_login_gate(request, call_next):
+    p = request.url.path
+    if (p == "/admin" or p.startswith("/admin/")) and not (
+        p.startswith("/admin/static") or p == "/admin/login" or p == "/admin/logout"
+    ):
+        if not admin_auth.valid(request.cookies.get(_ADMIN_COOKIE)):
+            from fastapi.responses import RedirectResponse
+            return RedirectResponse("/admin/login", status_code=303)
+    return await call_next(request)
 
 
 @app.on_event("startup")
@@ -302,7 +319,8 @@ def freechat(req: ChatRequest, sess=Depends(get_current_session)):
         prompt_tokens=pt, completion_tokens=ct,
         success=True, cost_usd=float(cost),
     )
-    return {"text": text}
+    return {"text": text,
+            "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
 
 
 @app.post("/llm/chat")
@@ -393,4 +411,5 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     )
 
     dispatcher.complete(task_id, resp.model_dump())
-    return resp.model_dump()
+    return {**resp.model_dump(),
+            "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}

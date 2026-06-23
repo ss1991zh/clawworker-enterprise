@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 · Clawworker Admin</title>
+  <link rel="stylesheet" href="/admin/static/admin.css?v={{ asset_ver('admin.css') }}">
+</head>
+<body class="login-body">
+  <div class="login-card">
+    <div class="login-brand">Clawworker <span>Enterprise · Admin</span></div>
+    {% for category, msg in messages %}
+      <div class="alert {{ category }}">{{ msg }}</div>
+    {% endfor %}
+    <form method="post" action="/admin/login">
+      <div class="field"><label>用户名</label>
+        <input type="text" name="username" value="{{ username }}" required autofocus autocomplete="username"></div>
+      <div class="field"><label>密码</label>
+        <input type="password" name="password" required autocomplete="current-password"></div>
+      <button class="btn btn-primary" type="submit" style="width:100%; margin-top:4px;">登录</button>
+    </form>
+    <p class="login-hint">初始账户 <code>admin</code> / <code>123456</code> · 登录后请到「账户」绑定邮箱并修改密码</p>
+  </div>
+</body>
+</html>

@@ -100,7 +100,7 @@
               {% endif %}
             </td>
             <td>
-              <a class="btn btn-secondary btn-sm" href="#edit-{{ c.id }}">修改</a>
+              <a class="btn btn-secondary btn-sm" href="/admin/llm/{{ c.id }}/edit">修改</a>
               <form method="post" action="/admin/llm/{{ c.id }}/toggle" style="display:inline;">
                 <button class="btn btn-secondary btn-sm" type="submit">{% if c.enabled %}禁用{% else %}启用{% endif %}</button>
               </form>
@@ -119,57 +119,6 @@
       {% endif %}
     </div>
   </div>
-
-  <!-- ============ 修改面板(每个配置一张) ============ -->
-  {% for c in configs %}
-  <div class="panel" id="edit-{{ c.id }}">
-    <div class="panel-header"><h3>修改「{{ c.name }}」</h3></div>
-    <div class="panel-body">
-      <form method="post" action="/admin/llm/{{ c.id }}/update" data-cid="{{ c.id }}" class="edit-form">
-        <div class="form-grid">
-          <div class="field">
-            <label>配置名</label>
-            <input type="text" name="name" value="{{ c.name }}">
-          </div>
-          <div class="field">
-            <label>Provider(厂商)</label>
-            <select name="provider_type" class="edit-provider">
-              {% for p in provider_options %}
-                <option value="{{ p.id }}" {% if p.id == c.provider_type %}selected{% endif %}>{{ p.label }}</option>
-              {% endfor %}
-            </select>
-          </div>
-        </div>
-        <div class="field">
-          <label>API Key(留空 = 不修改;已保存:<span class="mono">{{ c.api_key_masked }}</span>)</label>
-          <input type="password" name="api_key" class="edit-apikey" placeholder="留空保持不变,或粘贴新 key">
-        </div>
-        <div class="form-grid">
-          <div class="field">
-            <label>
-              模型名
-              <a href="#" class="edit-discover" style="font-size:11px; margin-left:8px;">用 API Key 实时拉取 →</a>
-            </label>
-            <select name="model_name" class="edit-model" data-current="{{ c.model_name }}"></select>
-            <div class="edit-discover-status" style="font-size:11px; color:var(--text-muted); margin-top:4px;"></div>
-          </div>
-          <div class="field">
-            <label>Base URL</label>
-            <input type="text" name="base_url" value="{{ c.base_url }}" class="edit-baseurl">
-          </div>
-        </div>
-        <div class="field">
-          <label>
-            <input type="checkbox" name="enabled" {% if c.enabled %}checked{% endif %} style="width:auto; margin-right:6px;">
-            启用此配置
-          </label>
-        </div>
-        <button type="submit" class="btn btn-primary">保存修改</button>
-        <a class="btn btn-secondary" href="/admin/llm">取消</a>
-      </form>
-    </div>
-  </div>
-  {% endfor %}
 
   <script>
     const META = JSON.parse(document.getElementById('provider-data').textContent);
@@ -287,26 +236,5 @@
         discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp, '');
       });
     })();
-
-    // ---- 每个修改表单初始化 ----
-    document.querySelectorAll('.edit-form').forEach(form => {
-      const providerSel = form.querySelector('.edit-provider');
-      const modelSel    = form.querySelector('.edit-model');
-      const apiKeyInp   = form.querySelector('.edit-apikey');
-      const baseUrlInp  = form.querySelector('.edit-baseurl');
-      const statusEl    = form.querySelector('.edit-discover-status');
-      const link        = form.querySelector('.edit-discover');
-      const current     = modelSel.dataset.current || '';
-      const cid         = form.dataset.cid || '';
-      // 不覆盖用户已填的 base_url
-      baseUrlInp.dataset.autofilled = '';
-      applyProvider(providerSel, modelSel, baseUrlInp, current);
-      providerSel.addEventListener('change', () => applyProvider(providerSel, modelSel, baseUrlInp, ''));
-      link.addEventListener('click', e => {
-        e.preventDefault();
-        // 编辑表单:把 config_id 也送上,后端会用已保存的 key
-        discover(providerSel, apiKeyInp, modelSel, statusEl, baseUrlInp, cid);
-      });
-    });
   </script>
 {% endblock %}

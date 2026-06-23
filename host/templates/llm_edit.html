@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}修改配置 · {{ cfg.name }} · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">修改 LLM 配置</h1>
+  <p class="page-subtitle">仅可修改「配置名」· 厂商 / 模型 / API Key / Base URL 保存后锁定(中途变更会让「概览」的调用统计口径错乱)· 需要换模型请新建一份配置</p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>配置信息</h3></div>
+    <div class="panel-body">
+      <dl>
+        <div class="dl-row"><dt>配置 ID</dt><dd class="mono">{{ cfg.id }}</dd></div>
+        <div class="dl-row"><dt>厂商</dt><dd><span class="pill muted">{{ cfg.provider_label }}</span></dd></div>
+        <div class="dl-row"><dt>模型</dt><dd class="mono">{{ cfg.model_name }}</dd></div>
+        <div class="dl-row"><dt>API Key</dt><dd class="mono">{{ cfg.api_key_masked }}</dd></div>
+        <div class="dl-row"><dt>Base URL</dt><dd class="mono">{{ cfg.base_url }}</dd></div>
+        <div class="dl-row"><dt>状态</dt>
+          <dd>
+            {% if cfg.enabled %}<span class="pill active">已启用</span>
+            {% else %}<span class="pill disabled">已禁用</span>{% endif %}
+          </dd>
+        </div>
+        <div class="dl-row"><dt>创建时间</dt><dd>{{ cfg.created_at }}</dd></div>
+      </dl>
+      <p class="alert info" style="max-width: 640px; margin-top: 12px;">
+        ℹ️ 这些参数与「概览 → LLM 调用统计」按配置 / 模型聚合的数据强绑定,保存后不可改。
+        启用 / 禁用请在列表页用对应按钮;更换模型或密钥请<strong>新建配置</strong>(旧配置的历史统计照常保留)。
+      </p>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>修改配置名</h3></div>
+    <div class="panel-body">
+      <form method="post" action="/admin/llm/{{ cfg.id }}/update">
+        <div class="field" style="max-width: 480px;">
+          <label>配置名(展示用)</label>
+          <input type="text" name="name" value="{{ cfg.name }}" required maxlength="60">
+        </div>
+        <button type="submit" class="btn btn-primary">保存</button>
+        <a class="btn btn-secondary" href="/admin/llm" style="margin-left:8px;">返回</a>
+      </form>
+    </div>
+  </div>
+{% endblock %}

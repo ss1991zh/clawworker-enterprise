@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}{{ username }} · 会话与记录 · Admin{% endblock %}
+
+{% macro clock() %}<svg class="rec-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>{% endmacro %}
+
+{% macro bubbles(sel) %}
+  {% for m in sel.messages %}
+  {% if m.role == 'event' %}
+  <div class="rec-event {{ m.event_kind }}"><span>{{ m.text }}</span></div>
+  {% else %}
+  <div class="rec-msg {{ 'user' if m.role == 'user' else 'bot' }}">
+    <div class="rec-msg__head">
+      <span class="rec-msg__who">{{ '用户' if m.role == 'user' else '助手' }}</span>
+      {% if m.role != 'user' and m.status and m.status != 'done' %}<span class="pill warning">{{ m.status }}</span>{% endif %}
+      <span class="rec-msg__time mono">{{ m.created_at[:19].replace('T',' ') }}</span>
+    </div>
+    {% if m.text %}<div class="rec-msg__text">{{ m.text }}</div>{% endif %}
+    {% if m.error %}<div class="rec-msg__text" style="color:var(--danger);">⚠ {{ m.error }}</div>{% endif %}
+    {% if m.attach_names %}<div class="rec-msg__att"><span class="rec-msg__att-l">附件</span>{% for n in m.attach_names %}<span class="pill muted">📎 {{ n }}</span>{% endfor %}</div>{% endif %}
+    {% if m.output_name %}<div class="rec-msg__att"><span class="rec-msg__att-l">输出</span><span class="pill muted">📄 {{ m.output_name }}</span></div>{% endif %}
+    {% if not m.text and not m.attach_names and not m.output_name and not m.error %}<div class="rec-msg__text" style="color:var(--text-muted);">(无文字内容)</div>{% endif %}
+    {% if m.remediation_note %}<div class="rec-remed">{{ m.remediation_note }}</div>{% endif %}
+  </div>
+  {% endif %}
+  {% endfor %}
+{% endmacro %}
+
+{% block content %}
+  <h1 class="page-title">{{ username }} · 会话与记录</h1>
+  <p class="page-subtitle">只读 · 仅文字与附件名,不含附件内容 · 此处任何操作不影响用户</p>
+
+  <div style="margin-bottom:14px;">
+    <a class="btn btn-secondary btn-sm" href="/admin/sessions">← 用户列表</a>
+    {% if show_hidden %}
+      <a class="btn btn-secondary btn-sm" href="/admin/sessions/user/{{ username }}?tab={{ tab }}" style="margin-left:6px;">只看正常记录</a>
+    {% elif hidden_n %}
+      <a class="btn btn-secondary btn-sm" href="/admin/sessions/user/{{ username }}?tab={{ tab }}&show_hidden=1" style="margin-left:6px;">查看已隐藏({{ hidden_n }})</a>
+    {% endif %}
+  </div>
+
+  {% set qs = '&show_hidden=1' if show_hidden else '' %}
+
+  <!-- 两个 tab:普通会话 / 定时任务 -->
+  <div class="rec-tabs">
+    <a class="rec-tab {% if tab != 'scheduled' %}active{% endif %}"
+       href="/admin/sessions/user/{{ username }}?tab=normal{{ qs }}">普通会话 <span class="rec-tab__n">{{ normal_n }}</span></a>
+    <a class="rec-tab {% if tab == 'scheduled' %}active{% endif %}"
+       href="/admin/sessions/user/{{ username }}?tab=scheduled{{ qs }}">定时任务 <span class="rec-tab__n">{{ tasks|length }}</span></a>
+  </div>
+
+  {% if tab == 'scheduled' %}
+  <!-- 定时任务:左 = 任务列表(与任务 1:1),右 = 任务详情 + 运行会话 -->
+  <div class="panel">
+    <div class="panel-header"><h3>任务列表({{ tasks|length }})</h3></div>
+    <div class="panel-body">
+      {% if tasks %}
+      <div class="rec-layout">
+        <div class="rec-side">
+          {% for t in tasks %}
+          <div class="rec-sess {% if sel_task and sel_task.id == t.id %}active{% endif %}">
+            <a class="rec-sess__link" href="/admin/sessions/user/{{ username }}?tab=scheduled&t={{ t.id }}{{ qs }}">
+              <span class="rec-sess__t">{{ clock() }}{{ t.name }}</span>
+              <span class="rec-sess__m">{{ t.schedule }} · {% if t.enabled %}启用{% else %}停用{% endif %}</span>
+            </a>
+            <form method="post" action="/admin/records/task/{{ t.id }}/{% if t.hidden %}unhide{% else %}hide{% endif %}">
+              <input type="hidden" name="back" value="/admin/sessions/user/{{ username }}?tab=scheduled&t={{ t.id }}{{ qs }}">
+              <button class="rec-sess__x" type="submit" title="{% if t.hidden %}恢复显示{% else %}从列表隐藏{% endif %}">{% if t.hidden %}↺{% else %}✕{% endif %}</button>
+            </form>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="rec-main">
+          {% if sel_task %}
+            <div class="rec-main__head">{{ clock() }}{{ sel_task.name }}
+              <span class="mono" style="font-size:11px; color:var(--text-muted);">· {{ sel_task.schedule }}</span></div>
+            <div class="rec-task-meta">
+              {% if sel_task.needs_approval %}<span class="pill warning">密态</span>{% else %}<span class="pill">问答</span>{% endif %}
+              {% if sel_task.enabled %}<span class="pill active">启用</span>{% else %}<span class="pill disabled">停用</span>{% endif %}
+              <span class="rec-task-meta__q">指令:{{ sel_task.question }}</span>
+            </div>
+            {% if sel and sel.messages %}
+              {{ bubbles(sel) }}
+            {% else %}
+              <div class="empty">该任务暂无运行记录(还没有运行过 / 尚未产生消息)</div>
+            {% endif %}
+          {% else %}
+            <div class="empty">选择左侧一个任务查看运行记录</div>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}<div class="empty">该用户没有定时任务</div>{% endif %}
+    </div>
+  </div>
+
+  {% else %}
+  <!-- 普通会话:左 = 会话列表,右 = 会话气泡 -->
+  <div class="panel">
+    <div class="panel-header"><h3>会话({{ normal_chats|length }})</h3></div>
+    <div class="panel-body">
+      {% if normal_chats %}
+      <div class="rec-layout">
+        <div class="rec-side">
+          {% for c in normal_chats %}
+          <div class="rec-sess {% if sel and sel.id == c.id %}active{% endif %}">
+            <a class="rec-sess__link" href="/admin/sessions/user/{{ username }}?tab=normal&s={{ c.id }}{{ qs }}">
+              <span class="rec-sess__t">{{ c.title }}</span>
+              <span class="rec-sess__m">{{ c.msg_count }} 条 · {{ c.updated_at[:10] }}</span>
+            </a>
+            <form method="post" action="/admin/records/session/{{ c.id }}/{% if c.hidden %}unhide{% else %}hide{% endif %}">
+              <input type="hidden" name="back" value="/admin/sessions/user/{{ username }}?tab=normal&s={{ c.id }}{{ qs }}">
+              <button class="rec-sess__x" type="submit" title="{% if c.hidden %}恢复显示{% else %}从列表隐藏{% endif %}">{% if c.hidden %}↺{% else %}✕{% endif %}</button>
+            </form>
+          </div>
+          {% endfor %}
+        </div>
+        <div class="rec-main">
+          {% if sel %}
+            <div class="rec-main__head">{{ sel.title }}
+              <span class="mono" style="font-size:11px; color:var(--text-muted);">· {{ sel.messages|length }} 条</span></div>
+            {% if sel.messages %}{{ bubbles(sel) }}{% else %}<div class="empty">该会话还没有消息</div>{% endif %}
+          {% else %}
+            <div class="empty">选择左侧一个会话查看</div>
+          {% endif %}
+        </div>
+      </div>
+      {% else %}<div class="empty">该用户没有普通会话</div>{% endif %}
+    </div>
+  </div>
+  {% endif %}
+{% endblock %}

@@ -42,6 +42,7 @@ from client.tools.crypto import ZFHE
 from client.webui import pipeline as pipeline_mod
 from client.webui import text_extract
 from client.webui import writer as writer_mod
+from client.webui.notices import NoticeStore
 from client.webui.sessions import ChatSession, Message, SessionStore
 from client.webui.scheduler import (
     EncryptedResultStore,
@@ -113,6 +114,7 @@ _pending_store = PendingStore()
 _run_history = HistoryStore()
 _enc_results = EncryptedResultStore()
 _missed_store = MissedRunStore()
+_notice_store = NoticeStore()
 
 # 启动时登记所有已存在任务的输出文件夹根 → Excel 白名单(每任务专属输出夹)
 for _t in _task_store.all_enabled():
@@ -272,6 +274,64 @@ async def api_config_set(request: Request):
             _config["backend"] = data["backend"]
         _save_config(_config)
     return _config
+
+
+# ----------------------------------------------------------------------------
+# 客户端自启 / 崩溃自愈(设置 · 自启)—— 仅管本机的 client(:8444),独立于 host 守护
+# ----------------------------------------------------------------------------
+
+@app.get("/api/ops/status")
+def api_ops_status():
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui import client_ops
+    try:
+        return client_ops.status_snapshot()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+
+
+@app.post("/api/ops/autostart/enable")
+def api_ops_autostart_enable():
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui import client_ops
+    try:
+        msg = client_ops.install_autostart()
+        client_ops.ensure_supervisor_running()
+        return {"ok": True, "msg": msg}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"启用失败:{e}")
+
+
+@app.post("/api/ops/autostart/disable")
+def api_ops_autostart_disable():
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui import client_ops
+    try:
+        msg = client_ops.uninstall_autostart()
+        client_ops.stop_supervisor()   # 停守护但保留客户端进程(界面不掉线)
+        return {"ok": True, "msg": msg}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"停用失败:{e}")
+
+
+@app.post("/api/ops/supervisor/start")
+def api_ops_supervisor_start():
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui import client_ops
+    started = client_ops.ensure_supervisor_running()
+    return {"ok": True, "msg": "守护已启动" if started else "守护已在运行"}
+
+
+@app.post("/api/ops/supervisor/stop")
+def api_ops_supervisor_stop():
+    if not _is_logged_in():
+        return _need_login()
+    from client.webui import client_ops
+    return {"ok": True, "msg": client_ops.stop_supervisor()}
 
 
 @app.get("/api/keys")
@@ -874,6 +934,8 @@ def api_sessions_list():
         return _need_login()
     out = []
     for s in _sessions.list_for(_session_state["username"]):
+        if getattr(s, "hidden", False):
+            continue   # 软隐藏的定时任务会话不在侧栏列出(数据仍在,「查看会话」可恢复)
         tid = getattr(s, "task_id", "")
         # 定时会话:带上其任务是否"有数据绑定"(决定是否显示「待解密文件」入口)+ 漏跑条数(侧栏红警示)
         task_needs_data = False
@@ -914,9 +976,14 @@ async def api_sessions_create():
 def api_sessions_delete(sid: str):
     if not _is_logged_in():
         return _need_login()
-    _sess_for_user(sid)
+    sess = _sess_for_user(sid)
+    # 定时任务会话:软隐藏(任务还在跑,历次运行继续累积)——「查看会话」可恢复全部内容。
+    # 普通会话:照常彻底删除。
+    if getattr(sess, "kind", "normal") == "scheduled" and getattr(sess, "task_id", ""):
+        _sessions.set_hidden(sid, True)
+        return {"ok": True, "hidden": True}
     _sessions.delete(sid)
-    return {"ok": True}
+    return {"ok": True, "hidden": False}
 
 
 @app.post("/api/sessions/{sid}/title")
@@ -1165,7 +1232,10 @@ def _run_pipeline(
     if (output_mode == "interactive"
             and sess is not None and getattr(sess, "kind", "normal") != "scheduled"
             and not skip_intent):
-        amb = pipeline_mod.detect_intent_ambiguity(user_query, has_attachment=bool(cipher_path))
+        # 歧义只看**本条消息**是否带了附件(沿用的旧密文不算)——否则做过分析的会话里
+        # 再说排程会被误判成"定时 vs 只算这个附件",把创建向导卡挡掉。
+        this_msg_attached = bool(attached_cipher and Path(attached_cipher).exists())
+        amb = pipeline_mod.detect_intent_ambiguity(user_query, has_attachment=this_msg_attached)
         if amb:
             _sessions.update_message(
                 sid, asst_mid, status="done",
@@ -1323,6 +1393,7 @@ def _run_pipeline(
             skill_calls=result.get("skill_calls", []),
             used_cipher=used_cipher,
             duration_sec=round(time.time() - t0, 2),
+            tokens=int(result.get("tokens", 0) or 0),
         )
         return
 
@@ -1341,6 +1412,7 @@ def _run_pipeline(
         skill_calls=result.get("skill_calls", []),
         used_cipher=used_cipher,
         duration_sec=round(time.time() - t0, 2),
+        tokens=int(result.get("tokens", 0) or 0),
     )
 
 
@@ -1364,8 +1436,9 @@ def _ensure_task_session(task) -> str:
 def _launch_run(*, username: str, task_name: str, question: str,
                 cipher_path: str, session_id: str,
                 output_mode: str = "interactive", sched_task=None,
-                web_search: bool = False) -> None:
-    """把一次运行注入聊天会话并跑 pipeline。output_mode=encrypted_sandbox 时密态结果加密暂存。"""
+                web_search: bool = False, note: str = "") -> None:
+    """把一次运行注入聊天会话并跑 pipeline。output_mode=encrypted_sandbox 时密态结果加密暂存。
+    note 非空(漏跑补救)→ 附在该轮助手消息执行时间下方,与这轮对话同属一个整体。"""
     sess = _sessions.get(session_id)
     if not sess:
         return
@@ -1379,7 +1452,8 @@ def _launch_run(*, username: str, task_name: str, question: str,
     user_msg = Message(id=secrets.token_hex(6), role="user",
                        content=question, attached_cipher=cipher_path or "")
     _sessions.append_message(session_id, user_msg)
-    asst = Message(id=secrets.token_hex(6), role="assistant", status="pending")
+    asst = Message(id=secrets.token_hex(6), role="assistant", status="pending",
+                   remediation_note=note or "")
     _sessions.append_message(session_id, asst)
     threading.Thread(
         target=_run_pipeline,
@@ -1466,16 +1540,40 @@ def _date_adjust_question(question: str, due_at: str) -> str:
     return q
 
 
-def _record_missed(task, due_at: str, reason: str) -> None:
-    """记一条漏跑预警(去重:同任务同到点窗口只记一条 pending)。"""
+def _fmt_due(due_at: str) -> str:
+    return (due_at or "")[:16].replace("T", " ") or "—"
+
+
+def _append_event(session_id: str, kind: str, text: str) -> None:
+    """把一条系统事件(漏跑 / 忽略 / 补救)写进任务会话,留痕、可在会话里查看。"""
+    if not session_id:
+        return
     try:
-        _missed_store.add_deduped(
+        _sessions.append_message(session_id, Message(
+            id=secrets.token_hex(6), role="event", event_kind=kind,
+            content=text, status="done"))
+    except Exception:
+        pass
+
+
+def _record_missed(task, due_at: str, reason: str) -> None:
+    """记一条漏跑预警(去重:同任务同到点窗口只记一条 pending),并把漏跑事件写进任务会话。"""
+    m = None
+    try:
+        m = _missed_store.add_deduped(
             username=task.username, task_id=task.id, task_name=task.name,
             question=task.question, due_at=due_at or "", reason=reason,
             needs_data=bool(task.needs_approval),
         )
     except Exception:
-        pass
+        m = None
+    if m is not None:   # 新漏跑(非重复)→ 写入任务会话
+        try:
+            sid = _ensure_task_session(task)
+            _append_event(sid, "missed",
+                          f"⚠ 漏跑:本应于 {_fmt_due(due_at)} 执行的任务未运行 —— {reason}")
+        except Exception:
+            pass
 
 
 def _on_scheduler_miss(task, due_dt) -> None:
@@ -1680,9 +1778,114 @@ def api_tasks_delete(tid: str):
     t = _task_store.get(tid)
     if not t or t.username != _session_state["username"]:
         raise HTTPException(404, "任务不存在")
+    sid = getattr(t, "session_id", "") or ""
     _task_store.delete(tid)
     pipeline_mod._codegen_cache_delete(f"task_{tid}")  # 任务删了,固化代码缓存一并清
-    return {"ok": True}
+    # 关联记录一并清:待批 / 密态结果 / 漏跑 / 运行历史 + 该任务的聊天会话
+    _pending_store.delete_for_task(tid)
+    _enc_results.delete_for_task(tid)
+    _missed_store.delete_for_task(tid)
+    _run_history.delete_for_task(tid)
+    if sid and _sessions.get(sid):
+        _sessions.delete(sid)
+    return {"ok": True, "session_id": sid}
+
+
+@app.post("/api/scheduled_tasks/{tid}/session")
+def api_task_session(tid: str):
+    """「查看会话」:确保该任务有一个聊天会话(历次运行累积在此),返回 session_id。
+    会话历史持久化在沙盒,关闭/切走都不清除,删除任务时才一并清理。"""
+    if not _is_logged_in():
+        return _need_login()
+    t = _task_store.get(tid)
+    if not t or t.username != _session_state["username"]:
+        raise HTTPException(404, "任务不存在")
+    sid = _ensure_task_session(t)
+    _sessions.set_hidden(sid, False)   # 若之前被软隐藏,重新显示并带回全部已运行内容
+    return {"session_id": sid}
+
+
+# ----------------------------------------------------------------------------
+# 站内信(只读通知 + 留痕)—— 从既有 store 派生,读取时同步(天然补发停机期间的消息)
+# ----------------------------------------------------------------------------
+
+def _fmt_dt(iso: str) -> str:
+    """ISO 时间 → 'YYYY-MM-DD HH:MM'(给人看);解析不了就原样返回。"""
+    s = (iso or "").replace("T", " ")
+    return s[:16] if len(s) >= 16 else (s or "—")
+
+
+def _sync_notices(username: str) -> None:
+    """把底层持久记录(漏跑 / 待解密 / 会话执行失败)同步成站内信。
+    幂等:同一来源事件只生成一条(去重 key);服务中断期间的事件,恢复后首次同步即补出。"""
+    seen = _notice_store.seen_keys(username)
+
+    # 1) 漏跑(未处理)→ warning
+    for m in _missed_store.list_pending(username):
+        key = f"missed:{m.id}"
+        if key in seen:
+            continue
+        how = "需先选择该轮数据文件再补跑" if getattr(m, "needs_data", False) else "可直接补跑"
+        _notice_store.add(
+            username=username, key=key, level="warning",
+            title=f"定时任务漏跑 · {m.task_name}",
+            summary=(f"任务「{m.task_name}」原定 {_fmt_dt(m.due_at)} 执行,但未跑成:{m.reason}。"
+                     f"该任务{how} —— 到「定时任务管理 → 漏跑」处理。"),
+            created_at=m.due_at or m.created_at)
+
+    # 2) 待解密就绪(按任务聚合,一个任务一条)→ info
+    for a in _enc_results.aggregate_by_task(username):
+        key = f"enc:{a['task_id']}"
+        if key in seen:
+            continue
+        _notice_store.add(
+            username=username, key=key, level="info",
+            title=f"密态结果待解密 · {a['task_name']}",
+            summary=(f"任务「{a['task_name']}」已有 {a['count']} 份密态结果加密暂存,"
+                     f"最近一次 {_fmt_dt(a.get('latest_run', ''))}。"
+                     f"授权后可批量解密为明文 Excel —— 到「定时任务管理 → 待解密文件」处理。"),
+            created_at=a.get("latest_run", "") or _now_iso())
+
+    # 3) 定时任务执行失败(含主进程重启被中断的运行)→ critical
+    for sess in _sessions.list_for(username):
+        if getattr(sess, "kind", "normal") != "scheduled":
+            continue
+        tname = (sess.title or "").replace("⏰ ", "").strip() or "定时任务"
+        for msg in sess.messages:
+            if msg.role != "assistant" or msg.status != "failed":
+                continue
+            key = f"runfail:{msg.id}"
+            if key in seen:
+                continue
+            err = (msg.error or "未知错误").strip().replace("\n", " ")
+            _notice_store.add(
+                username=username, key=key, level="critical",
+                title=f"定时任务执行失败 · {tname}",
+                summary=(f"任务「{tname}」于 {_fmt_dt(msg.created_at)} 执行失败:{err[:240]}。"
+                         f"可到该任务会话查看详情,或在「定时任务管理」里检查配置后重试。"),
+                created_at=msg.created_at)
+
+
+@app.get("/api/notices")
+def api_notices():
+    if not _is_logged_in():
+        return _need_login()
+    u = _session_state["username"]
+    _sync_notices(u)   # 读取即同步:实时(前端轮询)+ 补发(停机期间的事件)
+    return {
+        "items": [n.to_dict() for n in _notice_store.list_for(u)],
+        "unread": _notice_store.unread_count(u),
+    }
+
+
+@app.post("/api/notices/read")
+def api_notices_read():
+    """打开站内信即全部标记已读 → 小红点消失。"""
+    if not _is_logged_in():
+        return _need_login()
+    u = _session_state["username"]
+    _notice_store.mark_all_read(u)
+    return {"ok": True, "unread": 0}
 
 
 @app.post("/api/scheduled_tasks/{tid}/run_now")
@@ -1724,6 +1927,10 @@ def api_missed_dismiss(mid: str):
     if not m or m.username != _session_state["username"]:
         raise HTTPException(404, "预警不存在")
     _missed_store.set_status(mid, "dismissed")
+    task = _task_store.get(m.task_id)
+    if task is not None:
+        _append_event(_ensure_task_session(task), "dismissed",
+                      f"⊘ 已忽略漏跑:{_fmt_due(m.due_at)} 那轮不再补跑。")
     return {"ok": True}
 
 
@@ -1758,6 +1965,8 @@ async def api_missed_remediate(mid: str, request: Request):
 
     # 注入会话并跑(数据任务 → encrypted_sandbox 累积待解密;自由问答 → 直接跑)。
     # 补跑时把问题里的相对日期(今日/今天…)锚定到漏跑当天,避免实时问题跑成今天的。
+    # 补救说明作为该轮助手消息的一部分(执行时间下方),与这轮对话同属一个整体。
+    note = f"✓ 手动补救:对 {_fmt_due(m.due_at)} 那轮重新执行。"
     if task is not None:
         sid = _ensure_task_session(task)
         output_mode = "encrypted_sandbox" if m.needs_data else "interactive"
@@ -1765,15 +1974,15 @@ async def api_missed_remediate(mid: str, request: Request):
         _launch_run(username=m.username, task_name=task.name, question=q,
                     cipher_path=cipher_path, session_id=sid,
                     output_mode=output_mode, sched_task=task if m.needs_data else None,
-                    web_search=bool(getattr(task, "web_search", False)))
+                    web_search=bool(getattr(task, "web_search", False)), note=note)
     else:
         # 任务已删:用预警里存的问题在一个补救会话里跑
         sess = _sessions.create(username=m.username, title=f"⏰ 补救 · {m.task_name}",
                                 kind="scheduled")
+        sid = sess.id
         _launch_run(username=m.username, task_name=m.task_name,
                     question=_date_adjust_question(m.question, m.due_at),
-                    cipher_path=cipher_path, session_id=sess.id)
-        sid = sess.id
+                    cipher_path=cipher_path, session_id=sid, note=note)
 
     _missed_store.set_status(mid, "resolved")
     _run_history.add(

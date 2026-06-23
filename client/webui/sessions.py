@@ -22,8 +22,10 @@ SESSIONS_DIR = Path.home() / ".agent-system" / "sessions"
 @dataclass
 class Message:
     id: str
-    role: str                                 # user / assistant
+    role: str                                 # user / assistant / event(系统事件:漏跑/忽略/补救)
     content: str = ""
+    # event-only:事件类型 missed(漏跑) / dismissed(已忽略) / remediated(已补救),决定展示样式
+    event_kind: str = ""
     # user-only:用户在这条消息附带的密文文件(可为空,自动沿用上一条 user 消息的)
     attached_cipher: str = ""
     # user-only:本条消息附带的明文文本附件名(供前端 chip 展示;内容不持久化)
@@ -44,6 +46,8 @@ class Message:
     clarify: dict[str, Any] = field(default_factory=dict)  # 非空=意图有歧义,需用户先选择(question + options)
     status: str = "done"                       # pending / running / done / failed / needs_cipher
     duration_sec: float = 0.0
+    tokens: int = 0                            # 本轮所有 LLM 调用的 token 用量合计
+    remediation_note: str = ""                 # assistant-only:本轮是漏跑补救时,附在执行时间下方的说明
     used_cipher: str = ""                      # assistant 实际用了哪份 cipher
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
@@ -56,6 +60,7 @@ class Message:
             id=d.get("id", secrets.token_hex(6)),
             role=d.get("role", "user"),
             content=d.get("content", ""),
+            event_kind=d.get("event_kind", ""),
             attached_cipher=d.get("attached_cipher", "") or d.get("attached_cipher_path", ""),
             text_attachment_names=list(d.get("text_attachment_names", []) or []),
             summary=d.get("summary", ""),
@@ -73,6 +78,8 @@ class Message:
             clarify=dict(d.get("clarify", {}) or {}),
             status=d.get("status", "done"),
             duration_sec=float(d.get("duration_sec", 0.0) or 0.0),
+            tokens=int(d.get("tokens", 0) or 0),
+            remediation_note=d.get("remediation_note", ""),
             used_cipher=d.get("used_cipher", ""),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
         )
@@ -85,6 +92,9 @@ class ChatSession:
     username: str
     kind: str = "normal"            # normal=普通会话 / scheduled=定时任务专用会话
     task_id: str = ""               # kind=scheduled 时关联的任务 id(供分组/跳转)
+    # 定时任务会话从侧栏"删除"=软隐藏(不毁数据):任务仍在跑、历次运行继续累积,
+    # 「查看会话」会重新取消隐藏并展示全部已运行内容。删除任务时才真正清除。
+    hidden: bool = False
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     updated_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
     messages: list[Message] = field(default_factory=list)
@@ -102,6 +112,7 @@ class ChatSession:
             username=d.get("username", ""),
             kind=d.get("kind", "normal") or "normal",
             task_id=d.get("task_id", "") or "",
+            hidden=bool(d.get("hidden", False)),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
             updated_at=d.get("updated_at", datetime.now().isoformat(timespec="seconds")),
         )
@@ -114,6 +125,36 @@ class ChatSession:
             if m.role == "user" and m.attached_cipher:
                 return m.attached_cipher
         return ""
+
+
+def _fold_remediation_events(sess: "ChatSession") -> bool:
+    """一次性迁移:把旧版独立的「补救」事件消息(role=event, event_kind=remediated)
+    折叠成所属那一轮 assistant 消息的 remediation_note,并删除该独立事件。
+    幂等:无独立补救事件时返回 False。漏跑(missed)/忽略(dismissed)事件保持不变。"""
+    msgs = sess.messages
+    drop: set[int] = set()
+    for i, m in enumerate(msgs):
+        if getattr(m, "role", "") != "event" or getattr(m, "event_kind", "") != "remediated":
+            continue
+        target = None
+        # 旧顺序 [补救事件][user][assistant] → 取后面最近的 assistant
+        for j in range(i + 1, min(i + 3, len(msgs))):
+            if msgs[j].role == "assistant":
+                target = msgs[j]
+                break
+        # 兼容 [user][assistant][补救事件] → 取前面最近的 assistant
+        if target is None:
+            for j in range(i - 1, max(i - 3, -1), -1):
+                if msgs[j].role == "assistant":
+                    target = msgs[j]
+                    break
+        if target is not None and not getattr(target, "remediation_note", ""):
+            target.remediation_note = m.content
+        drop.add(i)
+    if not drop:
+        return False
+    sess.messages = [m for k, m in enumerate(msgs) if k not in drop]
+    return True
 
 
 class SessionStore:
@@ -135,7 +176,10 @@ class SessionStore:
                     if m.role == "assistant" and m.status in ("pending", "running"):
                         m.status = "failed"
                         m.error = "主进程重启,任务中断"
+                changed = _fold_remediation_events(sess)   # 旧版独立"补救"事件 → 折进所属轮
                 self._sessions[sess.id] = sess
+                if changed:
+                    self._save(sess)
             except Exception:
                 continue
 
@@ -177,6 +221,16 @@ class SessionStore:
                 self._path(sid).unlink(missing_ok=True)
             except Exception:
                 pass
+            return True
+
+    def set_hidden(self, sid: str, hidden: bool) -> bool:
+        """软隐藏/恢复(定时任务会话从侧栏移除但保留全部数据)。"""
+        sess = self._sessions.get(sid)
+        if not sess:
+            return False
+        with self._lock:
+            sess.hidden = bool(hidden)
+            self._save(sess)
             return True
 
     def append_message(self, sid: str, message: Message) -> None:

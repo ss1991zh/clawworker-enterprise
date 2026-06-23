@@ -47,6 +47,31 @@ StepCallback = Callable[[str, str], None]  # (kind, label)
 ShouldCancel = Callable[[], bool]
 
 
+# —— 本次运行的 token 用量累计(线程本地;ask() 入口重置、出口汇总到 result["tokens"])——
+# host 在 /llm/chat、/llm/freechat 响应里回带 usage;每个 LLM 助手把它累加进来。
+_usage_tls = threading.local()
+
+
+def _usage_reset() -> None:
+    _usage_tls.total = 0
+
+
+def _usage_add(u: Any) -> None:
+    if not isinstance(u, dict):
+        return
+    try:
+        n = u.get("total_tokens")
+        if n is None:
+            n = int(u.get("prompt_tokens", 0) or 0) + int(u.get("completion_tokens", 0) or 0)
+        _usage_tls.total = int(getattr(_usage_tls, "total", 0) or 0) + int(n or 0)
+    except (TypeError, ValueError):
+        pass
+
+
+def _usage_total() -> int:
+    return int(getattr(_usage_tls, "total", 0) or 0)
+
+
 class CancelledError(Exception):
     """pipeline.ask 被用户取消时抛。"""
 
@@ -378,6 +403,7 @@ def call_llm_for_freechat(
         raise PermissionError("登录已过期")
     r.raise_for_status()
     body = r.json()
+    _usage_add(body.get("usage"))
     return body.get("text", "") or "(LLM 返回空文本)"
 
 
@@ -425,6 +451,7 @@ def call_llm_for_plan_repair(
         raise PermissionError("登录已过期")
     r.raise_for_status()
     body = r.json()
+    _usage_add(body.get("usage"))
     if "computation_plan" in body and "summary" in body:
         plan = ComputationPlan.model_validate(body["computation_plan"])
         return plan, body["summary"]
@@ -451,6 +478,7 @@ def call_llm_for_codegen(
         raise PermissionError("登录已过期")
     r.raise_for_status()
     body = r.json()
+    _usage_add(body.get("usage"))
     return body.get("text", "") or ""
 
 
@@ -481,6 +509,7 @@ def call_llm_for_plan(
         raise PermissionError("登录已过期")
     r.raise_for_status()
     body = r.json()
+    _usage_add(body.get("usage"))
     # 老 /llm/chat 已经返回 parse 过的 {computation_plan, summary},但我们 parse_llm_text
     # 在 host 端可能拒掉新格式;直接再 parse 一次也能兼容
     if "computation_plan" in body and "summary" in body:
@@ -975,7 +1004,16 @@ def _run_codegen_path(
     return _build_done_files(decision, results, cipher_path, excel_stem, ["codegen"], clean, log)
 
 
-def ask(
+def ask(**kwargs) -> dict:
+    """外层入口:重置本次 token 累计,跑完后把总用量注入 result["tokens"]。"""
+    _usage_reset()
+    result = _ask_impl(**kwargs)
+    if isinstance(result, dict):
+        result.setdefault("tokens", _usage_total())
+    return result
+
+
+def _ask_impl(
     *,
     user_query: str,
     cipher_path: Optional[Path],

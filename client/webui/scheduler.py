@@ -402,6 +402,15 @@ class PendingStore(_JsonStore):
         return sum(1 for p in self._items.values()
                    if p.username == username and p.status == "pending")
 
+    def delete_for_task(self, task_id: str) -> int:
+        with self._lock:
+            ids = [i for i, p in self._items.items() if p.task_id == task_id]
+            for i in ids:
+                self._items.pop(i, None)
+            if ids:
+                self._flush()
+            return len(ids)
+
 
 class HistoryStore(_JsonStore):
     def __init__(self, path: Optional[Path] = None):
@@ -427,6 +436,15 @@ class HistoryStore(_JsonStore):
         out = [r for r in self._items if r.username == username]
         out.sort(key=lambda r: r.ran_at, reverse=True)
         return out[:limit]
+
+    def delete_for_task(self, task_id: str) -> int:
+        with self._lock:
+            before = len(self._items)
+            self._items = [r for r in self._items if r.task_id != task_id]
+            removed = before - len(self._items)
+            if removed:
+                self._write([x.to_dict() for x in self._items])
+            return removed
 
 
 class EncryptedResultStore(_JsonStore):
@@ -487,6 +505,15 @@ class EncryptedResultStore(_JsonStore):
                 if i in self._items:
                     self._items[i].status = "decrypted"
             self._flush()
+
+    def delete_for_task(self, task_id: str) -> int:
+        with self._lock:
+            ids = [i for i, r in self._items.items() if r.task_id == task_id]
+            for i in ids:
+                self._items.pop(i, None)
+            if ids:
+                self._flush()
+            return len(ids)
 
 
 @dataclass
@@ -561,6 +588,15 @@ class MissedRunStore(_JsonStore):
     def count_pending(self, username: str) -> int:
         return sum(1 for m in self._items.values()
                    if m.username == username and m.status == "pending")
+
+    def delete_for_task(self, task_id: str) -> int:
+        with self._lock:
+            ids = [i for i, m in self._items.items() if m.task_id == task_id]
+            for i in ids:
+                self._items.pop(i, None)
+            if ids:
+                self._flush()
+            return len(ids)
 
 
 # ---------------------------------------------------------------------------

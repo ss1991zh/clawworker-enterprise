@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}管理员 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">管理员</h1>
+  <p class="page-subtitle">修改登录密码前需先绑定邮箱;每次改密都要通过邮箱验证码验证</p>
+
+  <div class="panel">
+    <div class="panel-header"><h3>管理员信息</h3></div>
+    <div class="panel-body">
+      <dl>
+        <div class="dl-row"><dt>用户名</dt><dd>{{ username }}</dd></div>
+        <div class="dl-row"><dt>绑定邮箱</dt>
+          <dd>{% if email %}{{ email }}{% else %}<span class="pill warning">未绑定</span>{% endif %}</dd></div>
+      </dl>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>{% if email %}更换{% else %}绑定{% endif %}邮箱</h3></div>
+    <div class="panel-body">
+      <form method="post" action="/admin/account/email">
+        <div class="field" style="max-width:420px;"><label>邮箱地址</label>
+          <input type="email" name="email" value="{{ email }}" required placeholder="you@example.com"></div>
+        <button class="btn btn-primary" type="submit">保存邮箱</button>
+      </form>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>修改登录密码</h3></div>
+    <div class="panel-body">
+      {% if not email %}
+        <div class="alert info">请先在上方绑定邮箱,再修改密码。</div>
+      {% else %}
+        <form method="post" action="/admin/account/send_code" style="margin-bottom:18px;">
+          <button class="btn btn-secondary" type="submit">① 发送验证码到 {{ email }}</button>
+        </form>
+        <form method="post" action="/admin/account/password">
+          <div class="field" style="max-width:280px;"><label>② 邮箱验证码</label>
+            <input type="text" name="code" required inputmode="numeric" autocomplete="one-time-code"></div>
+          <div class="field" style="max-width:280px;"><label>新密码(至少 6 位)</label>
+            <input type="password" name="new_password" required minlength="6"></div>
+          <div class="field" style="max-width:280px;"><label>确认新密码</label>
+            <input type="password" name="confirm" required minlength="6"></div>
+          <button class="btn btn-primary" type="submit">③ 确认修改</button>
+        </form>
+        <p style="font-size:12px; color:var(--text-muted); margin-top:10px;">改密成功后当前登录态会失效,需用新密码重新登录。</p>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>邮件发送设置(用于发验证码)</h3></div>
+    <div class="panel-body">
+      <p style="font-size:12px; color:var(--text-muted); margin:0 0 14px;">
+        选你的邮箱服务商,填邮箱和「授权码」就行,服务器参数会自动配好。
+        没设置时,验证码会临时记录到服务端日志(仅本机自测用)。
+      </p>
+      <form method="post" action="/admin/account/smtp">
+        <div class="field" style="max-width:420px;"><label>① 邮箱服务商</label>
+          <select name="provider" id="smtp-provider">
+            {% for k, p in presets.items() %}
+            <option value="{{ k }}" {% if (smtp.provider or 'qq') == k %}selected{% endif %}>{{ p.label }}</option>
+            {% endfor %}
+          </select>
+        </div>
+        <div class="field" style="max-width:420px;"><label>② 发件邮箱</label>
+          <input type="email" name="email" value="{{ smtp.from or email or '' }}" placeholder="例如 you@qq.com"></div>
+        <div class="field" style="max-width:420px;"><label>③ 授权码 / 密码</label>
+          <input type="password" name="auth_code" placeholder="{% if smtp.password %}留空 = 不修改{% else %}粘贴邮箱授权码{% endif %}">
+          <div class="smtp-hint" id="smtp-hint"></div>
+        </div>
+        <!-- 仅「其他」需要手动填服务器 -->
+        <div id="smtp-custom" style="display:none;">
+          <div class="form-grid">
+            <div class="field"><label>SMTP 服务器</label>
+              <input type="text" name="host" value="{{ smtp.host or '' }}" placeholder="smtp.example.com"></div>
+            <div class="field"><label>端口</label>
+              <input type="text" name="port" value="{{ smtp.port or 587 }}"></div>
+          </div>
+          <div class="field"><label><input type="checkbox" name="use_ssl_custom" {% if smtp.use_ssl %}checked{% endif %} style="width:auto; margin-right:6px;">SSL(端口 465 常用)</label></div>
+          <div class="field"><label><input type="checkbox" name="use_tls_custom" {% if smtp.use_tls %}checked{% endif %} style="width:auto; margin-right:6px;">STARTTLS(端口 587 常用)</label></div>
+        </div>
+        <button class="btn btn-primary" type="submit">保存邮件设置</button>
+      </form>
+    </div>
+  </div>
+
+  <script>
+    (function () {
+      var HINTS = {{ hints_json|safe }};
+      var sel = document.getElementById('smtp-provider');
+      var hint = document.getElementById('smtp-hint');
+      var custom = document.getElementById('smtp-custom');
+      function upd() {
+        hint.textContent = HINTS[sel.value] || '';
+        custom.style.display = (sel.value === 'custom') ? 'block' : 'none';
+      }
+      sel.addEventListener('change', upd);
+      upd();
+    })();
+  </script>
+{% endblock %}
