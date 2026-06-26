@@ -515,9 +515,11 @@ function renderMessage(m) {
       content += `<details class="trace"${detailsOpen}>`;
       content += `<summary class="trace-summary">${stateLabel}</summary>`;
       content += `<div class="trace-steps">`;
-      steps.forEach(s => {
+      steps.forEach((s, i) => {
         const cls = s.kind || "step";
-        content += `<div class="step ${cls}">${esc(s.label)}</div>`;
+        // running 时,最后一步是"当前正在跑"的阶段 → 加 active 脉冲,告诉用户卡在哪一步
+        const act = (running && i === steps.length - 1) ? " active" : "";
+        content += `<div class="step ${cls}${act}">${esc(s.label)}</div>`;
       });
       content += `</div></details>`;
     }
@@ -835,6 +837,9 @@ function pollMessage(sid, mid) {
         const div = document.createElement("div");
         div.className = `step ${s.kind || "step"}`;
         div.textContent = s.label;
+        // 新亮出的这步成为"当前活跃步"(脉冲),清掉上一步的活跃态
+        box.querySelectorAll(".step.active").forEach(e => e.classList.remove("active"));
+        div.classList.add("active");
         box.appendChild(div);
         if (wasNearBottom) $("main").scrollTop = $("main").scrollHeight;
         if (box.children.length < latestSteps.length) drain();
@@ -3026,14 +3031,14 @@ async function renderAuditTab() {
     </div></div>
     <h3 class="keys-h3">最近事件</h3>
     <div>${events.length ? events.map(renderAuditEvent).join("") : '<div class="af-s">暂无记录。</div>'}</div>
-    <div style="margin-top:12px;"><button class="btn-primary" id="auditExportBtn">导出合规报告(JSON)</button></div>
+    <div style="margin-top:12px;"><button class="btn-primary" id="auditExportBtn">导出合规报告(Word)</button></div>
   `;
   $("auditExportBtn").addEventListener("click", () => {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    // 服务端生成带排版、大白话的 .docx;用隐藏 <a> 触发下载(带登录 cookie)
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(blob);
-    a.download = "compliance_audit.json"; a.click();
-    URL.revokeObjectURL(a.href);
+    a.href = "/api/audit/export";
+    a.download = "";
+    document.body.appendChild(a); a.click(); a.remove();
   });
 }
 

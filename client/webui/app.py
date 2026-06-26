@@ -444,6 +444,26 @@ def api_audit(limit: int = 200):
     return {"summary": audit.summary(user), "events": audit.read_events(user, limit=limit)}
 
 
+@app.get("/api/audit/export")
+def api_audit_export():
+    """导出合规报告(Word/.docx,大白话排版,非技术人员可读)。"""
+    if not _is_logged_in():
+        return _need_login()
+    from fastapi.responses import Response
+    from client.he_ops import audit_report
+    user = _session_state["username"]
+    try:
+        data = audit_report.build_docx(user)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"生成报告失败:{type(e).__name__}: {e}")
+    fname = f"数据隐私合规报告_{datetime.now().strftime('%Y%m%d')}.docx"
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"},
+    )
+
+
 # ----------------------------------------------------------------------------
 # /api/files
 # ----------------------------------------------------------------------------
