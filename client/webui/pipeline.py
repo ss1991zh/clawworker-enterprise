@@ -749,6 +749,19 @@ def _build_done_files(decision, results, cipher_path, excel_stem, skill_calls, c
     }
 
 
+_COMPOUND_MARKERS = ("、", "和", "并", "再", "同时", "然后", "以及", "+", "加上",
+                     "分别", "各", "排名", "top", "标记", "预警", "异常",
+                     "占比", "同比", "环比", "分类", "分群", "分箱")
+
+
+def _looks_compound(q: str) -> bool:
+    """粗判"复合分析问题"(多指标/多步骤),只对这类先做规划护栏,避免给简单问题平添一次 LLM 调用。"""
+    q = (q or "").lower()
+    if len(q) < 12:
+        return False
+    return sum(1 for m in _COMPOUND_MARKERS if m in q) >= 2
+
+
 def _run_codegen_path(
     *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
     host_url, token, history, custom_block, excel_stem,
@@ -809,6 +822,27 @@ def _run_codegen_path(
             )
         if lazy_feedback:
             gen_query = f"{gen_query}\n\n{lazy_feedback}"
+        # 2.5) 复合问题:先出"步骤计划",用能力表校验(挡禁用算子/标授权解密),作为 codegen 脚手架。
+        #      架构上仍由单代码块执行;计划只当护栏+提示,gated 到复合问题、全程围栏、失败即跳过。
+        if _looks_compound(effective_query):
+            try:
+                from client.he_ops import planner as _planner
+                _ps, _pu = _planner.build_plan_messages(effective_query, schema)
+                _plan = _planner.parse_plan(
+                    call_llm_for_codegen(host_url, token, _ps, _pu,
+                                         history=history, should_cancel=chk, web_search=False))
+                if _plan.steps:
+                    _v = _planner.validate_plan(_plan)
+                    log("think", f"已规划 {len(_plan.steps)} 步"
+                        + (f" · 需授权解密步骤:{', '.join(_v.auth_steps)}" if _v.auth_steps else ""))
+                    _fix = ("\n⚠ 修正:" + "; ".join(_v.errors)) if _v.errors else ""
+                    gen_query = (gen_query +
+                                 "\n\n参考下面已按算子能力校验过的步骤计划实现(用可靠算子,避开禁用的):\n"
+                                 + _planner.plan_steps_text(_plan) + _fix)
+            except CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 —— 规划失败绝不拖垮主流程
+                log("think", f"规划跳过({type(e).__name__})")
         system, user = codegen_mod.build_codegen_messages(
             skill_docs, schema, metadata_columns, gen_query, custom_block,
         )
@@ -879,6 +913,37 @@ def _run_codegen_path(
     except Exception as e:
         log("error", f"密文加载失败:{e} · 回退固化 skill")
         return None
+
+    # 4.5) 明文小样本校验(建议式):用按 schema 合成的几行随机数据先跑一遍同样的密态链路,
+    #       几毫秒抓出列名错/崩溃/无产出等;硬失败→把错误反馈 LLM 重生成一次;**不硬拦**
+    #       (合成数据本机随机造、自动解密体检,不出本机、不给 LLM;只对新生成代码,固化代码跳过)。
+    if not from_cache:
+        try:
+            from client.he_ops.verifier import verify as _verify_code
+            _ncols = [str(c) for c in getattr(cdf, "columns", [])]
+            _vd = _verify_code(code, numeric_cols=_ncols, identity_cols=metadata_columns)
+            if _vd.ok:
+                log("result", f"小样本校验通过 · {_vd.summary()}")
+            else:
+                log("think", f"小样本校验未过:{_vd.error} · 反馈 LLM 重生成一次")
+                _retry = (
+                    user + f"\n\n⚠️ 你上次的代码在小样本上失败:{_vd.error}。常见原因:"
+                    "列名拼错、忘了先 `df = ct.decrypt_df(cdf)`、对 CipherSeries 误用 ct.decrypt、未把结果放进 results。"
+                    "请修正并重写完整代码。"
+                )
+                _raw3 = call_llm_for_codegen(host_url, token, system, _retry,
+                                             history=history, should_cancel=chk, web_search=web_search)
+                _code3, _summary3 = codegen_mod.extract_code(_raw3)
+                codegen_mod.ast_safety_check(_code3)
+                if _verify_code(_code3, numeric_cols=_ncols, identity_cols=metadata_columns).ok:
+                    code, summary_raw = _code3, _summary3
+                    log("result", "重生成后小样本校验通过 · 采用新代码")
+                else:
+                    log("error", "重生成仍未过 · 保留原代码,交由全量执行兜底")
+        except CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001 —— 校验器自身异常绝不拖垮主流程
+            log("think", f"小样本校验跳过(校验器异常:{type(e).__name__})")
 
     # 5) 受限执行(decrypt 首次触发解密授权)
     log("call", "受限执行生成代码 · 密态计算")

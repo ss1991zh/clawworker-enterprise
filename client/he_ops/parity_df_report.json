@@ -1,0 +1,100 @@
+{
+  "col_add": {
+    "op_id": "col_add",
+    "passed": true,
+    "max_abs_err": 7.105427357601002e-15,
+    "secs": 0.27,
+    "error": ""
+  },
+  "col_sub": {
+    "op_id": "col_sub",
+    "passed": true,
+    "max_abs_err": 1.5987211554602254e-14,
+    "secs": 0.0,
+    "error": ""
+  },
+  "col_mul": {
+    "op_id": "col_mul",
+    "passed": true,
+    "max_abs_err": 3.410605131648481e-13,
+    "secs": 0.0,
+    "error": ""
+  },
+  "col_div": {
+    "op_id": "col_div",
+    "passed": true,
+    "max_abs_err": 4.440892098500626e-16,
+    "secs": 0.0,
+    "error": ""
+  },
+  "col_sum": {
+    "op_id": "col_sum",
+    "passed": true,
+    "max_abs_err": 2.842170943040401e-14,
+    "secs": 0.0,
+    "error": ""
+  },
+  "col_mean": {
+    "op_id": "col_mean",
+    "passed": true,
+    "max_abs_err": 3.552713678800501e-15,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_mean": {
+    "op_id": "df_mean",
+    "passed": true,
+    "max_abs_err": 1.4210854715202004e-14,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_var": {
+    "op_id": "df_var",
+    "passed": true,
+    "max_abs_err": 3.126388037344441e-13,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_std": {
+    "op_id": "df_std",
+    "passed": true,
+    "max_abs_err": 7.105427357601002e-14,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_cumsum": {
+    "op_id": "df_cumsum",
+    "passed": true,
+    "max_abs_err": 7.105427357601002e-15,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_max": {
+    "op_id": "df_max",
+    "passed": true,
+    "max_abs_err": 6.750155989720952e-14,
+    "secs": 0.0,
+    "error": ""
+  },
+  "df_quantile": {
+    "op_id": "df_quantile",
+    "passed": true,
+    "max_abs_err": 2.7711166694643907e-13,
+    "secs": 0.0,
+    "error": ""
+  },
+  "sort_values": {
+    "op_id": "sort_values",
+    "passed": true,
+    "max_abs_err": 7.105427357601002e-15,
+    "secs": 0.0,
+    "error": ""
+  },
+  "col_gt": {
+    "op_id": "col_gt",
+    "passed": true,
+    "max_abs_err": 0.0,
+    "secs": 0.0,
+    "error": ""
+  }
+}

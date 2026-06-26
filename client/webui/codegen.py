@@ -21,6 +21,21 @@ import ast
 import re
 from typing import Any, Callable, Optional
 
+from client.he_ops import synth as _synth_mod
+
+
+class _BoundSynth:
+    """把 synth.* 的第一个 hp 参数预绑定,生成代码里直接 `synth.sumif_gt(col, 阈值)`。
+    用于补足当前 henumpy 构建里坏掉的比较/条件/分箱(greater/less/digitize)。"""
+
+    def __init__(self, hp):
+        self._hp = hp
+
+    def __getattr__(self, name):
+        fn = getattr(_synth_mod, name)
+        hp = self._hp
+        return lambda *a, **k: fn(hp, *a, **k)
+
 
 # ---------------------------------------------------------------------------
 # 信号异常
@@ -68,6 +83,17 @@ hp.initDict() / ct.initSK()(已初始化):
     · ct.encrypt_df(df)  —— 加密 pandas DataFrame
     · ct.decrypt(c)      —— 解密 ct.encrypt 出来的数值密文 → ndarray
     · ct.decrypt_df(c)   —— 解密 CipherDataFrame / CipherSeries → 明文 DataFrame
+
+═══════════ 在密文上直接计算(进阶,仅"保留密文/不解密"场景才用) ═══════════
+默认仍按下面的最稳写法:**先 `ct.decrypt_df(cdf)` 再用 pandas/numpy**(本机内存、有解密授权门控)。
+只有需要"保留密文、不解密就出结果"时,才在密文上用 henumpy(hp)算子:
+  实测可靠:sum/mean/var/std/median/percentile/max/min/div/sort/sqrt/exp/log 等,直接 hp.xxx(密文)。
+  ⚠ 当前构建里 `hp.greater / greater_equal / less / digitize` **不可靠,禁止使用**。
+    要"比较 / 条件求和 / 分箱"时,改用已就绪的 `synth` 工具(无需 import;阈值用明文数字即可):
+      · synth.gt(a, b) / synth.lt(a, b)          两个密文逐元素比较 → 1/0 掩码
+      · synth.sumif_gt(col, 阈值)                 条件求和(col 中 > 阈值 的元素之和,SUMIF)
+      · synth.countif_gt(col, 阈值)               条件计数(COUNTIF)
+      · synth.bin_index(col, [阈值1, 阈值2, ...])  分箱序号(替代 digitize;RFM/ABC 分级用)
 
 ═══════════ 第 0 步:意图补全(先想清楚"要呈现什么",再写代码) ═══════════
 用户的话经常只说"算什么",省略"怎么呈现"。你必须先从【问题 + schema】推断**完整意图**,
@@ -188,6 +214,11 @@ def build_codegen_messages(
     skills_text = "\n\n".join(skill_blocks)
 
     system = CODEGEN_SYSTEM
+    try:   # 注入实测自动同步的算子可靠性摘要(随对拍报告保持准确)
+        from client.he_ops.planner import capability_brief
+        system = system + "\n\n═══════════ 密态算子可靠性(对拍实测·自动同步)═══════════\n" + capability_brief()
+    except Exception:
+        pass
     if custom_block:
         system = system + "\n" + custom_block
 
@@ -510,6 +541,7 @@ def run_generated_code(
         "metadata_columns": metadata_columns,
         "ps": ps, "ct": ct_gate, "hp": hp, "hl": hl,
         "pd": pd, "np": np,
+        "synth": _BoundSynth(hp),   # 可靠的比较/条件求和/分箱(补 henumpy 构建缺陷)
         "results": results,
     }
 
