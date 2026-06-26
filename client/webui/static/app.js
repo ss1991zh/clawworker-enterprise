@@ -2930,11 +2930,35 @@ async function renderKeysTab() {
       <button class="btn-primary" id="fetchAuthBtn">${k.user_auth_present ? "重新拉取" : "从主机获取"}</button>
     </div>
 
+    <h3 class="keys-h3">密钥体检 <span class="mono-tag">selfcheck</span></h3>
+    <div class="auth-fetch">
+      <div class="af-body">
+        <div class="af-t">在这套密钥上实测:能算什么、精度多少、能平稳跑多大规模</div>
+        <div class="af-s">导入密钥/字典后跑一次 · 不配套或损坏会当场暴露</div>
+      </div>
+      <button class="btn-primary" id="keycheckBtn">开始体检</button>
+    </div>
+    <div id="keycheckResult" style="margin-top:10px;"></div>
+
     <div id="kStatus" style="margin-top:14px;"></div>
   `;
 
   bindKeyDrop("dropSk", "skFile", "sk", "/api/keys/sk");
   bindKeyDrop("dropEvk", "evkFile", "evk", "/api/keys/evk");
+
+  $("keycheckBtn").addEventListener("click", async () => {
+    const btn = $("keycheckBtn");
+    btn.disabled = true; btn.textContent = "体检中…";
+    $("keycheckResult").innerHTML = '<div class="alert-box info">正在体检(对拍实测,约数秒)…</div>';
+    try {
+      const rep = await api("GET", "/api/keycheck?quick=true");
+      $("keycheckResult").innerHTML = renderKeycheckResult(rep);
+    } catch (e) {
+      $("keycheckResult").innerHTML = `<div class="alert-box">体检失败:${esc(e.message)}</div>`;
+    } finally {
+      btn.disabled = false; btn.textContent = "重新体检";
+    }
+  });
 
   $("fetchAuthBtn").addEventListener("click", async () => {
     $("kStatus").innerHTML = '<div class="alert-box info">正在从主机拉取证书…</div>';
@@ -2946,6 +2970,27 @@ async function renderKeysTab() {
       $("kStatus").innerHTML = `<div class="alert-box">同步失败:${esc(e.message)}</div>`;
     }
   });
+}
+
+function renderKeycheckResult(rep) {
+  const head = rep.ok
+    ? '<div class="alert-box success">✓ 密钥可用 · 全部套件通过</div>'
+    : '<div class="alert-box">⚠ 部分套件未通过(详见下方)</div>';
+  const rows = (rep.suites || []).map(s =>
+    `<div class="key-row"><div class="key-meta">
+       <span class="badge ${s.ok ? "ok" : "no"}">${s.ok ? "通过" : "未过"}</span>
+       <strong>${esc(s.name)}</strong> <span class="af-s">· ${esc(s.detail)}</span>
+     </div></div>`).join("");
+  const t = rep.scale_tier || {};
+  const tier = t.max_smooth_n
+    ? `<div class="af-s" style="margin-top:8px;">规模:向量化聚合平稳到 ${Number(t.max_smooth_n).toLocaleString()} 行` +
+      `(group-by ${t.groupby_secs_at_max}s);排名/topk 大表自动走授权解密。</div>`
+    : "";
+  const brief = rep.capability_brief
+    ? `<details style="margin-top:8px;"><summary class="af-s" style="cursor:pointer;">能力清单(对拍实测)</summary>` +
+      `<pre class="keycheck-brief">${esc(rep.capability_brief)}</pre></details>`
+    : "";
+  return head + rows + tier + brief;
 }
 
 function bindKeyDrop(zoneId, inputId, label, endpoint) {
