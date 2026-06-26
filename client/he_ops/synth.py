@@ -149,6 +149,44 @@ def countif_or(hp, masks):
     return hp.sum(any_of(hp, masks))
 
 
+# ---------- 排名 / top-k(比较和,替代不可靠的近似 sort) ----------
+# 原理:rank(xᵢ)=#{j: xⱼ<xᵢ}(升序 0 基)。用 xᵢ 广播减整列 + 严格正掩码求和,
+# 比近似 sort 稳。注意:密文逻辑长度不透明(len 给的是填充槽数),故需显式传 n。
+# 不拼密文数组(hp.append 拼标量不可靠),按元素累加标量。
+def rank(hp, a, n: int) -> list:
+    """每个元素的升序排名(0 基)列表:rank[i]=#{j: a[j]<a[i]}。n=逻辑元素个数。
+    返回 n 个密文标量(读取需授权解密,会泄露顺序)。"""
+    return [hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a))) for i in range(n)]
+
+
+def topk_sum(hp, a, k: int, n: int):
+    """最大 k 个元素之和(密文标量)。**隐私友好**:全程不暴露"谁是 top-k"/顺序,只出和。
+    = Σ_i a[i]·[rank(a[i]) ≥ n−k]。n=逻辑元素个数。"""
+    total = None
+    for i in range(n):
+        rank_i = hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a)))   # #{a[j]<a[i]}
+        mask_i = _mask_incl_pos(hp, hp.add(rank_i, -float(n - k)))      # rank_i ≥ n−k
+        term = hp.mul(a[i:i + 1], mask_i)
+        total = term if total is None else hp.add(total, term)
+    return total
+
+
+def topk_mean(hp, a, k: int, n: int):
+    """最大 k 个元素的均值 = topk_sum × (1/k),明文常数乘,精确。"""
+    return hp.mul(topk_sum(hp, a, k, n), 1.0 / k)
+
+
+def bottomk_sum(hp, a, k: int, n: int):
+    """最小 k 个元素之和(隐私友好)= Σ_i a[i]·[rank(a[i]) < k]。"""
+    total = None
+    for i in range(n):
+        rank_i = hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a)))
+        mask_i = _mask_strict_pos(hp, hp.add(-rank_i, float(k)))        # rank_i < k
+        term = hp.mul(a[i:i + 1], mask_i)
+        total = term if total is None else hp.add(total, term)
+    return total
+
+
 # ---------- 分箱(替代不可靠的 digitize)----------
 def bin_index(hp, a, edges: list[float]):
     """分箱序号(0..len(edges)),对齐 np.digitize(a, edges, right=False):

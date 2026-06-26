@@ -169,6 +169,21 @@ def generate() -> str:
         lines.append(f"纯乘法链可用深度 ≈ **{dep.get('usable_depth')}**(相对误差预算 {dep.get('budget')});"
                      "超过此深度精度才显著退化。供 planner/verifier 给链式分析预警。")
         lines.append("")
+
+    # ---- 有效输入域(近似算子)----
+    dom = _rep("parity_domain_report.json")
+    if dom:
+        lines.append("## 近似算子有效输入域(domain)")
+        lines.append("")
+        lines.append("近似算子在不同输入量级的相对误差(实测)。本构建在宽域均可靠,无实际域限;极端量级建议先归一化。")
+        lines.append("")
+        lines.append("| 算子 | 实测可靠域 |")
+        lines.append("|---|---|")
+        for op, info in dom.items():
+            rr = info.get("reliable_ranges") or []
+            span = f"[{min(r[0] for r in rr):g}, {max(r[1] for r in rr):g}]" if rr else "无"
+            lines.append(f"| `{op}` | {span} |")
+        lines.append("")
     return "\n".join(lines)
 
 

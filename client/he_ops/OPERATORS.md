@@ -114,22 +114,25 @@
 
 ## 窗口/时序 + 多条件 · window / synth(对拍实测)
 
-对拍实测 11/11 通过。窗口 `window.*`(diff/lag/rolling 精确,pct_change 近似);
+对拍实测 14/14 通过。窗口 `window.*`(diff/lag/rolling 精确,pct_change 近似);
 多条件 `synth.*`(布尔代数 band/bor/bnot 组合掩码 → sumif_and/sumif_or/countif_and/countif_or)。
 
 | 算子 | 状态 | 实测max误差 |
 |---|---|---|
-| `diff` | ✅ | 1.4e-14 |
-| `diff2` | ✅ | 6.4e-14 |
-| `lag` | ✅ | 0.0e+00 |
-| `rolling_sum` | ✅ | 3.1e-13 |
-| `rolling_mean` | ✅ | 1.3e-13 |
-| `pct_change` | ✅ | 7.8e-16 |
-| `sumif_and` | ✅ | 0.0e+00 |
-| `sumif_or` | ✅ | 0.0e+00 |
-| `countif_and` | ✅ | 8.9e-16 |
-| `countif_or` | ✅ | 8.9e-16 |
-| `bnot` | ✅ | 1.7e-13 |
+| `diff` | ✅ | 4.3e-14 |
+| `diff2` | ✅ | 2.1e-14 |
+| `lag` | ✅ | 7.1e-15 |
+| `rolling_sum` | ✅ | 2.6e-13 |
+| `rolling_mean` | ✅ | 1.1e-13 |
+| `pct_change` | ✅ | 2.2e-15 |
+| `sumif_and` | ✅ | 1.1e-13 |
+| `sumif_or` | ✅ | 2.3e-13 |
+| `countif_and` | ✅ | 1.8e-15 |
+| `countif_or` | ✅ | 1.8e-15 |
+| `bnot` | ✅ | 2.0e-13 |
+| `topk_sum` | ✅ | 1.1e-13 |
+| `topk_mean` | ✅ | 0.0e+00 |
+| `bottomk_sum` | ✅ | 1.3e-13 |
 
 ## 模型级 · helearn(密文训练 + 预测,体检实测)
 
@@ -152,3 +155,14 @@
 ## 数值护栏 · 深度×误差剖面
 
 纯乘法链可用深度 ≈ **32**(相对误差预算 0.001);超过此深度精度才显著退化。供 planner/verifier 给链式分析预警。
+
+## 近似算子有效输入域(domain)
+
+近似算子在不同输入量级的相对误差(实测)。本构建在宽域均可靠,无实际域限;极端量级建议先归一化。
+
+| 算子 | 实测可靠域 |
+|---|---|
+| `exp` | [-5, 15] |
+| `log` | [0.001, 100] |
+| `sqrt` | [0.01, 1e+06] |
+| `reciprocal` | [0.01, 100] |

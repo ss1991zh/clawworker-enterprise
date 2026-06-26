@@ -142,6 +142,8 @@ hp.initDict() / ct.initSK()(已初始化):
       · 多条件(AND/OR):mask 用布尔代数组合再聚合 ——
         synth.sumif_and(col, [synth.gt_threshold(col,a), synth.lt_threshold(col,b)])  # a<col<b 求和
         synth.sumif_or / countif_and / countif_or 同理;synth.band/bor/bnot 组合任意掩码。
+      · 排名/top-k(比较和,替代近似 sort;n=行数):synth.topk_sum(col, k, n) / topk_mean / bottomk_sum
+        —— 隐私友好:只出"最大/最小 k 个之和",不暴露是哪几个、不暴露顺序。要逐行排名用 synth.rank(col, n)。
   密态分组聚合 `groupby`(明文维度键 × 密文度量,sum/mean/count 精确、max/min 近似):
       keys = [r["大区"] for r in metadata_rows]                       # 维度键取自明文身份列
       g = groupby.sum(cdf["销售额"], keys)   # → {大区: 密文标量}

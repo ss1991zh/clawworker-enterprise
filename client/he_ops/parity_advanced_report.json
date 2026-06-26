@@ -2,77 +2,98 @@
   "diff": {
     "op_id": "diff",
     "passed": true,
-    "max_abs_err": 1.4210854715202004e-14,
-    "secs": 0.3,
+    "max_abs_err": 4.263256414560601e-14,
+    "secs": 0.42,
     "error": ""
   },
   "diff2": {
     "op_id": "diff2",
     "passed": true,
-    "max_abs_err": 6.394884621840902e-14,
+    "max_abs_err": 2.1316282072803006e-14,
     "secs": 0.0,
     "error": ""
   },
   "lag": {
     "op_id": "lag",
     "passed": true,
-    "max_abs_err": 0.0,
+    "max_abs_err": 7.105427357601002e-15,
     "secs": 0.0,
     "error": ""
   },
   "rolling_sum": {
     "op_id": "rolling_sum",
     "passed": true,
-    "max_abs_err": 3.126388037344441e-13,
+    "max_abs_err": 2.5579538487363607e-13,
     "secs": 0.0,
     "error": ""
   },
   "rolling_mean": {
     "op_id": "rolling_mean",
     "passed": true,
-    "max_abs_err": 1.2789769243681803e-13,
+    "max_abs_err": 1.1368683772161603e-13,
     "secs": 0.0,
     "error": ""
   },
   "pct_change": {
     "op_id": "pct_change",
     "passed": true,
-    "max_abs_err": 7.771561172376096e-16,
+    "max_abs_err": 2.220446049250313e-15,
     "secs": 0.0,
     "error": ""
   },
   "sumif_and": {
     "op_id": "sumif_and",
     "passed": true,
-    "max_abs_err": 0.0,
+    "max_abs_err": 1.1368683772161603e-13,
     "secs": 0.0,
     "error": ""
   },
   "sumif_or": {
     "op_id": "sumif_or",
     "passed": true,
-    "max_abs_err": 0.0,
+    "max_abs_err": 2.2737367544323206e-13,
     "secs": 0.0,
     "error": ""
   },
   "countif_and": {
     "op_id": "countif_and",
     "passed": true,
-    "max_abs_err": 8.881784197001252e-16,
+    "max_abs_err": 1.7763568394002505e-15,
     "secs": 0.0,
     "error": ""
   },
   "countif_or": {
     "op_id": "countif_or",
     "passed": true,
-    "max_abs_err": 8.881784197001252e-16,
+    "max_abs_err": 1.7763568394002505e-15,
     "secs": 0.0,
     "error": ""
   },
   "bnot": {
     "op_id": "bnot",
     "passed": true,
-    "max_abs_err": 1.7053025658242404e-13,
+    "max_abs_err": 1.9895196601282805e-13,
+    "secs": 0.0,
+    "error": ""
+  },
+  "topk_sum": {
+    "op_id": "topk_sum",
+    "passed": true,
+    "max_abs_err": 1.1368683772161603e-13,
+    "secs": 0.0,
+    "error": ""
+  },
+  "topk_mean": {
+    "op_id": "topk_mean",
+    "passed": true,
+    "max_abs_err": 0.0,
+    "secs": 0.0,
+    "error": ""
+  },
+  "bottomk_sum": {
+    "op_id": "bottomk_sum",
+    "passed": true,
+    "max_abs_err": 1.2789769243681803e-13,
     "secs": 0.0,
     "error": ""
   }

@@ -81,6 +81,15 @@ def _check_depth() -> tuple[bool, str]:
     return ok, f"可用乘法深度 ≈ {d}" + ("" if ok else " · ⚠ 低于 8")
 
 
+def _check_domain() -> tuple[bool, str]:
+    from client.he_ops import parity_domain
+    prof = parity_domain.run_all()
+    total = sum(len(v["rows"]) for v in prof.values())
+    ok_n = sum(1 for v in prof.values() for r in v["rows"] if r["ok"])
+    ok = ok_n == total
+    return ok, f"近似算子 {ok_n}/{total} 区间可靠" + ("" if ok else " · ⚠ 有区间超差")
+
+
 def _check_planner() -> tuple[bool, str]:
     from client.he_ops.planner import Plan, Step, validate_plan
     good = Plan([Step("s1", "回款率", ops=["div"]),
@@ -102,6 +111,7 @@ def main() -> int:
         ("窗口+多条件 (advanced)", _check_advanced),
         ("模型级 (helearn)", _check_model),
         ("深度护栏 (depth)", _check_depth),
+        ("有效域 (domain)", _check_domain),
         ("规划器 (planner)", _check_planner),
     ]
     all_ok = True

@@ -95,12 +95,28 @@ def capability_brief() -> str:
         "- 表级 pandaseal(CipherDataFrame)直接可用:列加减乘除、sum/mean/var/std/quantile、sort_values、.gt 等(实测可靠)。",
         (f"- 密态分组聚合 groupby(明文键×密文度量):{', '.join(gb)}(sum/mean/count 精确,max/min 近似)。" if gb else ""),
         (f"- 窗口/时序 window:{', '.join(win)}(diff/lag/rolling 精确,pct_change 近似)。" if win else ""),
+        "- 排名/top-k:synth.topk_sum/topk_mean/bottomk_sum(a, k, n) 与 synth.rank(a, n)"
+        "(比较和实现,替代近似 sort;topk_sum 隐私友好不暴露顺序,n=逻辑行数,需授权解密读 rank)。",
         f"- 需授权解密(会触发用户授权,规划时标出):{', '.join(auth)}",
         (f"- 模型级 helearn(对拍达标):{', '.join(ml)}。⚠ GBDT/XGBoost 当前构建训练报错,勿用。"
          if ml else "- 模型级 helearn:LinearRegression 等(密文训练+预测)。"),
         (f"- 数值护栏:纯乘法链可用深度 ≈ {depth}(超过精度才显著退化)。" if depth else ""),
+        _domain_line(),
     ]
     return "\n".join(x for x in lines if x)
+
+
+def _domain_line() -> str:
+    rep = _load_report("parity_domain_report.json")
+    if not rep:
+        return ""
+    spans = []
+    for op, info in rep.items():
+        rr = info.get("reliable_ranges") or []
+        if rr:
+            spans.append(f"{op}∈[{min(r[0] for r in rr):g},{max(r[1] for r in rr):g}]")
+    return ("- 近似算子有效域(实测在宽域均可靠,无需特殊处理;极端量级再归一化):"
+            + "; ".join(spans)) if spans else ""
 
 
 # ---------------- 计划模型 ----------------

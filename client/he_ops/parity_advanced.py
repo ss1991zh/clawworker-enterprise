@@ -56,6 +56,13 @@ def _ops():
               lambda np, a: float(np.sum((a < 20) | (a > 80))), "a<20 或 a>80 计数(OR)"),
         AdvOp("bnot", lambda hp, c: synth.sum_masked(hp, c, synth.bnot(hp, gt(hp, c, 50.0))),
               lambda np, a: float(np.sum(a * ~(a > 50))), "NOT(a>50) 求和 = sum(a<=50)"),
+        # ---- 排名 / top-k(比较和,替代近似 sort;隐私友好不暴露顺序)----
+        AdvOp("topk_sum", lambda hp, c: synth.topk_sum(hp, c, 3, 12),
+              lambda np, a: float(np.sort(a)[-3:].sum()), "最大 3 个之和(rank 比较和)"),
+        AdvOp("topk_mean", lambda hp, c: synth.topk_mean(hp, c, 3, 12),
+              lambda np, a: float(np.sort(a)[-3:].mean()), "最大 3 个均值"),
+        AdvOp("bottomk_sum", lambda hp, c: synth.bottomk_sum(hp, c, 3, 12),
+              lambda np, a: float(np.sort(a)[:3].sum()), "最小 3 个之和"),
     ]
 
 
