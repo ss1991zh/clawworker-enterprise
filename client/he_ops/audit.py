@@ -54,18 +54,42 @@ def _append(user: Optional[str], event: dict) -> None:
         pass
 
 
+def _field_names(schema: dict) -> list[str]:
+    """提取真正暴露给 LLM 的**字段名**。兼容两种 schema 形态:
+    标准 sidecar {scenario, columns:[{name,type,encrypted}], metadata_columns, primary_key} →
+    取 columns[].name;简单 {字段名: 类型} → 取 keys。"""
+    if not isinstance(schema, dict):
+        return []
+    cols = schema.get("columns")
+    if isinstance(cols, list) and cols and isinstance(cols[0], dict):
+        return [str(c.get("name", "")) for c in cols if c.get("name")]
+    # 退化:简单 {名:类型};排除已知结构键
+    structural = {"scenario", "columns", "metadata_columns", "primary_key"}
+    return [str(k) for k in schema.keys() if k not in structural]
+
+
+def _contains_data_values(obj) -> bool:
+    """是否含**实际数据值**(数值数组 / 数据行),而非字段名/类型元数据。
+    标准 schema 的 columns 是 {name,type,encrypted} 定义(布尔除外无数字)→ 不触发。
+    若误塞了数据列(如 {col:[1,2,3,4]})→ 触发。"""
+    if isinstance(obj, list):
+        nums = [x for x in obj if isinstance(x, (int, float)) and not isinstance(x, bool)]
+        if len(nums) >= 3:            # 像一列数据
+            return True
+        return any(_contains_data_values(x) for x in obj)
+    if isinstance(obj, dict):
+        return any(_contains_data_values(v) for v in obj.values())
+    return False
+
+
 def assert_no_plaintext(schema: dict, query: str) -> dict:
-    """零明文断言:确认发给 LLM 的内容(schema + 问题)只含字段名/类型,不含数据行/单元值。
-    schema 应是 {字段名: 类型/描述} 形态;若检出疑似嵌入的数据行(list/dict 值且非类型描述),标记。"""
-    fields = list(schema.keys()) if isinstance(schema, dict) else []
-    suspicious = []
-    if isinstance(schema, dict):
-        for k, v in schema.items():
-            # 类型/描述应是短字符串;若值是 list/dict(疑似塞了样本数据)则可疑
-            if isinstance(v, (list, dict)) and len(json.dumps(v, ensure_ascii=False)) > 80:
-                suspicious.append(k)
+    """零明文断言:确认发给 LLM 的只有**字段名 + 类型元数据**,不含任何数据行/单元值。
+    记录真实字段名(columns[].name);仅当检出嵌入的数值数组/数据行时才判为外发。"""
+    fields = _field_names(schema)
+    has_data = _contains_data_values(schema)
     return {"fields": fields, "field_count": len(fields),
-            "no_plaintext": not suspicious, "suspicious_fields": suspicious}
+            "no_plaintext": not has_data,
+            "suspicious_fields": ["<检出疑似数据值>"] if has_data else []}
 
 
 def record_llm_exposure(schema: dict, query: str, purpose: str = "analyze",
