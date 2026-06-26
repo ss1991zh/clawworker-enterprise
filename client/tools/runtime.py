@@ -38,6 +38,51 @@ def get_backend_from_env() -> Backend:
     return val  # type: ignore[return-value]
 
 
+def _init_with_fd_capture(fn) -> str:
+    """在 fd(1) 级捕获 fn() 期间原生库打印到 stdout 的内容并返回。
+    捕获不可用/失败时仍正常执行 fn(),只是返回空串 —— 绝不影响初始化本身。"""
+    import os
+    import tempfile
+
+    saved = None
+    tf = None
+    try:
+        saved = os.dup(1)
+        tf = tempfile.TemporaryFile(mode="w+")
+        os.dup2(tf.fileno(), 1)
+    except Exception:  # noqa: BLE001 —— 捕获不可用,直接裸跑
+        saved = None
+    try:
+        fn()
+    finally:
+        text = ""
+        if saved is not None:
+            try:
+                os.dup2(saved, 1)
+                os.close(saved)
+                tf.seek(0)
+                text = tf.read()
+            except Exception:  # noqa: BLE001
+                text = ""
+            finally:
+                if tf is not None:
+                    tf.close()
+    return text
+
+
+def _parse_license(text: str) -> dict:
+    """从 initSK 的原生输出里解析授权信息('… N days left to expiration.')。"""
+    import re
+    m = re.search(r"(\d+)\s*days?\s*left", text or "")
+    raw = next((ln.strip() for ln in (text or "").splitlines()
+                if "expiration" in ln or "Serial" in ln), "")
+    return {
+        "days_left": int(m.group(1)) if m else None,
+        "verified": ("verification succeeded" in (text or "")) or ("succeeded" in (text or "")),
+        "raw": raw,
+    }
+
+
 def _file_exists(path: str | Path) -> bool:
     try:
         return Path(path).is_file()
@@ -69,6 +114,7 @@ class Runtime:
         self.config = config or RuntimeConfig(backend=get_backend_from_env())
         self._sk_initialized = False
         self._dict_initialized = False
+        self._license: Optional[dict] = None   # HE 库授权信息(initSK 时捕获)
 
     # ----- 单例 -----
     @classmethod
@@ -124,6 +170,27 @@ class Runtime:
         ct.initSK(skFilePath=sk_path)
         self._sk_initialized = True
 
+    def license_status(self) -> dict:
+        """HE 库授权状态(到期预警用)。需 initSK 已发生(否则 days_left 未知)。
+        level: ok(>30d) / warn(≤30d) / critical(≤14d) / expired(≤0) / unknown。"""
+        from datetime import date, timedelta
+        lic = self._license
+        if not lic or lic.get("days_left") is None:
+            return {"available": False, "level": "unknown",
+                    "message": "未捕获到授权信息(尚未初始化密钥,或捕获不可用)。"}
+        d = int(lic["days_left"])
+        level = "expired" if d <= 0 else "critical" if d <= 14 else "warn" if d <= 30 else "ok"
+        expires = (date.today() + timedelta(days=d)).isoformat()
+        msg = {
+            "ok": f"HE 库授权正常,剩余 {d} 天(约 {expires} 到期)。",
+            "warn": f"⚠ HE 库授权剩余 {d} 天(约 {expires} 到期),请及时续期。",
+            "critical": f"⚠⚠ HE 库授权仅剩 {d} 天(约 {expires} 到期),尽快续期,否则密态将全部失效!",
+            "expired": "❌ HE 库授权已过期,密态运算已失效,请立即续期。",
+        }[level]
+        return {"available": True, "days_left": d, "expires_on": expires,
+                "level": level, "verified": lic.get("verified"),
+                "raw": lic.get("raw"), "message": msg}
+
     def ensure_dict_initialized(self) -> None:
         """调用 hp.initDict(),只调一次。"""
         if self._dict_initialized:
@@ -137,10 +204,15 @@ class Runtime:
             )
         import henumpy as hp
 
+        # initDict 时原生库会向 stdout 打印授权信息("Serial number … N days left to expiration"),
+        # 仅首次打印 → fd 级捕获并解析,供 license 到期预警。捕获失败绝不影响初始化。
         if dict_path:
-            hp.initDict(dictFilePath=dict_path, userFilePath=user_auth)
+            captured = _init_with_fd_capture(
+                lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
         else:
-            hp.initDict(userFilePath=user_auth)
+            captured = _init_with_fd_capture(
+                lambda: hp.initDict(userFilePath=user_auth))
+        self._license = _parse_license(captured)
         self._dict_initialized = True
 
     def ensure_all_initialized(self) -> None:

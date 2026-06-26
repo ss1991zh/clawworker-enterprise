@@ -153,8 +153,13 @@ def health_report(quick: bool = False) -> dict:
         scale = parity_scale.scale_tier(parity_scale.run_all([200_000]))
     except Exception:  # noqa: BLE001
         scale = {}
+    try:
+        from client.tools.runtime import Runtime
+        lic = Runtime.get().license_status()
+    except Exception:  # noqa: BLE001
+        lic = {"available": False, "level": "unknown", "message": "未获取授权状态。"}
     return {"ok": all_ok, "quick": quick, "suites": rows,
-            "capability_brief": brief, "scale_tier": scale}
+            "capability_brief": brief, "scale_tier": scale, "license": lic}
 
 
 def main() -> int:
@@ -162,6 +167,9 @@ def main() -> int:
     rep = health_report(quick="--quick" in sys.argv)
     for r in rep["suites"]:
         print(f"  [{'通过' if r['ok'] else '失败'}] {r['name']:24} · {r['detail']}")
+    lic = rep.get("license") or {}
+    if lic.get("message"):
+        print(f"  [授权] {lic.get('level','?'):10} · {lic['message']}")
     print("══════════════════════════════════")
     print("总体:" + ("✅ 全部通过" if rep["ok"] else "❌ 存在失败/回归"))
     return 0 if rep["ok"] else 1

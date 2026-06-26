@@ -2976,6 +2976,13 @@ function renderKeycheckResult(rep) {
   const head = rep.ok
     ? '<div class="alert-box success">✓ 密钥可用 · 全部套件通过</div>'
     : '<div class="alert-box">⚠ 部分套件未通过(详见下方)</div>';
+  // HE 库授权状态:ok=success,warn/critical/expired=醒目
+  const lic = rep.license || {};
+  let licBox = "";
+  if (lic.message) {
+    const cls = (lic.level === "ok") ? "success" : (lic.level === "warn") ? "info" : "";
+    licBox = `<div class="alert-box ${cls}">${esc(lic.message)}</div>`;
+  }
   const rows = (rep.suites || []).map(s =>
     `<div class="key-row"><div class="key-meta">
        <span class="badge ${s.ok ? "ok" : "no"}">${s.ok ? "通过" : "未过"}</span>
@@ -2990,7 +2997,7 @@ function renderKeycheckResult(rep) {
     ? `<details style="margin-top:8px;"><summary class="af-s" style="cursor:pointer;">能力清单(对拍实测)</summary>` +
       `<pre class="keycheck-brief">${esc(rep.capability_brief)}</pre></details>`
     : "";
-  return head + rows + tier + brief;
+  return head + licBox + rows + tier + brief;
 }
 
 function bindKeyDrop(zoneId, inputId, label, endpoint) {
