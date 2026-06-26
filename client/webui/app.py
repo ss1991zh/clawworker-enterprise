@@ -559,8 +559,16 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
     all_cols = df.columns.tolist()
     if all(str(c).startswith("Unnamed:") for c in all_cols):
         raise ValueError("无法识别表头(所有列都是 Unnamed)")
-    string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
-    numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+    # 脏数据体检 + 清洗:数值列里混的 "N/A"/"-"/inf → NaN,并按"非空值可强转数字比例"
+    # 重判数值/身份列(避免被一两个脏值误判成文本而丢出计算)。失败回退原始 dtype 判定。
+    data_health = {}
+    try:
+        from client.he_ops import data_health as _dh
+        df, numeric_cols, string_cols, _reports = _dh.clean_for_encryption(df)
+        data_health = _dh.health_summary(_reports, len(df))
+    except Exception:  # noqa: BLE001 —— 体检失败不阻断入库
+        string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
 
     stem = dst_stem or Path(original_name).stem
     cipher_suffix = raw_suffix if backend == "real" else f"{raw_suffix}.cipher"
@@ -617,6 +625,7 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         "sheet_name": sheet_name, "header_row": header_row,
         "column_preview": all_cols[:8],
         "nan_filled": nan_counts,
+        "data_health": data_health,
     }
 
 

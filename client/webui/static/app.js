@@ -2761,9 +2761,12 @@ async function renderFilesModal() {
     try {
       const res = await api("POST", "/api/files/upload", fd, true);
       const enc = res.encrypted_columns || [], pt = res.plaintext_columns || [];
+      const dh = res.data_health || {};
+      const dhLine = (dh.message && dh.message !== "数据干净,无需清洗。")
+        ? `<br><span class="af-s">数据体检:${esc(dh.message)}</span>` : "";
       $("fileUpStatus").innerHTML =
         `<div class="alert-box success">✓ 已加密入库:<strong>${esc(res.name)}</strong>
-         <br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行</div>`;
+         <br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行${dhLine}</div>`;
       setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
       inp.value = "";
       await loadFiles(); renderFilesList();
