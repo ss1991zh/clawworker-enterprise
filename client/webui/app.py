@@ -433,6 +433,17 @@ def api_keycheck(quick: bool = True):
         raise HTTPException(500, f"体检执行失败:{type(e).__name__}: {e}")
 
 
+@app.get("/api/audit")
+def api_audit(limit: int = 200):
+    """可信审计:合规摘要 + 审计事件(LLM 只见 schema 的零明文断言 + 解密授权台账)。
+    用于合规审计/客户尽调:证明"明文不出本机、LLM 只见字段名、解密均经授权"。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client.he_ops import audit
+    user = _session_state["username"]
+    return {"summary": audit.summary(user), "events": audit.read_events(user, limit=limit)}
+
+
 # ----------------------------------------------------------------------------
 # /api/files
 # ----------------------------------------------------------------------------
@@ -1341,6 +1352,8 @@ def _run_pipeline(
             # 定时任务:固化首次成功生成的代码,每次到点复用 → 输出结构一致
             codegen_cache_key=(f"task_{sched_task.id}" if sched_task is not None else ""),
             web_search=web_search,
+            audit_user=_session_state.get("username", ""),
+            audit_session=sid,
         )
     except Exception as e:
         _sessions.update_message(

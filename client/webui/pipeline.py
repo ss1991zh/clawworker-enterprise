@@ -846,6 +846,12 @@ def _run_codegen_path(
         system, user = codegen_mod.build_codegen_messages(
             skill_docs, schema, metadata_columns, gen_query, custom_block,
         )
+        # 可信审计:记录"本次发给 LLM 的只有 schema 字段名 + 问题",附零明文断言
+        try:
+            from client.he_ops import audit as _audit
+            _audit.record_llm_exposure(schema, gen_query, purpose="codegen")
+        except Exception:  # noqa: BLE001 —— 审计失败不拖垮分析
+            pass
         log("call", "调用 LLM 生成密态分析代码")
         if chk():
             raise CancelledError("用户已停止")
@@ -1058,6 +1064,13 @@ def _run_codegen_path(
             return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
                     "excel_path": "", "skill_calls": ["codegen"]}
         log("result", f"用户选择:{'解密展示' if decision == 'decrypt' else '保留密文展示' if decision == 'keep_encrypted' else '取消'}")
+    # 可信审计:记录解密授权台账(谁/何时/哪个会话/授权解密还是保留密文)
+    try:
+        from client.he_ops import audit as _audit
+        _dec = "granted" if decision == "decrypt" else "keep_encrypted" if decision == "keep_encrypted" else "denied"
+        _audit.record_decrypt_auth(_dec, detail=f"{len(results)} 个 sheet 解密展示")
+    except Exception:  # noqa: BLE001
+        pass
     if decision == "cancel":
         return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
                 "excel_path": "", "skill_calls": ["codegen"]}
@@ -1095,6 +1108,8 @@ def _ask_impl(
     run_id: str = "",
     codegen_cache_key: str = "",
     web_search: bool = False,
+    audit_user: str = "",
+    audit_session: str = "",
 ) -> dict:
     """
     跑一次完整分析。返回:
@@ -1108,6 +1123,13 @@ def _ask_impl(
     """
     log = on_step or (lambda kind, label: None)
     chk = should_cancel or (lambda: False)
+
+    # 可信审计:设请求作用域上下文(user, session),供各埋点记录(不层层穿参)
+    try:
+        from client.he_ops import audit as _audit
+        _audit.set_context(audit_user, audit_session or run_id)
+    except Exception:  # noqa: BLE001
+        pass
 
     def _ck():
         if chk():

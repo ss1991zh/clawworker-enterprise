@@ -1120,6 +1120,7 @@ const TABS = {
   ops:     { title: "自启 / 运维", render: renderOpsTab },
   skills:  { title: "Skill 管理", render: renderSkillsTab },
   keys:    { title: "同态密钥", render: renderKeysTab },
+  audit:   { title: "可信审计", render: renderAuditTab },
   account: { title: "账户", render: renderAccountTab },
 };
 let currentTab = "general";
@@ -2998,6 +2999,59 @@ function renderKeycheckResult(rep) {
       `<pre class="keycheck-brief">${esc(rep.capability_brief)}</pre></details>`
     : "";
   return head + licBox + rows + tier + brief;
+}
+
+async function renderAuditTab() {
+  let data;
+  try {
+    data = await api("GET", "/api/audit?limit=100");
+  } catch (e) {
+    $("modalBody").innerHTML = `<h2>可信审计</h2><div class="alert-box">读取失败:${esc(e.message)}</div>`;
+    return;
+  }
+  const s = data.summary || {};
+  const events = (data.events || []).slice().reverse();
+  $("modalBody").innerHTML = `
+    <h2>可信审计</h2>
+    <p class="sub">证明:明文不出本机 · LLM 只见字段名 schema · 解密均经本机授权可追溯</p>
+    <div class="alert-box ${s.zero_plaintext_holds ? "success" : ""}">${esc(s.statement || "暂无审计记录 —— 跑一次分析后这里会有台账。")}</div>
+    <div class="key-row"><div class="key-meta af-s">
+      LLM 暴露事件 <strong>${s.llm_exposures || 0}</strong> ·
+      解密授权 <strong>${s.decrypt_authorizations || 0}</strong>
+      (授权 ${s.decrypt_granted || 0} / 拒绝或保留密文 ${s.decrypt_denied || 0}) ·
+      疑似明文外发 <strong>${s.plaintext_breaches || 0}</strong>
+    </div></div>
+    <h3 class="keys-h3">最近事件</h3>
+    <div>${events.length ? events.map(renderAuditEvent).join("") : '<div class="af-s">暂无记录。</div>'}</div>
+    <div style="margin-top:12px;"><button class="btn-primary" id="auditExportBtn">导出合规报告(JSON)</button></div>
+  `;
+  $("auditExportBtn").addEventListener("click", () => {
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "compliance_audit.json"; a.click();
+    URL.revokeObjectURL(a.href);
+  });
+}
+
+function renderAuditEvent(e) {
+  const ts = esc((e.ts || "").replace("T", " ").slice(0, 19));
+  if (e.type === "llm_exposure") {
+    const ok = e.no_plaintext;
+    return `<div class="key-row"><div class="key-meta">
+      <span class="badge ${ok ? "ok" : "no"}">${ok ? "零明文" : "疑似外发"}</span>
+      <span class="mono-tag">LLM</span> <span class="af-s">${ts} · 字段 ${e.field_count || 0} 个:${esc((e.fields || []).slice(0, 6).join("、"))}</span>
+    </div></div>`;
+  }
+  if (e.type === "decrypt_auth") {
+    const d = e.decision;
+    const label = d === "granted" ? "授权解密" : d === "keep_encrypted" ? "保留密文" : "拒绝/取消";
+    return `<div class="key-row"><div class="key-meta">
+      <span class="badge ${d === "granted" ? "ok" : "warn"}">${label}</span>
+      <span class="mono-tag">解密</span> <span class="af-s">${ts} · ${esc(e.detail || "")}</span>
+    </div></div>`;
+  }
+  return "";
 }
 
 function bindKeyDrop(zoneId, inputId, label, endpoint) {
