@@ -153,15 +153,32 @@ def countif_or(hp, masks):
 # 原理:rank(xᵢ)=#{j: xⱼ<xᵢ}(升序 0 基)。用 xᵢ 广播减整列 + 严格正掩码求和,
 # 比近似 sort 稳。注意:密文逻辑长度不透明(len 给的是填充槽数),故需显式传 n。
 # 不拼密文数组(hp.append 拼标量不可靠),按元素累加标量。
+#
+# 规模护栏:本实现是 O(n²)(每个元素都要和整列比一遍),实测 1000→0.7s、2000→3s、
+# 3000→5.4s。超 TOPK_MAX_N 行会很慢 → 大表必须降级 decrypt-first(授权后 pandas
+# nlargest/rank,精确且毫秒)。守门函数在超限时抛清晰错误,引导改路。
+TOPK_MAX_N = 2000
+
+
+def _check_topk_n(n: int) -> None:
+    if n > TOPK_MAX_N:
+        raise ValueError(
+            f"密态 top-k/rank 是 O(n²),n={n} 超过 {TOPK_MAX_N} 行会很慢;"
+            f"大表请改用 decrypt-first:授权解密该列后用 pandas 的 nlargest/nsmallest/rank"
+            f"(明文、精确、毫秒级)。")
+
+
 def rank(hp, a, n: int) -> list:
     """每个元素的升序排名(0 基)列表:rank[i]=#{j: a[j]<a[i]}。n=逻辑元素个数。
     返回 n 个密文标量(读取需授权解密,会泄露顺序)。"""
+    _check_topk_n(n)
     return [hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a))) for i in range(n)]
 
 
 def topk_sum(hp, a, k: int, n: int):
     """最大 k 个元素之和(密文标量)。**隐私友好**:全程不暴露"谁是 top-k"/顺序,只出和。
     = Σ_i a[i]·[rank(a[i]) ≥ n−k]。n=逻辑元素个数。"""
+    _check_topk_n(n)
     total = None
     for i in range(n):
         rank_i = hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a)))   # #{a[j]<a[i]}
@@ -178,6 +195,7 @@ def topk_mean(hp, a, k: int, n: int):
 
 def bottomk_sum(hp, a, k: int, n: int):
     """最小 k 个元素之和(隐私友好)= Σ_i a[i]·[rank(a[i]) < k]。"""
+    _check_topk_n(n)
     total = None
     for i in range(n):
         rank_i = hp.sum(_mask_strict_pos(hp, hp.sub(a[i:i + 1], a)))

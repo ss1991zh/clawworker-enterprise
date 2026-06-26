@@ -102,15 +102,16 @@
 
 ## 密态分组聚合 · groupby(明文维度键 × 密文度量)
 
-对拍实测 5/5 通过。维度键取自明文身份列;**sum/mean/count 精确**(组大小明文 → 均值=和×1/n),max/min 近似。
+对拍实测 6/6 通过。维度键取自明文身份列;**sum/mean/count 精确**(组大小明文 → 均值=和×1/n),max/min 近似。
 
 | 聚合 | 状态 | 实测max误差 | 沙箱用法 |
 |---|---|---|---|
-| `sum` | ✅ | 1.1e-13 | `groupby.sum(cdf[度量], keys)` |
-| `mean` | ✅ | 1.4e-14 | `groupby.mean(cdf[度量], keys)` |
+| `sum` | ✅ | 2.3e-13 | `groupby.sum(cdf[度量], keys)` |
+| `mean` | ✅ | 7.1e-15 | `groupby.mean(cdf[度量], keys)` |
 | `count` | ✅ | 0.0e+00 | `groupby.count(keys)` |
-| `max` | ✅ | 8.5e-14 | `groupby.max(cdf[度量], keys)` |
-| `min` | ✅ | 1.3e-15 | `groupby.min(cdf[度量], keys)` |
+| `max` | ✅ | 5.7e-14 | `groupby.max(cdf[度量], keys)` |
+| `min` | ✅ | 3.6e-15 | `groupby.min(cdf[度量], keys)` |
+| `pivot` | ✅ | 5.7e-14 | `` |
 
 ## 窗口/时序 + 多条件 · window / synth(对拍实测)
 

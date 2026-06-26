@@ -102,6 +102,7 @@ def capability_brief() -> str:
          if ml else "- 模型级 helearn:LinearRegression 等(密文训练+预测)。"),
         (f"- 数值护栏:纯乘法链可用深度 ≈ {depth}(超过精度才显著退化)。" if depth else ""),
         _domain_line(),
+        _scale_line(),
     ]
     return "\n".join(x for x in lines if x)
 
@@ -117,6 +118,16 @@ def _domain_line() -> str:
             spans.append(f"{op}∈[{min(r[0] for r in rr):g},{max(r[1] for r in rr):g}]")
     return ("- 近似算子有效域(实测在宽域均可靠,无需特殊处理;极端量级再归一化):"
             + "; ".join(spans)) if spans else ""
+
+
+def _scale_line() -> str:
+    rep = _load_report("parity_scale_report.json")
+    tier = rep.get("tier") or {}
+    mx = tier.get("max_smooth_n")
+    if not mx:
+        return ""
+    return (f"- 规模:向量化聚合(sum/mean/groupby/sumif/window)实测平稳到 {mx} 行(百万级仍 1~2 秒、内存平);"
+            "但排名/topk/sort/中位数大表(>2000 行)必须 decrypt-first(授权后 pandas),勿用密态 topk/sort。")
 
 
 # ---------------- 计划模型 ----------------

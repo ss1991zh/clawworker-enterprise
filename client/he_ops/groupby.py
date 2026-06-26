@@ -99,3 +99,28 @@ def groupby_agg(hp, cipher_measure, keys: Sequence, agg: str = "sum") -> dict:
     if agg not in _AGG:
         raise ValueError(f"未知聚合 {agg!r};支持 sum/mean/count/max/min")
     return _AGG[agg](hp, cipher_measure, keys)
+
+
+# ---------- 多维透视 / 层级下钻(复合键)----------
+_SEP = "\x1f"   # 维度值拼接分隔符(单元分隔符,业务文本几乎不会含)
+
+
+def _compound(key_lists: Sequence[Sequence]) -> list[str]:
+    """把多列明文维度键按行拼成复合字符串键(numpy 对元组键不友好,故用字符串)。"""
+    return [_SEP.join(map(str, row)) for row in zip(*key_lists)]
+
+
+def pivot_agg(hp, cipher_measure, key_lists: Sequence[Sequence], agg: str = "sum") -> dict:
+    """多维透视:key_lists=[大区列, 品类列, ...](明文)。
+    返回 {(大区, 品类, ...): 密文标量/计数}。沿用 group-by 掩码法 → 同样精确、同样可扩展到百万级。"""
+    res = groupby_agg(hp, cipher_measure, _compound(key_lists), agg)
+    return {tuple(k.split(_SEP)): v for k, v in res.items()}
+
+
+def drilldown_agg(hp, cipher_measure, key_lists: Sequence[Sequence], agg: str = "sum") -> list[dict]:
+    """层级下钻:对 [大区, 城市, 门店] 逐层加深,返回每一层的透视结果列表
+    [按大区, 按大区×城市, 按大区×城市×门店]。每层一个 {维度元组: 值}。"""
+    out = []
+    for depth in range(1, len(key_lists) + 1):
+        out.append(pivot_agg(hp, cipher_measure, key_lists[:depth], agg))
+    return out

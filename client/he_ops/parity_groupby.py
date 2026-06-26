@@ -69,8 +69,36 @@ def run_agg(agg: str, tol: float, n: int = 24) -> GbResult:
                         f"{type(e).__name__}: {e}")
 
 
+def run_pivot(n: int = 30) -> GbResult:
+    """多维透视(大区×品类)对拍 pandas.groupby(两键).sum()。"""
+    import numpy as np
+    import pandas as pd
+    import crypto_toolkit as ct
+    import henumpy as hp
+    from client.tools.runtime import Runtime
+
+    t0 = time.time()
+    try:
+        Runtime.get().ensure_all_initialized()
+        np.random.seed(777)
+        region = np.random.choice(["华东", "华北", "华南"], n)
+        cat = np.random.choice(["甲", "乙"], n)
+        measure = np.round(np.random.uniform(1, 100, n), 2)
+        ref = pd.Series(measure).groupby([region, cat]).sum().to_dict()  # {(大区,品类): 和}
+        got = gb.pivot_agg(hp, ct.encrypt(measure), [list(region), list(cat)], "sum")
+        gs = sorted(ref.keys())
+        if sorted(got.keys()) != gs:
+            return GbResult("pivot", False, float("inf"), len(gs), round(time.time() - t0, 2),
+                            "透视格集不一致")
+        err = max(abs(float(np.ravel(ct.decrypt(got[g]))[0]) - float(ref[g])) for g in gs)
+        return GbResult("pivot", err <= 1e-2, err, len(gs), round(time.time() - t0, 2))
+    except Exception as e:  # noqa: BLE001
+        return GbResult("pivot", False, float("nan"), 0, round(time.time() - t0, 2),
+                        f"{type(e).__name__}: {e}")
+
+
 def run_all():
-    return [run_agg(a, t) for a, t in AGGS]
+    return [run_agg(a, t) for a, t in AGGS] + [run_pivot()]
 
 
 REPORT = Path(__file__).resolve().parent / "parity_groupby_report.json"

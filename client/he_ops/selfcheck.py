@@ -90,6 +90,18 @@ def _check_domain() -> tuple[bool, str]:
     return ok, f"近似算子 {ok_n}/{total} 区间可靠" + ("" if ok else " · ⚠ 有区间超差")
 
 
+def _check_scale() -> tuple[bool, str]:
+    from client.he_ops import parity_scale
+    r = parity_scale.run_size(200_000)
+    ok = r.correct and r.t_groupby < 3.0 and not r.error
+    msg = f"20万行 group-by {r.t_groupby:.2f}s · 内存 {r.peak_rss_mb:.0f}MB · 正确{'✓' if r.correct else '✗'}"
+    if r.error:
+        msg += f" · ⚠ {r.error}"
+    elif not ok:
+        msg += " · ⚠ 慢于 3s 或不精确"
+    return ok, msg
+
+
 def _check_planner() -> tuple[bool, str]:
     from client.he_ops.planner import Plan, Step, validate_plan
     good = Plan([Step("s1", "回款率", ops=["div"]),
@@ -112,6 +124,7 @@ def main() -> int:
         ("模型级 (helearn)", _check_model),
         ("深度护栏 (depth)", _check_depth),
         ("有效域 (domain)", _check_domain),
+        ("规模 (scale 20万行)", _check_scale),
         ("规划器 (planner)", _check_planner),
     ]
     all_ok = True

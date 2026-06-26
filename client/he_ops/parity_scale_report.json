@@ -1,0 +1,48 @@
+{
+  "results": [
+    {
+      "n": 50000,
+      "t_encrypt": 0.005,
+      "t_sum": 0.007,
+      "t_groupby": 0.083,
+      "t_sumif": 0.116,
+      "t_rolling": 0.085,
+      "t_decrypt": 0.006,
+      "peak_rss_mb": 840.0,
+      "correct": true,
+      "max_rel_err": 5.709157221809352e-15,
+      "error": ""
+    },
+    {
+      "n": 200000,
+      "t_encrypt": 0.034,
+      "t_sum": 0.09,
+      "t_groupby": 0.416,
+      "t_sumif": 0.173,
+      "t_rolling": 0.153,
+      "t_decrypt": 0.02,
+      "peak_rss_mb": 840.0,
+      "correct": true,
+      "max_rel_err": 1.2046584507462071e-14,
+      "error": ""
+    },
+    {
+      "n": 1000000,
+      "t_encrypt": 0.121,
+      "t_sum": 0.107,
+      "t_groupby": 1.891,
+      "t_sumif": 0.734,
+      "t_rolling": 0.564,
+      "t_decrypt": 0.09,
+      "peak_rss_mb": 840.0,
+      "correct": true,
+      "max_rel_err": 1.878791968437711e-14,
+      "error": ""
+    }
+  ],
+  "tier": {
+    "max_smooth_n": 1000000,
+    "groupby_secs_at_max": 1.891,
+    "note": "超过此规模或做排名/topk,自动走授权解密(decrypt-first)。"
+  }
+}

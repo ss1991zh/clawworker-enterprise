@@ -2,15 +2,15 @@
   "sum": {
     "agg": "sum",
     "passed": true,
-    "max_abs_err": 1.1368683772161603e-13,
+    "max_abs_err": 2.2737367544323206e-13,
     "groups": 4,
-    "secs": 0.24,
+    "secs": 0.47,
     "error": ""
   },
   "mean": {
     "agg": "mean",
     "passed": true,
-    "max_abs_err": 1.4210854715202004e-14,
+    "max_abs_err": 7.105427357601002e-15,
     "groups": 4,
     "secs": 0.0,
     "error": ""
@@ -26,7 +26,7 @@
   "max": {
     "agg": "max",
     "passed": true,
-    "max_abs_err": 8.526512829121202e-14,
+    "max_abs_err": 5.684341886080802e-14,
     "groups": 4,
     "secs": 0.0,
     "error": ""
@@ -34,8 +34,16 @@
   "min": {
     "agg": "min",
     "passed": true,
-    "max_abs_err": 1.3322676295501878e-15,
+    "max_abs_err": 3.552713678800501e-15,
     "groups": 4,
+    "secs": 0.0,
+    "error": ""
+  },
+  "pivot": {
+    "agg": "pivot",
+    "passed": true,
+    "max_abs_err": 5.684341886080802e-14,
+    "groups": 6,
     "secs": 0.0,
     "error": ""
   }

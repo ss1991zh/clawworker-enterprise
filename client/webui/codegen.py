@@ -25,6 +25,9 @@ from client.he_ops import synth as _synth_mod
 from client.he_ops import groupby as _groupby_mod
 from client.he_ops import window as _window_mod
 
+# 输出规模护栏:单表超过此行数即截断 + 说明(百万级应聚合,非倒原始明细)
+_OUTPUT_ROW_LIMIT = 50_000
+
 
 def _to_ca(x):
     """pandaseal CipherSeries → henumpy CipherArray(其余原样)。
@@ -79,6 +82,14 @@ class _BoundGroupby:
         if agg == "count":
             return _groupby_mod.groupby_count(keys)
         return _groupby_mod.groupby_agg(self._hp, _to_ca(measure), keys, agg)
+
+    def pivot(self, measure, key_lists, agg="sum"):
+        """多维透视:key_lists=[大区列, 品类列, ...] → {(大区,品类): 密文标量}。"""
+        return _groupby_mod.pivot_agg(self._hp, _to_ca(measure), key_lists, agg)
+
+    def drilldown(self, measure, key_lists, agg="sum"):
+        """层级下钻:逐层加深 → [按大区, 按大区×城市, ...] 列表。"""
+        return _groupby_mod.drilldown_agg(self._hp, _to_ca(measure), key_lists, agg)
 
 
 # ---------------------------------------------------------------------------
@@ -144,11 +155,21 @@ hp.initDict() / ct.initSK()(已初始化):
         synth.sumif_or / countif_and / countif_or 同理;synth.band/bor/bnot 组合任意掩码。
       · 排名/top-k(比较和,替代近似 sort;n=行数):synth.topk_sum(col, k, n) / topk_mean / bottomk_sum
         —— 隐私友好:只出"最大/最小 k 个之和",不暴露是哪几个、不暴露顺序。要逐行排名用 synth.rank(col, n)。
+        ⚠ 密态 top-k/rank 是 O(n²),**仅适合 ≤2000 行**;大表(上万/百万)做排名/TOP-N 必须
+          **decrypt-first**:`df = ct.decrypt_df(cdf)` 后用 pandas `df.nlargest(N, 列)`(明文、精确、毫秒)。
+
+═══════════ 大数据量(上万~百万行)平稳法则 ═══════════
+- 向量化密态聚合(sum/mean/groupby/sumif/window)实测百万行仍 1~2 秒、内存平稳,可放心在密文上做。
+- **排名/TOP-N/中位数/分位数/排序**:大表一律 decrypt-first(授权后 pandas),别用密态 sort/topk(很慢)。
+- **产出必须是聚合结果**(分组汇总 / TOP-N / 指标),**绝不要把百万原始明细行倒进结果表**——
+  Excel 行上限约 104.8 万,且没人看百万行;超 5 万行会被自动截断并提示。
   密态分组聚合 `groupby`(明文维度键 × 密文度量,sum/mean/count 精确、max/min 近似):
       keys = [r["大区"] for r in metadata_rows]                       # 维度键取自明文身份列
       g = groupby.sum(cdf["销售额"], keys)   # → {大区: 密文标量}
       合计 = {k: float(ct.decrypt(v)) for k, v in g.items()}          # 标量密文解密:用 float(ct.decrypt(v)),勿写 [0]
       groupby.mean / groupby.count(keys) / groupby.max / groupby.min / groupby.agg(col, keys, "sum")
+      多维透视(大区×品类):groupby.pivot(cdf["销售额"], [大区keys, 品类keys]) → {(大区,品类): 密文标量}
+      层级下钻:groupby.drilldown(cdf["销售额"], [大区keys, 城市keys, 门店keys]) → [按大区, 按大区×城市, ...]
   窗口/时序 `window`(diff/lag/rolling 精确,pct_change 近似):
       window.diff(col, 1)  环比差额  · window.rolling_mean(col, 3)  移动平均
       window.pct_change(col, 1)  变化率(近似)  · window.lag(col, 1)  上一期
@@ -623,6 +644,17 @@ def run_generated_code(
         df = r.get("df")
         if df is None:
             continue
+        # 输出规模护栏:百万级分析应产出聚合结果(小)。若生成代码误把超大原始表倒出来,
+        # 截断到上限 + 加说明,避免生成几十 MB、Excel 还打不开的文件(Excel 行上限 ~104.8 万)。
+        trunc_note = None
+        try:
+            nrow = len(df)
+            if nrow > _OUTPUT_ROW_LIMIT:
+                trunc_note = (f"⚠ 结果有 {nrow} 行,已截断显示前 {_OUTPUT_ROW_LIMIT} 行。"
+                              f"百万级数据建议改为聚合/TOP-N 分析,而非导出原始明细。")
+                df = df.head(_OUTPUT_ROW_LIMIT)
+        except (TypeError, AttributeError):
+            pass
         item = {
             "sheet_name": r.get("sheet_name") or "结果",
             "df": df,
@@ -632,5 +664,7 @@ def run_generated_code(
             v = r.get(k)
             if v:
                 item[k] = v
+        if trunc_note:
+            item["note"] = (str(item["note"]) + " " + trunc_note) if item.get("note") else trunc_note
         cleaned.append(item)
     return cleaned
