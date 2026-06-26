@@ -95,6 +95,60 @@ def sum_masked(hp, a, mask):
     return hp.sum(hp.mul(a, mask))
 
 
+# ---------- 多条件:掩码布尔代数(掩码 ∈ {0,1}) ----------
+def band(hp, m1, m2):
+    """逻辑与 AND = m1·m2。"""
+    return hp.mul(m1, m2)
+
+
+def bor(hp, m1, m2):
+    """逻辑或 OR = m1 + m2 − m1·m2。"""
+    return hp.sub(hp.add(m1, m2), hp.mul(m1, m2))
+
+
+def bnot(hp, m):
+    """逻辑非 NOT = 1 − m。"""
+    return hp.add(hp.negative(m), 1.0)
+
+
+def _reduce(hp, masks, op):
+    acc = masks[0]
+    for m in masks[1:]:
+        acc = op(hp, acc, m)
+    return acc
+
+
+def all_of(hp, masks):
+    """多个条件同时成立(AND 链)。"""
+    return _reduce(hp, masks, band)
+
+
+def any_of(hp, masks):
+    """任一条件成立(OR 链)。"""
+    return _reduce(hp, masks, bor)
+
+
+def sumif_and(hp, a, masks):
+    """多条件同时成立时求和:sum(a where 所有条件成立)。
+    例:回款额>50万 且 区域掩码=华东 → sumif_and(hp, 回款, [gt_thr掩码, 区域掩码])。"""
+    return hp.sum(hp.mul(a, all_of(hp, masks)))
+
+
+def sumif_or(hp, a, masks):
+    """任一条件成立时求和:sum(a where 任一条件成立)。"""
+    return hp.sum(hp.mul(a, any_of(hp, masks)))
+
+
+def countif_and(hp, masks):
+    """多条件同时成立的计数。"""
+    return hp.sum(all_of(hp, masks))
+
+
+def countif_or(hp, masks):
+    """任一条件成立的计数。"""
+    return hp.sum(any_of(hp, masks))
+
+
 # ---------- 分箱(替代不可靠的 digitize)----------
 def bin_index(hp, a, edges: list[float]):
     """分箱序号(0..len(edges)),对齐 np.digitize(a, edges, right=False):

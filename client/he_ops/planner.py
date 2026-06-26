@@ -65,6 +65,15 @@ def auth_decrypt_ids() -> set[str]:
     return {op.id for op in REGISTRY if op.needs_auth_decrypt}
 
 
+def _passed_ids(report: str) -> list[str]:
+    return sorted(k for k, v in _load_report(report).items() if v.get("passed"))
+
+
+def _ml_ok() -> list[str]:
+    rep = _load_report("parity_ml_report.json")
+    return sorted(k for k, v in rep.items() if v.get("passed"))
+
+
 def capability_brief() -> str:
     """供注入 LLM 提示的紧凑能力摘要(从实测自动生成)。"""
     rel = reliable_ids()
@@ -72,17 +81,26 @@ def capability_brief() -> str:
     auth = sorted(auth_decrypt_ids() & rel)
     arr = sorted(o.id for o in REGISTRY if o.id in rel and o.impl == "native")
     syn = sorted(SYNTH_OPS & rel)
+    gb = _passed_ids("parity_groupby_report.json")
+    _WINDOW = {"diff", "diff2", "lag", "rolling_sum", "rolling_mean", "pct_change"}
+    win = [x for x in _passed_ids("parity_advanced_report.json") if x in _WINDOW]
+    ml = _ml_ok()
+    depth = _load_report("parity_depth_report.json").get("usable_depth")
     lines = [
         "密态算子可靠性(对拍实测,务必遵守):",
         f"- 数组级 henumpy 可靠:{', '.join(arr)}",
-        f"- 合成可靠(比较/条件/分箱):{', '.join(syn)}",
+        f"- 合成可靠(比较/条件/分箱/多条件):{', '.join(syn)} + 布尔代数 band/bor/bnot/sumif_and/sumif_or",
         (f"- ⚠ 当前构建坏掉、禁用:{', '.join(sorted(broken))} → "
          f"改用 {', '.join(f'{k}→{v}' for k, v in BROKEN_REPLACEMENT.items() if k in broken)}"),
         "- 表级 pandaseal(CipherDataFrame)直接可用:列加减乘除、sum/mean/var/std/quantile、sort_values、.gt 等(实测可靠)。",
+        (f"- 密态分组聚合 groupby(明文键×密文度量):{', '.join(gb)}(sum/mean/count 精确,max/min 近似)。" if gb else ""),
+        (f"- 窗口/时序 window:{', '.join(win)}(diff/lag/rolling 精确,pct_change 近似)。" if win else ""),
         f"- 需授权解密(会触发用户授权,规划时标出):{', '.join(auth)}",
-        "- 模型级 helearn:LinearRegression 等(密文训练+预测)。",
+        (f"- 模型级 helearn(对拍达标):{', '.join(ml)}。⚠ GBDT/XGBoost 当前构建训练报错,勿用。"
+         if ml else "- 模型级 helearn:LinearRegression 等(密文训练+预测)。"),
+        (f"- 数值护栏:纯乘法链可用深度 ≈ {depth}(超过精度才显著退化)。" if depth else ""),
     ]
-    return "\n".join(lines)
+    return "\n".join(x for x in lines if x)
 
 
 # ---------------- 计划模型 ----------------

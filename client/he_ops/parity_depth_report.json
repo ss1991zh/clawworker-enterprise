@@ -1,0 +1,36 @@
+{
+  "budget": 0.001,
+  "usable_depth": 32,
+  "profile": [
+    {
+      "depth": 1,
+      "max_rel_err": 1.1258726545230266e-16,
+      "within_budget": true
+    },
+    {
+      "depth": 2,
+      "max_rel_err": 3.618857830486451e-16,
+      "within_budget": true
+    },
+    {
+      "depth": 4,
+      "max_rel_err": 5.033105564971841e-16,
+      "within_budget": true
+    },
+    {
+      "depth": 8,
+      "max_rel_err": 3.570283949444952e-16,
+      "within_budget": true
+    },
+    {
+      "depth": 16,
+      "max_rel_err": 1.7631666509244634e-15,
+      "within_budget": true
+    },
+    {
+      "depth": 32,
+      "max_rel_err": 9.942758850644588e-16,
+      "within_budget": true
+    }
+  ]
+}

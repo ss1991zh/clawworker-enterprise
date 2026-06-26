@@ -21,6 +21,9 @@ import sys
 
 # 当前构建实测已知坏掉、且已有 synth 替代,不计为回归
 KNOWN_BROKEN = {"greater", "greater_equal", "less", "digitize"}
+# 当前构建训练内部报错的树模型(非回归),Linear/Logistic 才是达标项
+KNOWN_BROKEN_MODELS = {"GradientBoostingRegressor", "GradientBoostingClassifier",
+                       "XGBRegressor", "XGBClassfier"}
 
 
 def _check_array() -> tuple[bool, str]:
@@ -43,24 +46,39 @@ def _check_table() -> tuple[bool, str]:
     return ok, f"{sum(r.passed for r in res)}/{len(res)} 通过" + (f" · ⚠ 失败:{', '.join(fails)}" if fails else "")
 
 
+def _check_groupby() -> tuple[bool, str]:
+    from client.he_ops import parity_groupby
+    res = parity_groupby.run_all()
+    fails = [r.agg for r in res if not r.passed]
+    return not fails, f"{sum(r.passed for r in res)}/{len(res)} 通过" + (f" · ⚠ {', '.join(fails)}" if fails else "")
+
+
+def _check_advanced() -> tuple[bool, str]:
+    from client.he_ops import parity_advanced
+    res = parity_advanced.run_all()
+    fails = [r.op_id for r in res if not r.passed]
+    return not fails, f"{sum(r.passed for r in res)}/{len(res)} 通过" + (f" · ⚠ {', '.join(fails)}" if fails else "")
+
+
 def _check_model() -> tuple[bool, str]:
-    try:
-        import numpy as np
-        import crypto_toolkit as ct
-        import henumpy as hp
-        import helearn as hl
-        from client.tools.runtime import Runtime
-        Runtime.get().ensure_all_initialized()
-        d = hl.datasets.load_diabetes()
-        w = hp.ones_array(len(d.feature_names) + 1)
-        m = hl.LinearRegression()
-        m.set_params(iterations=10, w=w, learningrate=0.1)
-        m.fit(d.train_data, d.train_target)
-        out = np.ravel(ct.decrypt(m.predict(d.test_data)))
-        ok = bool(out.size) and bool(np.all(np.isfinite(out)))
-        return ok, f"LinearRegression 预测 {out.size} 条" + ("" if ok else " · ⚠ 含非有限值")
-    except Exception as e:  # noqa: BLE001
-        return False, f"⚠ {type(e).__name__}: {e}"
+    from client.he_ops import parity_ml
+    res = parity_ml.run_all()
+    fails = [r.model for r in res if not r.passed]
+    new_fails = [f for f in fails if f not in KNOWN_BROKEN_MODELS]
+    ok = not new_fails
+    passed = [r.model for r in res if r.passed]
+    msg = f"达标 {', '.join(passed) or '无'}(树模型已知缺陷:{len(KNOWN_BROKEN_MODELS)})"
+    if new_fails:
+        msg += f" · ⚠ 新增失败(回归):{', '.join(new_fails)}"
+    return ok, msg
+
+
+def _check_depth() -> tuple[bool, str]:
+    from client.he_ops import parity_depth
+    prof = parity_depth.run_all()
+    d = parity_depth.usable_depth(prof)
+    ok = d >= 8
+    return ok, f"可用乘法深度 ≈ {d}" + ("" if ok else " · ⚠ 低于 8")
 
 
 def _check_planner() -> tuple[bool, str]:
@@ -80,7 +98,10 @@ def main() -> int:
     suites = [
         ("数组级 (henumpy+synth)", _check_array),
         ("表级   (pandaseal)", _check_table),
+        ("分组   (groupby)", _check_groupby),
+        ("窗口+多条件 (advanced)", _check_advanced),
         ("模型级 (helearn)", _check_model),
+        ("深度护栏 (depth)", _check_depth),
         ("规划器 (planner)", _check_planner),
     ]
     all_ok = True

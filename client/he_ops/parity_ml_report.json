@@ -1,0 +1,62 @@
+{
+  "LinearRegression": {
+    "model": "LinearRegression",
+    "task": "regression",
+    "passed": true,
+    "he_score": 0.6865,
+    "sk_score": 0.6951,
+    "secs": 1.86,
+    "note": "线性回归(梯度下降,密文训练)。",
+    "error": ""
+  },
+  "LogisticRegression": {
+    "model": "LogisticRegression",
+    "task": "classification",
+    "passed": true,
+    "he_score": 0.92,
+    "sk_score": 0.92,
+    "secs": 1.56,
+    "note": "逻辑回归(predict 返回 logit,标签=logit>0;特征须标准化)。",
+    "error": ""
+  },
+  "GradientBoostingRegressor": {
+    "model": "GradientBoostingRegressor",
+    "task": "regression",
+    "passed": false,
+    "he_score": NaN,
+    "sk_score": NaN,
+    "secs": 0.01,
+    "note": "GBDT 回归(当前 build 训练报错)。",
+    "error": "TypeError: 'tuple' object does not support item assignment"
+  },
+  "GradientBoostingClassifier": {
+    "model": "GradientBoostingClassifier",
+    "task": "classification",
+    "passed": false,
+    "he_score": NaN,
+    "sk_score": NaN,
+    "secs": 0.05,
+    "note": "GBDT 分类(当前 build 训练报错)。",
+    "error": "TypeError: 'tuple' object does not support item assignment"
+  },
+  "XGBRegressor": {
+    "model": "XGBRegressor",
+    "task": "regression",
+    "passed": false,
+    "he_score": NaN,
+    "sk_score": NaN,
+    "secs": 0.01,
+    "note": "XGBoost 回归(当前 build 训练报错)。",
+    "error": "TypeError: 'tuple' object does not support item assignment"
+  },
+  "XGBClassfier": {
+    "model": "XGBClassfier",
+    "task": "classification",
+    "passed": false,
+    "he_score": NaN,
+    "sk_score": NaN,
+    "secs": 0.05,
+    "note": "XGBoost 分类(当前 build 训练报错)。",
+    "error": "TypeError: 'tuple' object does not support item assignment"
+  }
+}

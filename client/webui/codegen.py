@@ -22,19 +22,63 @@ import re
 from typing import Any, Callable, Optional
 
 from client.he_ops import synth as _synth_mod
+from client.he_ops import groupby as _groupby_mod
+from client.he_ops import window as _window_mod
 
 
-class _BoundSynth:
-    """把 synth.* 的第一个 hp 参数预绑定,生成代码里直接 `synth.sumif_gt(col, 阈值)`。
-    用于补足当前 henumpy 构建里坏掉的比较/条件/分箱(greater/less/digitize)。"""
+def _to_ca(x):
+    """pandaseal CipherSeries → henumpy CipherArray(其余原样)。
+    让生成代码能直接把 `cdf[列]` 喂给 synth/groupby/window。"""
+    return x.to_cipherarray() if type(x).__name__ == "CipherSeries" else x
+
+
+class _BoundHp:
+    """把模块函数的第一个 hp 参数预绑定,并把 CipherSeries 实参自动转 CipherArray,
+    生成代码里直接 `synth.sumif_gt(cdf[列], 阈值)` / `window.rolling_mean(cdf[列], 3)`。"""
+
+    def __init__(self, hp, mod):
+        self._hp = hp
+        self._mod = mod
+
+    def __getattr__(self, name):
+        fn = getattr(self._mod, name)
+        hp = self._hp
+        return lambda *a, **k: fn(hp, *[_to_ca(x) for x in a],
+                                  **{kk: _to_ca(vv) for kk, vv in k.items()})
+
+
+# 兼容旧名:synth 绑定
+def _BoundSynth(hp):
+    return _BoundHp(hp, _synth_mod)
+
+
+class _BoundGroupby:
+    """密态分组聚合(明文键 × 密文度量):
+      groupby.sum(cdf[度量], keys) / .mean / .count(keys) / .max / .min / .agg(度量, keys, "sum")
+    keys 取自明文身份列(metadata_rows 的某列)。sum/mean/count 精确,max/min 近似。"""
 
     def __init__(self, hp):
         self._hp = hp
 
-    def __getattr__(self, name):
-        fn = getattr(_synth_mod, name)
-        hp = self._hp
-        return lambda *a, **k: fn(hp, *a, **k)
+    def sum(self, measure, keys):
+        return _groupby_mod.groupby_sum(self._hp, _to_ca(measure), keys)
+
+    def mean(self, measure, keys):
+        return _groupby_mod.groupby_mean(self._hp, _to_ca(measure), keys)
+
+    def count(self, keys):
+        return _groupby_mod.groupby_count(keys)
+
+    def max(self, measure, keys):
+        return _groupby_mod.groupby_max(self._hp, _to_ca(measure), keys)
+
+    def min(self, measure, keys):
+        return _groupby_mod.groupby_min(self._hp, _to_ca(measure), keys)
+
+    def agg(self, measure, keys, agg="sum"):
+        if agg == "count":
+            return _groupby_mod.groupby_count(keys)
+        return _groupby_mod.groupby_agg(self._hp, _to_ca(measure), keys, agg)
 
 
 # ---------------------------------------------------------------------------
@@ -89,11 +133,25 @@ hp.initDict() / ct.initSK()(已初始化):
 只有需要"保留密文、不解密就出结果"时,才在密文上用 henumpy(hp)算子:
   实测可靠:sum/mean/var/std/median/percentile/max/min/div/sort/sqrt/exp/log 等,直接 hp.xxx(密文)。
   ⚠ 当前构建里 `hp.greater / greater_equal / less / digitize` **不可靠,禁止使用**。
-    要"比较 / 条件求和 / 分箱"时,改用已就绪的 `synth` 工具(无需 import;阈值用明文数字即可):
+    要"比较 / 条件求和 / 分箱"时,改用已就绪的 `synth` 工具(无需 import;阈值用明文数字;
+    可直接把 `cdf[列]` 当密文列传,会自动转 CipherArray):
       · synth.gt(a, b) / synth.lt(a, b)          两个密文逐元素比较 → 1/0 掩码
       · synth.sumif_gt(col, 阈值)                 条件求和(col 中 > 阈值 的元素之和,SUMIF)
       · synth.countif_gt(col, 阈值)               条件计数(COUNTIF)
       · synth.bin_index(col, [阈值1, 阈值2, ...])  分箱序号(替代 digitize;RFM/ABC 分级用)
+      · 多条件(AND/OR):mask 用布尔代数组合再聚合 ——
+        synth.sumif_and(col, [synth.gt_threshold(col,a), synth.lt_threshold(col,b)])  # a<col<b 求和
+        synth.sumif_or / countif_and / countif_or 同理;synth.band/bor/bnot 组合任意掩码。
+  密态分组聚合 `groupby`(明文维度键 × 密文度量,sum/mean/count 精确、max/min 近似):
+      keys = [r["大区"] for r in metadata_rows]                       # 维度键取自明文身份列
+      g = groupby.sum(cdf["销售额"], keys)   # → {大区: 密文标量}
+      合计 = {k: float(ct.decrypt(v)) for k, v in g.items()}          # 标量密文解密:用 float(ct.decrypt(v)),勿写 [0]
+      groupby.mean / groupby.count(keys) / groupby.max / groupby.min / groupby.agg(col, keys, "sum")
+  窗口/时序 `window`(diff/lag/rolling 精确,pct_change 近似):
+      window.diff(col, 1)  环比差额  · window.rolling_mean(col, 3)  移动平均
+      window.pct_change(col, 1)  变化率(近似)  · window.lag(col, 1)  上一期
+  密态模型 `hl`(对拍达标、可用):LinearRegression(回归)、LogisticRegression(分类,
+    predict 返回 logit,取标签用 `logit>0`,特征须已标准化)。⚠ GBDT/XGBoost 当前构建训练报错,勿用。
 
 ═══════════ 第 0 步:意图补全(先想清楚"要呈现什么",再写代码) ═══════════
 用户的话经常只说"算什么",省略"怎么呈现"。你必须先从【问题 + schema】推断**完整意图**,
@@ -541,7 +599,9 @@ def run_generated_code(
         "metadata_columns": metadata_columns,
         "ps": ps, "ct": ct_gate, "hp": hp, "hl": hl,
         "pd": pd, "np": np,
-        "synth": _BoundSynth(hp),   # 可靠的比较/条件求和/分箱(补 henumpy 构建缺陷)
+        "synth": _BoundHp(hp, _synth_mod),       # 比较/条件求和/分箱/多条件布尔(补构建缺陷)
+        "groupby": _BoundGroupby(hp),            # 密态分组聚合(明文键×密文度量)
+        "window": _BoundHp(hp, _window_mod),     # 窗口/时序(diff/lag/rolling/pct_change)
         "results": results,
     }
 
