@@ -114,27 +114,57 @@ def _check_planner() -> tuple[bool, str]:
     return ok, f"好计划{'过' if vg.ok else '未过'}/授权解密标注{'对' if 's3' in vg.auth_steps else '错'}、坏计划{'被拦' if not vb.ok else '漏拦'}"
 
 
+# 套件清单(quick=导入体检常用的快子集,跳过较慢的模型/深度/有效域)
+_SUITES = [
+    ("数组级 (henumpy+synth)", _check_array, True),
+    ("表级 (pandaseal)", _check_table, True),
+    ("分组 (groupby)", _check_groupby, True),
+    ("窗口+多条件 (advanced)", _check_advanced, True),
+    ("规模 (scale 20万行)", _check_scale, True),
+    ("模型级 (helearn)", _check_model, False),
+    ("深度护栏 (depth)", _check_depth, False),
+    ("有效域 (domain)", _check_domain, False),
+    ("规划器 (planner)", _check_planner, True),
+]
+
+
+def health_report(quick: bool = False) -> dict:
+    """结构化体检报告(供 /api/keycheck 导入体检 + CLI 共用)。
+    在**当前已加载的用户密钥**上跑对拍套件,返回每套件 ok/detail + 能力摘要 + 规模档位。
+    quick=True 跑快子集(跳过模型/深度/有效域),适合导入流程即时反馈。"""
+    suites = [(n, f) for n, f, q in _SUITES if (q or not quick)]
+    rows, all_ok = [], True
+    for name, fn in suites:
+        try:
+            ok, detail = fn()
+        except Exception as e:  # noqa: BLE001
+            ok, detail = False, f"{type(e).__name__}: {e}"
+        all_ok = all_ok and ok
+        rows.append({"name": name, "ok": ok, "detail": detail})
+
+    brief = scale = ""
+    try:
+        from client.he_ops.planner import capability_brief
+        brief = capability_brief()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        from client.he_ops import parity_scale
+        scale = parity_scale.scale_tier(parity_scale.run_all([200_000]))
+    except Exception:  # noqa: BLE001
+        scale = {}
+    return {"ok": all_ok, "quick": quick, "suites": rows,
+            "capability_brief": brief, "scale_tier": scale}
+
+
 def main() -> int:
     print("══════════ he_ops 自检 ══════════")
-    suites = [
-        ("数组级 (henumpy+synth)", _check_array),
-        ("表级   (pandaseal)", _check_table),
-        ("分组   (groupby)", _check_groupby),
-        ("窗口+多条件 (advanced)", _check_advanced),
-        ("模型级 (helearn)", _check_model),
-        ("深度护栏 (depth)", _check_depth),
-        ("有效域 (domain)", _check_domain),
-        ("规模 (scale 20万行)", _check_scale),
-        ("规划器 (planner)", _check_planner),
-    ]
-    all_ok = True
-    for name, fn in suites:
-        ok, msg = fn()
-        all_ok = all_ok and ok
-        print(f"  [{'通过' if ok else '失败'}] {name:24} · {msg}")
+    rep = health_report(quick="--quick" in sys.argv)
+    for r in rep["suites"]:
+        print(f"  [{'通过' if r['ok'] else '失败'}] {r['name']:24} · {r['detail']}")
     print("══════════════════════════════════")
-    print("总体:" + ("✅ 全部通过" if all_ok else "❌ 存在失败/回归"))
-    return 0 if all_ok else 1
+    print("总体:" + ("✅ 全部通过" if rep["ok"] else "❌ 存在失败/回归"))
+    return 0 if rep["ok"] else 1
 
 
 if __name__ == "__main__":

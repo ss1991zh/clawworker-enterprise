@@ -409,6 +409,30 @@ def api_keys_fetch_auth():
         tmp.unlink(missing_ok=True)
 
 
+@app.get("/api/keycheck")
+def api_keycheck(quick: bool = True):
+    """导入密钥体检:在**当前用户密钥**上跑 he_ops 对拍套件,返回能力清单 + 精度 + 规模档位。
+    用途:用户导入 SK/EVK+字典后一键验证「这套 key 能算什么、精度多少、哪些算子/模型不可用、
+    能平稳跑多大规模」;若密钥/字典不配套或损坏,初始化即报错,当场暴露(而非分析时才失败)。
+    同步端点 → FastAPI 自动跑在线程池,不阻塞事件循环。quick=True 跑快子集(秒级),
+    quick=False 跑全量(含模型体检/深度/有效域,约数十秒)。"""
+    if not _is_logged_in():
+        return _need_login()
+    keys = _keystore.get_paths(_session_state["username"])
+    if not (keys and keys.sk_path.exists()):
+        raise HTTPException(400, "尚未导入密钥(SK)。请先导入密钥与字典,再做体检。")
+    try:
+        from client.tools.runtime import Runtime
+        Runtime.get().ensure_all_initialized()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(400, f"密钥/字典初始化失败(可能不配套或损坏):{type(e).__name__}: {e}")
+    try:
+        from client.he_ops.selfcheck import health_report
+        return health_report(quick=quick)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"体检执行失败:{type(e).__name__}: {e}")
+
+
 # ----------------------------------------------------------------------------
 # /api/files
 # ----------------------------------------------------------------------------
