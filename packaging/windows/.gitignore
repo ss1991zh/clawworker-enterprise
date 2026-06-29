@@ -1,0 +1,4 @@
+# HE 库含自带密钥(skf)/证书(user_authorization)—— 绝不上传
+he_libs/
+# 编译产物(.exe 安装包)
+dist/
