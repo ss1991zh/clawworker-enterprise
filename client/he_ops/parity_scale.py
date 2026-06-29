@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import sys
 import time
-import resource
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 
@@ -25,9 +24,18 @@ REL_TOL = 1e-6   # 大数求和走相对误差
 
 
 def _peak_rss_mb() -> float:
-    # macOS: ru_maxrss 为字节;Linux: KB。统一粗略换算到 MB(用于趋势,不求精确)。
-    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return rss / 1e6 if sys.platform == "darwin" else rss / 1e3
+    """峰值常驻内存(MB,仅趋势用)。Unix 用 resource;Windows 无该模块 → 退化 psutil 或 0。"""
+    try:
+        import resource  # Unix-only
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return rss / 1e6 if sys.platform == "darwin" else rss / 1e3  # mac 字节 / linux KB
+    except ImportError:
+        try:
+            import os as _os
+            import psutil
+            return psutil.Process(_os.getpid()).memory_info().rss / 1e6
+        except Exception:  # noqa: BLE001
+            return 0.0
 
 
 @dataclass

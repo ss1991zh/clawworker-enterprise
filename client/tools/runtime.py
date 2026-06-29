@@ -18,16 +18,49 @@ from typing import Literal, Optional
 
 Backend = Literal["stub", "real"]
 
-# 真实包的默认密钥/字典路径(由 setup.py 决定)
-DEFAULT_SK_PATH = (
-    "/Users/davidzheng/Desktop/密态数据分析/crypto_toolkit-64_dev/crypto_toolkit/file/skf"
-)
-DEFAULT_DICT_DIR = (
-    "/Users/davidzheng/Desktop/密态数据分析/henumpy-dev/henumpy/file"
-)
-DEFAULT_USER_AUTH = (
-    "/Users/davidzheng/Desktop/密态数据分析/henumpy-dev/henumpy/file/user_authorization"
-)
+# 默认密钥/字典/授权文件解析(跨平台)。优先级:
+#   环境变量(AGENT_SK_PATH / AGENT_DICT_DIR / AGENT_USER_AUTH)
+#   > 已安装 HE 包内自带文件 <pkg>/file/...(随包走,Windows/Linux/Mac 通用)
+#   > 开发机回退路径(仅本机,别处不存在也无碍)。
+_FALLBACK_SK = "/Users/davidzheng/Desktop/密态数据分析/crypto_toolkit-64_dev/crypto_toolkit/file/skf"
+_FALLBACK_DICT_DIR = "/Users/davidzheng/Desktop/密态数据分析/henumpy-dev/henumpy/file"
+_FALLBACK_USER_AUTH = "/Users/davidzheng/Desktop/密态数据分析/henumpy-dev/henumpy/file/user_authorization"
+
+
+def _pkg_file_dir(module_name: str):
+    """已安装 HE 包内自带文件目录 <pkg>/file。失败返回 None。"""
+    try:
+        import importlib
+        m = importlib.import_module(module_name)
+        if getattr(m, "__file__", None):
+            return Path(m.__file__).resolve().parent / "file"
+    except Exception:  # noqa: BLE001
+        pass
+    return None
+
+
+def _resolve_sk_path() -> str:
+    env = os.environ.get("AGENT_SK_PATH")
+    if env:
+        return env
+    d = _pkg_file_dir("crypto_toolkit")
+    return str(d / "skf") if d else _FALLBACK_SK
+
+
+def _resolve_dict_dir() -> str:
+    env = os.environ.get("AGENT_DICT_DIR")
+    if env:
+        return env
+    d = _pkg_file_dir("henumpy")
+    return str(d) if d else _FALLBACK_DICT_DIR
+
+
+def _resolve_user_auth() -> str:
+    env = os.environ.get("AGENT_USER_AUTH")
+    if env:
+        return env
+    d = _pkg_file_dir("henumpy")
+    return str(d / "user_authorization") if d else _FALLBACK_USER_AUTH
 
 
 def get_backend_from_env() -> Backend:
@@ -141,11 +174,11 @@ class Runtime:
 
     def real_available(self) -> bool:
         """真实 backend 所需的所有密钥/字典文件是否都在位。"""
-        sk = self.config.sk_path or DEFAULT_SK_PATH
+        sk = self.config.sk_path or _resolve_sk_path()
         if not _file_exists(sk):
             return False
         # henumpy initDict 需要字典文件,默认目录下可能要一组文件 —— MVP 简化为检查目录非空
-        dict_dir = Path(self.config.dict_path or DEFAULT_DICT_DIR)
+        dict_dir = Path(self.config.dict_path or _resolve_dict_dir())
         if not dict_dir.is_dir():
             return False
         # 至少有一个非 file.md 的文件
@@ -159,7 +192,7 @@ class Runtime:
         """调用 ct.initSK(sk_path),只调一次。"""
         if self._sk_initialized:
             return
-        sk_path = self.config.sk_path or DEFAULT_SK_PATH
+        sk_path = self.config.sk_path or _resolve_sk_path()
         if not _file_exists(sk_path):
             raise RuntimeError(
                 f"真实 backend 需要 sk 密钥文件,但未找到: {sk_path}。"
@@ -196,7 +229,7 @@ class Runtime:
         if self._dict_initialized:
             return
         dict_path = self.config.dict_path
-        user_auth = self.config.user_auth_path or DEFAULT_USER_AUTH
+        user_auth = self.config.user_auth_path or _resolve_user_auth()
         if not _file_exists(user_auth):
             raise RuntimeError(
                 f"真实 backend 需要 user_authorization 文件,但未找到: {user_auth}。"
