@@ -32,7 +32,6 @@ Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
 PrivilegesRequired=lowest
-ArchitecturesInstallIn64BitMode=x64compatible
 SetupIconFile=clawworker.ico
 UninstallDisplayIcon={app}\packaging\windows\clawworker.ico
 

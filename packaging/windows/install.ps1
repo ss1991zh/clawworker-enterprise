@@ -36,19 +36,30 @@ $HeLibs  = Join-Path $Here "he_libs"
 Write-Host "==== Clawworker 安装 ($Role) ====" -ForegroundColor Cyan
 Write-Host "项目根: $Project"
 
-# ---- 1. 找系统 Python ----
-$sysPy = $null
-foreach ($c in @("py -3.11", "py -3", "python")) {
-    $exe = ($c -split " ")[0]
-    if (Get-Command $exe -ErrorAction SilentlyContinue) { $sysPy = $c; break }
+# ---- 1. 找系统 Python(真正验证可运行)----
+function Test-PyCmd($exe, $verArg) {
+    try {
+        if ($verArg) { & $exe $verArg --version *> $null } else { & $exe --version *> $null }
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
 }
-if (-not $sysPy) { throw "未找到 Python。请先安装 Python 3.11+ 并勾选 Add to PATH。" }
-Write-Host "系统 Python: $sysPy"
+$pyExe = $null; $pyArg = $null
+if (Get-Command py -ErrorAction SilentlyContinue) {
+    foreach ($v in @("-3.11", "-3.12", "-3.13", "-3")) {
+        if (Test-PyCmd "py" $v) { $pyExe = "py"; $pyArg = $v; break }
+    }
+}
+if (-not $pyExe -and (Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) {
+    $pyExe = "python"
+}
+if (-not $pyExe) { throw "未找到可用的 Python 3.11+。请先安装并勾选 Add to PATH。" }
+Write-Host "系统 Python: $pyExe $pyArg"
 
-# ---- 2. 建 venv ----
+# ---- 2. 建 venv(PS 自动处理含空格/中文的路径)----
 if (-not (Test-Path $Py)) {
     Write-Host "创建虚拟环境 .venv ..." -ForegroundColor Yellow
-    & cmd /c "$sysPy -m venv `"$Venv`""
+    if ($pyArg) { & $pyExe $pyArg -m venv $Venv } else { & $pyExe -m venv $Venv }
+    if (-not (Test-Path $Py)) { throw "创建 venv 失败:$Venv" }
 }
 & $Py -m pip install --upgrade pip --quiet
 
@@ -61,7 +72,7 @@ $libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev"
 if (Test-Path $HeLibs) {
     foreach ($l in $libs) {
         $d = Join-Path $HeLibs $l
-        if (Test-Path $d) { Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow; & $Py -m pip install $d --quiet }
+        if (Test-Path $d) { Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow; & $Py -m pip install -e $d --quiet }
         else { Write-Warning "缺少 HE 库目录: $d" }
     }
 } else {
