@@ -230,6 +230,7 @@ def login_submit(
         })
         _config["host_url"] = host_url
         _save_config(_config)
+    _bind_runtime_vault()   # 绑定该用户 vault → 引擎用其上传的密钥/字典/授权
     return RedirectResponse("/", status_code=303)
 
 
@@ -334,18 +335,36 @@ def api_ops_supervisor_stop():
     return {"ok": True, "msg": client_ops.stop_supervisor()}
 
 
+def _bind_runtime_vault() -> None:
+    """把当前登录用户的 vault 绑给 HE 引擎,使真实初始化直接用该用户
+    上传的 sk / 字典 与拉取的 user_authorization(上传即生效)。"""
+    try:
+        from client.tools import runtime as _rt
+        u = _session_state.get("username")
+        _rt.set_active_vault(_keystore.vault_path(u) if u else None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @app.get("/api/keys")
 def api_keys_get():
     if not _is_logged_in():
         return _need_login()
-    keys = _keystore.get_paths(_session_state["username"])
+    vault = _keystore.vault_path(_session_state["username"])
+
+    def _info(name: str):
+        p = vault / name
+        return p.exists(), (str(p) if p.exists() else "")
+
+    sk_present, sk_path = _info("sk.bin")
+    evk_present, evk_path = _info("evk.bin")
+    auth_present, auth_path = _info("user_authorization")
+    dict_present, dict_path = _info("dictf")
     return {
-        "sk_present": bool(keys and keys.sk_path.exists()),
-        "sk_path": str(keys.sk_path) if keys else "",
-        "evk_present": bool(keys and keys.evk_path.exists()),
-        "evk_path": str(keys.evk_path) if keys else "",
-        "user_auth_present": bool(keys and keys.user_auth_path and keys.user_auth_path.exists()),
-        "user_auth_path": str(keys.user_auth_path) if keys and keys.user_auth_path else "",
+        "sk_present": sk_present, "sk_path": sk_path,
+        "evk_present": evk_present, "evk_path": evk_path,
+        "user_auth_present": auth_present, "user_auth_path": auth_path,
+        "dict_present": dict_present, "dict_path": dict_path,
     }
 
 
@@ -360,6 +379,7 @@ async def api_keys_upload_sk(file: UploadFile = File(...)):
         t.write(data); tmp = Path(t.name)
     try:
         dst = _keystore.import_sk(username=_session_state["username"], source=tmp)
+        _bind_runtime_vault()
         return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
     finally:
         tmp.unlink(missing_ok=True)
@@ -376,6 +396,24 @@ async def api_keys_upload_evk(file: UploadFile = File(...)):
         t.write(data); tmp = Path(t.name)
     try:
         dst = _keystore.import_evk(username=_session_state["username"], source=tmp)
+        _bind_runtime_vault()
+        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@app.post("/api/keys/dict")
+async def api_keys_upload_dict(file: UploadFile = File(...)):
+    if not _is_logged_in():
+        return _need_login()
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "文件为空")
+    with tempfile.NamedTemporaryFile(delete=False) as t:
+        t.write(data); tmp = Path(t.name)
+    try:
+        dst = _keystore.import_dict(username=_session_state["username"], source=tmp)
+        _bind_runtime_vault()
         return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
     finally:
         tmp.unlink(missing_ok=True)
@@ -404,6 +442,7 @@ def api_keys_fetch_auth():
         t.write(r.content); tmp = Path(t.name)
     try:
         dst = _keystore.import_user_authorization(username=_session_state["username"], source=tmp)
+        _bind_runtime_vault()
         return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
     finally:
         tmp.unlink(missing_ok=True)
@@ -704,6 +743,7 @@ def _native_pick_folder() -> tuple[Optional[str], bool, str]:
             r = subprocess.run(
                 ["powershell", "-NoProfile", "-STA", "-Command", ps],
                 capture_output=True, text=True, timeout=300,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # 不闪 PS 控制台(对话框照常显示)
             )
             path = (r.stdout or "").strip()
             if not path:
@@ -760,7 +800,8 @@ def _native_pick_file() -> tuple[Optional[str], bool, str]:
                 "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }"
             )
             r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
-                               capture_output=True, text=True, timeout=300)
+                               capture_output=True, text=True, timeout=300,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # 不闪 PS 控制台
             path = (r.stdout or "").strip()
             return (path, False, "") if path else (None, True, "")
         for cmd in (["zenity", "--file-selection", f"--title={prompt}"],

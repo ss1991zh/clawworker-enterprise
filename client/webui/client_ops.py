@@ -62,6 +62,16 @@ def _systemd_unit_path() -> Path:
     return Path.home() / ".config" / "systemd" / "user" / f"{SYSTEMD_UNIT}.service"
 
 
+def _win_autostart_installed() -> bool:
+    import winreg  # noqa: PLC0415  Windows-only
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sm._WIN_RUN_SUBKEY) as k:
+            winreg.QueryValueEx(k, WIN_TASK_NAME)
+        return True
+    except OSError:
+        return False
+
+
 def autostart_status() -> dict:
     plat = sm.current_platform()
     if plat == "darwin":
@@ -73,9 +83,9 @@ def autostart_status() -> dict:
         return {"installed": p.exists(), "kind": "systemd", "path": str(p),
                 "detail": "systemd --user · Restart=on-failure"}
     if plat == "windows":
-        ok = sm._run(["schtasks", "/Query", "/TN", WIN_TASK_NAME]).returncode == 0
-        return {"installed": ok, "kind": "schtasks", "path": WIN_TASK_NAME,
-                "detail": "计划任务 · 登录时启动"}
+        return {"installed": _win_autostart_installed(), "kind": "registry-run",
+                "path": rf"HKCU\{sm._WIN_RUN_SUBKEY}\{WIN_TASK_NAME}",
+                "detail": "登录自启 · HKCU Run 键(免管理员)"}
     return {"installed": False, "kind": "unknown", "path": "", "detail": ""}
 
 
@@ -169,13 +179,17 @@ def install_autostart() -> str:
         sm._run(["loginctl", "enable-linger", os.environ.get("USER", "")])
         return f"已写入 {p.name} 并 systemctl --user enable --now"
     if plat == "windows":
-        tr = f'"{sm._py_exe()}" "{CLIENT_SUP_PY}"'
-        r = sm._run(["schtasks", "/Create", "/F", "/SC", "ONLOGON",
-                     "/TN", WIN_TASK_NAME, "/TR", tr, "/RL", "LIMITED"])
-        if r.returncode != 0:
-            raise RuntimeError(f"schtasks /Create 失败: {r.stderr.strip() or r.stdout.strip()}")
+        # 注册表 Run 键(HKCU):纯用户态、免管理员。schtasks /SC ONLOGON 的 /Create
+        # 在很多机器上需要提权 → "拒绝访问",故弃用。
+        import winreg  # noqa: PLC0415
+        cmd = f'"{sm._py_exe()}" "{CLIENT_SUP_PY}"'
+        try:
+            with winreg.CreateKey(winreg.HKEY_CURRENT_USER, sm._WIN_RUN_SUBKEY) as k:
+                winreg.SetValueEx(k, WIN_TASK_NAME, 0, winreg.REG_SZ, cmd)
+        except OSError as e:
+            raise RuntimeError(f"写入登录自启注册表失败: {e}") from e
         ensure_supervisor_running()
-        return f"已注册计划任务「{WIN_TASK_NAME}」(登录时启动客户端守护)"
+        return f"已注册登录自启「{WIN_TASK_NAME}」(HKCU Run · 免管理员 · 登录时启动客户端守护)"
     raise RuntimeError(f"不支持的平台: {plat}")
 
 
@@ -197,10 +211,15 @@ def uninstall_autostart() -> str:
             return f"已 systemctl disable 并删除 {p.name}"
         return "未安装(无 unit)"
     if plat == "windows":
-        r = sm._run(["schtasks", "/Delete", "/F", "/TN", WIN_TASK_NAME])
-        if r.returncode != 0 and "ERROR" in (r.stderr + r.stdout).upper():
-            return "未安装(无该计划任务)"
-        return f"已删除计划任务「{WIN_TASK_NAME}」"
+        import winreg  # noqa: PLC0415
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sm._WIN_RUN_SUBKEY, 0, winreg.KEY_SET_VALUE) as k:
+                winreg.DeleteValue(k, WIN_TASK_NAME)
+        except FileNotFoundError:
+            return "未安装(无该自启项)"
+        except OSError as e:
+            return f"卸载失败: {e}"
+        return f"已移除登录自启「{WIN_TASK_NAME}」"
     raise RuntimeError(f"不支持的平台: {plat}")
 
 

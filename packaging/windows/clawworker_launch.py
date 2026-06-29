@@ -21,7 +21,7 @@ import webbrowser
 from pathlib import Path
 
 ROLES = {
-    "admin":  {"svc": "host",   "port": 8443, "url": "http://localhost:8443", "label": "管理端"},
+    "admin":  {"svc": "host",   "port": 8443, "url": "http://localhost:8443/admin", "label": "管理端"},
     "client": {"svc": "client", "port": 8444, "url": "http://localhost:8444", "label": "用户端"},
 }
 

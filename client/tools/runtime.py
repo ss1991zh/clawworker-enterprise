@@ -39,10 +39,33 @@ def _pkg_file_dir(module_name: str):
     return None
 
 
+# 当前登录用户的 vault 目录(由客户端登录时 set_active_vault 设置)。
+# 用户在 UI 里上传的 sk/字典、从主机拉的 user_authorization 都落在这里,
+# 引擎优先用 vault → 实现"上传即生效",找不到再回退包目录/环境变量。
+_active_vault: Optional[Path] = None
+
+
+def set_active_vault(path: Optional[str | Path]) -> None:
+    """绑定当前用户的密钥 vault 目录(登录后调用)。传 None 解绑。"""
+    global _active_vault
+    _active_vault = Path(path) if path else None
+
+
+def _vault_file(name: str) -> Optional[str]:
+    if _active_vault is not None:
+        p = _active_vault / name
+        if p.is_file():
+            return str(p)
+    return None
+
+
 def _resolve_sk_path() -> str:
     env = os.environ.get("AGENT_SK_PATH")
     if env:
         return env
+    v = _vault_file("sk.bin")          # 用户上传的 sk(vault 里存为 sk.bin)
+    if v:
+        return v
     d = _pkg_file_dir("crypto_toolkit")
     return str(d / "skf") if d else _FALLBACK_SK
 
@@ -55,10 +78,32 @@ def _resolve_dict_dir() -> str:
     return str(d) if d else _FALLBACK_DICT_DIR
 
 
+def _resolve_dict_file() -> Optional[str]:
+    """字典文件(henumpy initDict 的 dictFilePath)。
+    注:本方案里"计算密钥 evk"与"计算字典 dictf"是同一文件 —— 客户端把它
+    上传到 vault/evk.bin。优先用 vault 的 evk.bin(=字典),其次 vault/dictf,
+    再回退目录内 'dictf' 前缀的最新文件(env AGENT_DICT_DIR → 包目录)。"""
+    v = _vault_file("evk.bin") or _vault_file("dictf")
+    if v:
+        return v
+    try:
+        d = Path(_resolve_dict_dir())
+        if d.is_dir():
+            cands = [p for p in d.iterdir() if p.is_file() and p.name.startswith("dictf")]
+            if cands:
+                return str(max(cands, key=lambda p: p.stat().st_mtime))
+    except OSError:
+        pass
+    return None
+
+
 def _resolve_user_auth() -> str:
     env = os.environ.get("AGENT_USER_AUTH")
     if env:
         return env
+    v = _vault_file("user_authorization")   # 从主机拉到 vault 的授权
+    if v:
+        return v
     d = _pkg_file_dir("henumpy")
     return str(d / "user_authorization") if d else _FALLBACK_USER_AUTH
 
@@ -228,23 +273,24 @@ class Runtime:
         """调用 hp.initDict(),只调一次。"""
         if self._dict_initialized:
             return
-        dict_path = self.config.dict_path
+        dict_path = self.config.dict_path or _resolve_dict_file()
         user_auth = self.config.user_auth_path or _resolve_user_auth()
         if not _file_exists(user_auth):
             raise RuntimeError(
-                f"真实 backend 需要 user_authorization 文件,但未找到: {user_auth}。"
-                f"请按 PROVIDE_ME.md 提供。"
+                "真实 backend 需要 user_authorization 文件,但未找到。"
+                "请在客户端「密钥」面板点「从主机获取」拉取证书。"
+            )
+        if not (dict_path and _file_exists(dict_path)):
+            raise RuntimeError(
+                "真实 backend 需要字典文件(dictf),但未找到。"
+                "请在客户端「密钥」面板上传字典文件(dictf)。"
             )
         import henumpy as hp
 
         # initDict 时原生库会向 stdout 打印授权信息("Serial number … N days left to expiration"),
         # 仅首次打印 → fd 级捕获并解析,供 license 到期预警。捕获失败绝不影响初始化。
-        if dict_path:
-            captured = _init_with_fd_capture(
-                lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
-        else:
-            captured = _init_with_fd_capture(
-                lambda: hp.initDict(userFilePath=user_auth))
+        captured = _init_with_fd_capture(
+            lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
         self._license = _parse_license(captured)
         self._dict_initialized = True
 

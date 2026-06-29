@@ -35,6 +35,7 @@ class KeyPaths:
     sk_path: Path
     evk_path: Path
     user_auth_path: Optional[Path] = None  # 每用户的 user_authorization 文件
+    dict_path: Optional[Path] = None        # 每用户的 henumpy 字典文件(dictf)
 
 
 class Keystore:
@@ -129,19 +130,28 @@ class Keystore:
         self._write_secret(dst, source.read_bytes())
         return dst
 
+    def import_dict(self, *, username: str, source: Path) -> Path:
+        """单独导入/替换 henumpy 字典文件(dictf)。引擎 initDict 用此路径。"""
+        dst = self._vault_dir(username) / "dictf"
+        self._write_secret(dst, source.read_bytes())
+        return dst
+
     # ----- 查询 -----
     def get_paths(self, username: str) -> Optional[KeyPaths]:
         vault = self._vault_dir(username)
         sk = vault / "sk.bin"
-        evk = vault / "evk.bin"
-        if not sk.exists() or not evk.exists():
-            # 仍允许"只有 evk 没有 sk"等中间态吗?MVP 维持原语义:都需在
+        # 本方案真实初始化只需 sk + 字典 + 授权,不使用单独的 evk;
+        # 因此只要 sk 在就返回(evk/字典/授权按存在性可选填)。
+        if not sk.exists():
             return None
+        evk = vault / "evk.bin"
+        dictf = vault / "dictf"
         auth = vault / "user_authorization"
         return KeyPaths(
             sk_path=sk,
             evk_path=evk,
             user_auth_path=auth if auth.exists() else None,
+            dict_path=dictf if dictf.exists() else None,
         )
 
     def vault_path(self, username: str) -> Path:

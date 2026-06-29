@@ -2913,15 +2913,15 @@ async function renderKeysTab() {
       <input type="file" id="skFile" hidden>
     </div>
 
-    <h3 class="keys-h3">计算密钥 <span class="mono-tag">evk</span></h3>
+    <h3 class="keys-h3">计算密钥 / 字典 <span class="mono-tag">evk · dictf</span></h3>
     <div class="key-row">
       <div class="key-meta">${k.evk_present
         ? `<span class="badge ok">已导入</span>`
         : `<span class="badge no">未导入</span>`}</div>
     </div>
     <div class="sk-drop" id="dropEvk">
-      <div class="sk-drop__t"><strong>拖入</strong> 或 <span class="sk-pick" data-pick="evk">点击选择</span> evk 文件</div>
-      <div class="sk-drop__s">用于 HE 加法 / 乘法 · 不暴露明文</div>
+      <div class="sk-drop__t"><strong>拖入</strong> 或 <span class="sk-pick" data-pick="evk">点击选择</span> 计算密钥(evk,即字典 dictf)</div>
+      <div class="sk-drop__s">密态计算必需 · evk 与 dictf 是同一文件 · 文件较大,上传需稍候 · 仅本机沙盒</div>
       <input type="file" id="evkFile" hidden>
     </div>
 

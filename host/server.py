@@ -112,6 +112,13 @@ app.include_router(
 )
 
 
+# 根路径 → 管理后台(裸访问 :8443 时不再 404;登录闸门交给下面中间件)
+@app.get("/")
+def _root():
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse("/admin", status_code=303)
+
+
 # Admin 登录闸门:未登录访问 /admin/* 一律跳登录页(登录页 / 静态资源放行)
 @app.middleware("http")
 async def _admin_login_gate(request, call_next):

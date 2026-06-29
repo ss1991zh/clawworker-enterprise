@@ -244,13 +244,18 @@ def autostart_status() -> dict:
         return {"installed": p.exists(), "kind": "systemd", "path": str(p),
                 "detail": "systemd --user · Restart=on-failure"}
     if plat == "windows":
-        ok = _run(["schtasks", "/Query", "/TN", WIN_TASK_NAME]).returncode == 0
-        return {"installed": ok, "kind": "schtasks", "path": WIN_TASK_NAME,
-                "detail": "计划任务 · 登录时启动"}
+        return {"installed": _win_autostart_installed(), "kind": "registry-run",
+                "path": rf"HKCU\{_WIN_RUN_SUBKEY}\{WIN_TASK_NAME}",
+                "detail": "登录自启 · HKCU Run 键(免管理员)"}
     return {"installed": False, "kind": "unknown", "path": "", "detail": ""}
 
 
 def _run(argv: list[str], **kw) -> subprocess.CompletedProcess:
+    # Windows:父进程是 pythonw(无控制台)时,拉起 schtasks/taskkill 等控制台程序会
+    # 新建一个一闪而过的黑窗。ops 页每 4s 轮询 status → autostart_status → schtasks,
+    # 会造成周期性闪窗 —— 加 CREATE_NO_WINDOW 彻底消除(非 Windows 上该常量为 0,无副作用)。
+    if current_platform() == "windows":
+        kw.setdefault("creationflags", getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return subprocess.run(argv, capture_output=True, text=True, **kw)
 
 
@@ -366,25 +371,44 @@ def _linux_uninstall() -> str:
 
 # ---- Windows: schtasks ----
 
+# 登录自启走 HKCU 的 Run 键:纯用户态,免管理员。
+# (schtasks /SC ONLOGON 在很多机器上 /Create 需要提权 → "拒绝访问",故弃用。)
+# 登录时由 explorer 在用户会话里执行该命令,继承用户环境变量(含 CLAWWORKER_MANAGED_SERVICES),
+# 用 pythonw 启动 supervisor → 无窗口。
+_WIN_RUN_SUBKEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def _win_autostart_installed() -> bool:
+    import winreg  # noqa: PLC0415  Windows-only
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_SUBKEY) as k:
+            winreg.QueryValueEx(k, WIN_TASK_NAME)
+        return True
+    except OSError:
+        return False
+
+
 def _win_install() -> str:
-    tr = f'"{_py_exe()}" "{SUPERVISOR_PY}"'
-    r = _run([
-        "schtasks", "/Create", "/F",
-        "/SC", "ONLOGON",
-        "/TN", WIN_TASK_NAME,
-        "/TR", tr,
-        "/RL", "LIMITED",
-    ])
-    if r.returncode != 0:
-        raise RuntimeError(f"schtasks /Create 失败: {r.stderr.strip() or r.stdout.strip()}")
-    return f"已注册计划任务「{WIN_TASK_NAME}」(登录时启动 supervisor)"
+    import winreg  # noqa: PLC0415
+    cmd = f'"{_py_exe()}" "{SUPERVISOR_PY}"'
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_SUBKEY) as k:
+            winreg.SetValueEx(k, WIN_TASK_NAME, 0, winreg.REG_SZ, cmd)
+    except OSError as e:
+        raise RuntimeError(f"写入登录自启注册表失败: {e}") from e
+    return f"已注册登录自启「{WIN_TASK_NAME}」(HKCU Run · 免管理员 · 登录时启动 supervisor)"
 
 
 def _win_uninstall() -> str:
-    r = _run(["schtasks", "/Delete", "/F", "/TN", WIN_TASK_NAME])
-    if r.returncode != 0 and "ERROR" in (r.stderr + r.stdout).upper():
-        return "未安装(无该计划任务)"
-    return f"已删除计划任务「{WIN_TASK_NAME}」"
+    import winreg  # noqa: PLC0415
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _WIN_RUN_SUBKEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, WIN_TASK_NAME)
+    except FileNotFoundError:
+        return "未安装(无该自启项)"
+    except OSError as e:
+        return f"卸载失败: {e}"
+    return f"已移除登录自启「{WIN_TASK_NAME}」"
 
 
 def install_autostart() -> str:

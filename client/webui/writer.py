@@ -705,8 +705,13 @@ def _encrypt_numeric_columns(df):
     # 数值列单独写盘 → 加密 → 读回
     num_df = df[numeric_cols].copy().fillna(0)
 
-    tmp_plain = Path(tempfile.mkstemp(suffix=".xlsx")[1])
-    tmp_enc = Path(tempfile.mkstemp(suffix=".xlsx")[1])
+    # 注:不能用 mkstemp()[1] —— 它会泄漏一个打开的 fd,Windows 上该句柄占着文件,
+    # 随后 to_excel/encrypt_excel 写同一路径会报 WinError 32(文件被占用)。
+    # 用 NamedTemporaryFile + with 立即关闭句柄(delete=False 保留文件)。
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _f:
+        tmp_plain = Path(_f.name)
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _f:
+        tmp_enc = Path(_f.name)
     enc_num_df = None
     try:
         num_df.to_excel(str(tmp_plain), index=False)

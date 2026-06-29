@@ -51,7 +51,9 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
         num_enc_path = ""
         if numeric_cols:
             num_df = df[numeric_cols].copy().fillna(0)
-            tmp_plain = Path(tempfile.mkstemp(suffix=".xlsx")[1])
+            # 用 with 立即关闭句柄,避免 Windows 上 mkstemp 泄漏 fd 占用文件(WinError 32)
+            with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _f:
+                tmp_plain = Path(_f.name)
             enc_path = run_dir / f"sheet{idx}_num.xlsx"
             try:
                 num_df.to_excel(str(tmp_plain), index=False)
