@@ -615,6 +615,20 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
     if df.empty or df.shape[1] == 0:
         raise ValueError("文件没有任何列")
 
+    # 公式列兜底:源表把"销售收入=销量×单价 / 营业利润率=营业利润/销售收入"等派生列写成公式,
+    # 若保存时没缓存计算值,openpyxl/pandas 读回来整列是空的 → 会被当空字符串列丢进 metadata,
+    # 下游 AI 读到空列 → 结果全 NaN(明文为空、密文是 encrypt(0))。这里按源表公式补算,
+    # 让派生列变回真实数值列,正常加密、正常参与计算。失败安全兜底(不阻断摄取)。
+    formula_filled: list = []
+    if raw_suffix in (".xlsx", ".xls"):
+        try:
+            from client.he_ops.formula_eval import fill_formula_columns
+            df, formula_filled = fill_formula_columns(
+                str(src_path), df, sheet_name=sheet_name, header_row=header_row,
+            )
+        except Exception:  # noqa: BLE001 —— 公式补算失败绝不阻断入库
+            formula_filled = []
+
     all_cols = df.columns.tolist()
     if all(str(c).startswith("Unnamed:") for c in all_cols):
         raise ValueError("无法识别表头(所有列都是 Unnamed)")
@@ -685,6 +699,7 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         "column_preview": all_cols[:8],
         "nan_filled": nan_counts,
         "data_health": data_health,
+        "formula_filled": formula_filled,
     }
 
 
@@ -710,6 +725,58 @@ async def api_files_upload(raw_file: UploadFile = File(...)):
         tmp_path.unlink(missing_ok=True)
 
 
+def _win_foreground_dialog(inner: str) -> str:
+    """构造 PowerShell,保证对话框弹到浏览器网页最上层。
+    客户端由 pythonw(后台/无窗口)拉起,直接弹的 WinForms 对话框会被 Windows 前台锁
+    压到后面/最小化(表现为"点了没反应"或藏在浏览器后面)。两道保证:
+      1) 隐形置顶 owner + SetForegroundWindow 抢到前台,并以它为父弹对话框;
+      2) 定时器在对话框出现后(#32770 对话框类)把它自身提升为 HWND_TOPMOST 并抢焦点,
+         确保稳稳盖在浏览器上层。
+    inner 需定义 $d 并 $d.ShowDialog($o),OK 时 Write-Output 结果。"""
+    return (
+        'Add-Type -AssemblyName System.Windows.Forms\n'
+        'Add-Type @"\n'
+        'using System;using System.Runtime.InteropServices;using System.Text;\n'
+        'public class U{\n'
+        ' [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);\n'
+        ' [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h,IntPtr a,int x,int y,int cx,int cy,uint f);\n'
+        ' [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);\n'
+        ' [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);\n'
+        ' [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);\n'
+        ' [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);\n'
+        ' public delegate bool EnumProc(IntPtr h, IntPtr l);\n'
+        ' public static IntPtr Find(uint pid){ IntPtr r=IntPtr.Zero; EnumWindows(new EnumProc((h,l)=>{\n'
+        '   uint p; GetWindowThreadProcessId(h, out p);\n'
+        '   if(p==pid && IsWindowVisible(h)){ var sb=new StringBuilder(64); GetClassName(h,sb,64);\n'
+        '     if(sb.ToString()=="#32770"){ r=h; return false; } } return true; }), IntPtr.Zero); return r; }\n'
+        '}\n'
+        '"@\n'
+        '$mypid = [System.Diagnostics.Process]::GetCurrentProcess().Id\n'
+        '$o = New-Object System.Windows.Forms.Form\n'
+        '$o.TopMost=$true; $o.ShowInTaskbar=$false; $o.Opacity=0;'
+        ' $o.StartPosition="CenterScreen"; $o.Size=New-Object System.Drawing.Size(500,400);'
+        ' $o.Show(); $o.Activate()\n'
+        '[U]::SetForegroundWindow($o.Handle) | Out-Null\n'
+        # 只置顶一次:HWND_TOPMOST 是粘性的,设一次就永久保持在最上层;找到本进程的
+        # 对话框(#32770)后立即 $t.Stop(),避免反复 SetForegroundWindow 造成闪烁。
+        '$t = New-Object System.Windows.Forms.Timer; $t.Interval=120\n'
+        '$t.add_Tick({ $h=[U]::Find([uint32]$mypid);'
+        ' if ($h -ne [IntPtr]::Zero) { $t.Stop();'
+        ' [U]::SetWindowPos($h,[IntPtr](-1),0,0,0,0,3) | Out-Null;'
+        ' [U]::SetForegroundWindow($h) | Out-Null } })\n'
+        '$t.Start()\n'
+        + inner + '\n'
+        '$t.Stop(); $t.Dispose(); $o.Close()\n'
+    )
+
+
+# Windows 弹对话框的 PowerShell 参数。搭配 CREATE_NO_WINDOW 使用:
+# client 由 pythonw(无控制台)拉起,若不加 CREATE_NO_WINDOW,Windows 会给子 powershell
+# 新分配一个可见的黑色终端窗口;加了它则无黑窗。而对话框弹不到前台的问题,由
+# _win_foreground_dialog 里的隐形置顶 owner + SetForegroundWindow 解决 —— 两者缺一不可。
+_WIN_PS_DIALOG_ARGS = ["powershell", "-NoProfile", "-STA", "-Command"]
+
+
 def _native_pick_folder() -> tuple[Optional[str], bool, str]:
     """
     调系统原生「选择文件夹」对话框(跨平台)。
@@ -733,17 +800,16 @@ def _native_pick_folder() -> tuple[Optional[str], bool, str]:
             return (r.stdout or "").strip().rstrip("/"), False, ""
 
         if plat == "win32":
-            ps = (
-                "Add-Type -AssemblyName System.Windows.Forms;"
+            ps = _win_foreground_dialog(
                 "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
                 f"$d.Description = '{prompt}';"
-                "$r = $d.ShowDialog();"
-                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }"
+                "$r = $d.ShowDialog($o);"
+                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath };"
             )
             r = subprocess.run(
-                ["powershell", "-NoProfile", "-STA", "-Command", ps],
+                [*_WIN_PS_DIALOG_ARGS, ps],
                 capture_output=True, text=True, timeout=300,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # 不闪 PS 控制台(对话框照常显示)
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # 无黑窗;前台由 owner 保证
             )
             path = (r.stdout or "").strip()
             if not path:
@@ -791,17 +857,16 @@ def _native_pick_file() -> tuple[Optional[str], bool, str]:
                 return None, False, (r.stderr or "").strip()[:120]
             return (r.stdout or "").strip(), False, ""
         if plat == "win32":
-            ps = (
-                "Add-Type -AssemblyName System.Windows.Forms;"
+            ps = _win_foreground_dialog(
                 "$d = New-Object System.Windows.Forms.OpenFileDialog;"
                 f"$d.Title = '{prompt}';"
                 "$d.Filter = 'data (*.csv;*.xlsx;*.xls)|*.csv;*.xlsx;*.xls|all|*.*';"
-                "$r = $d.ShowDialog();"
-                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }"
+                "$r = $d.ShowDialog($o);"
+                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName };"
             )
-            r = subprocess.run(["powershell", "-NoProfile", "-STA", "-Command", ps],
+            r = subprocess.run([*_WIN_PS_DIALOG_ARGS, ps],
                                capture_output=True, text=True, timeout=300,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # 不闪 PS 控制台
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # 无黑窗;前台由 owner 保证
             path = (r.stdout or "").strip()
             return (path, False, "") if path else (None, True, "")
         for cmd in (["zenity", "--file-selection", f"--title={prompt}"],

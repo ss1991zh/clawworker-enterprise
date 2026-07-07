@@ -89,6 +89,16 @@ class AdminAuth:
     def smtp(self) -> dict:
         return self._d.get("smtp", {}) or {}
 
+    @property
+    def initialized(self) -> bool:
+        """首次初始化(绑邮箱 + 邮件发送测试通过)是否完成。
+        完成前:向导态,邮箱可自由改;完成后:改密码/邮箱都要验证码。"""
+        return bool(self._d.get("initialized", False))
+
+    def set_initialized(self, value: bool = True) -> None:
+        self._d["initialized"] = bool(value)
+        self._save()
+
     def verify_login(self, username: str, password: str) -> bool:
         if (username or "").strip() != self.username:
             return False
@@ -157,17 +167,44 @@ class AdminAuth:
             self._codes.pop(purpose, None)   # 一次性
         return ok
 
+    # ---- 发测试邮件(首次初始化第二步:验证 SMTP 是否真的能发)----
+    def send_test_email(self, to: str) -> tuple[bool, str]:
+        s = self.smtp
+        if not (s.get("host") and s.get("from")):
+            return False, "尚未填写邮件发送设置(服务商 / 发件邮箱 / 授权码)。"
+        body = ("这是一封来自 Clawworker Admin 的配置测试邮件。\n\n"
+                "收到它,说明邮件发送已配好;之后改密码 / 换邮箱的验证码会发到这里。")
+        try:
+            msg = MIMEText(body, "plain", "utf-8")
+            msg["Subject"] = "Clawworker Admin · 配置测试"
+            msg["From"] = formataddr(("Clawworker Admin", s["from"]))
+            msg["To"] = to
+            port = int(s.get("port", 587))
+            if s.get("use_ssl"):
+                srv = smtplib.SMTP_SSL(s["host"], port, timeout=15)
+            else:
+                srv = smtplib.SMTP(s["host"], port, timeout=15)
+                if s.get("use_tls", True):
+                    srv.starttls()
+            if s.get("user"):
+                srv.login(s["user"], s.get("password", ""))
+            srv.sendmail(s["from"], [to], msg.as_string())
+            srv.quit()
+            return True, f"测试邮件已发送到 {to},请查收"
+        except Exception as e:  # noqa: BLE001
+            return False, f"SMTP 发送失败({type(e).__name__}),请检查发件邮箱与授权码是否正确。"
+
     # ---- 发邮件(验证码)----
-    def send_code_email(self, to: str, code: str) -> tuple[bool, str]:
-        body = (f"你正在修改 Clawworker Admin 登录密码。\n\n验证码:{code}\n"
+    def send_code_email(self, to: str, code: str, what: str = "登录密码") -> tuple[bool, str]:
+        body = (f"你正在修改 Clawworker Admin 的{what}。\n\n验证码:{code}\n"
                 f"10 分钟内有效。若非本人操作,请忽略本邮件并尽快检查账户安全。")
         s = self.smtp
         if not (s.get("host") and s.get("from")):
-            print(f"[admin-auth] 未配置 SMTP · 改密验证码 → {to}: {code}", flush=True)
+            print(f"[admin-auth] 未配置 SMTP · 改{what}验证码 → {to}: {code}", flush=True)
             return False, "尚未配置 SMTP,验证码已记录到服务端日志(本地自测用)。可在下方配置 SMTP 后真正发邮件。"
         try:
             msg = MIMEText(body, "plain", "utf-8")
-            msg["Subject"] = "Clawworker Admin · 改密验证码"
+            msg["Subject"] = f"Clawworker Admin · 改{what}验证码"
             msg["From"] = formataddr(("Clawworker Admin", s["from"]))
             msg["To"] = to
             port = int(s.get("port", 587))

@@ -126,6 +126,7 @@ def build_admin_router(
                 "active": "account",
                 "username": admin_auth.username if admin_auth else "admin",
                 "email": admin_auth.email if admin_auth else "",
+                "initialized": admin_auth.initialized if admin_auth else False,
                 "smtp": s,
                 "presets": EMAIL_PRESETS,
                 "hints_json": _json.dumps({k: p["hint"] for k, p in EMAIL_PRESETS.items()},
@@ -135,12 +136,21 @@ def build_admin_router(
         )
 
     @router.post("/account/email")
-    def admin_set_email(request: Request, email: str = Form(...)):
+    def admin_set_email(request: Request, email: str = Form(...), code: str = Form("")):
         e = (email or "").strip()
         if "@" not in e or "." not in e.split("@")[-1]:
             return _flash_redirect("/admin/account", ("error", "邮箱格式不正确"))
+        # 初始化完成后改邮箱需验证码(发到当前邮箱);初始化阶段(向导)邮箱可自由改。
+        if admin_auth.initialized:
+            if e == admin_auth.email:
+                return _flash_redirect("/admin/account", ("error", "新邮箱与当前邮箱相同"))
+            if not admin_auth.check_code(code, "change_email"):
+                return _flash_redirect("/admin/account", ("error", "验证码错误或已过期,请点「发送验证码」重新获取"))
+            admin_auth.set_email(e)
+            return _flash_redirect("/admin/account", ("success", f"已更换为邮箱 {e}"))
+        # 向导阶段:直接绑定,进入第二步(配置邮件发送)
         admin_auth.set_email(e)
-        return _flash_redirect("/admin/account", ("success", f"已绑定邮箱 {e}"))
+        return _flash_redirect("/admin/account", ("success", f"已绑定邮箱 {e},请继续配置邮件发送"))
 
     @router.post("/account/smtp")
     def admin_set_smtp(request: Request,
@@ -148,7 +158,8 @@ def build_admin_router(
                        email: str = Form(""),
                        auth_code: str = Form(""),
                        host: str = Form(""), port: str = Form("587"),
-                       use_ssl_custom: str = Form(""), use_tls_custom: str = Form("")):
+                       use_ssl_custom: str = Form(""), use_tls_custom: str = Form(""),
+                       init: str = Form("")):
         from host.admin_auth import EMAIL_PRESETS
         cur = admin_auth.smtp
         email = (email or "").strip()
@@ -163,14 +174,27 @@ def build_admin_router(
                    "use_ssl": use_ssl_custom == "on", "use_tls": use_tls_custom == "on",
                    "user": email, "from": email, "password": pw}
         admin_auth.set_smtp(cfg)
+        # 首次初始化第二步:保存后发测试邮件验证;成功才算"初始化完成"。
+        if init == "1" and not admin_auth.initialized:
+            if not admin_auth.email:
+                return _flash_redirect("/admin/account", ("error", "请先返回上一步绑定邮箱"))
+            ok, detail = admin_auth.send_test_email(admin_auth.email)
+            if ok:
+                admin_auth.set_initialized(True)
+                return _flash_redirect("/admin/account",
+                                       ("success", f"初始化完成!{detail}。此后可分别修改密码 / 邮箱 / 发送设置。"))
+            return _flash_redirect("/admin/account",
+                                   ("warning", f"邮件设置已保存,但{detail} 配置成功前仍可返回上一步修改邮箱。"))
         return _flash_redirect("/admin/account", ("success", "已保存邮件配置"))
 
     @router.post("/account/send_code")
-    def admin_send_code(request: Request):
+    def admin_send_code(request: Request, purpose: str = Form("change_pw")):
         if not admin_auth.email:
             return _flash_redirect("/admin/account", ("error", "请先绑定邮箱"))
-        code = admin_auth.gen_code("change_pw")
-        ok, detail = admin_auth.send_code_email(admin_auth.email, code)
+        purpose = purpose if purpose in ("change_pw", "change_email") else "change_pw"
+        what = "邮箱" if purpose == "change_email" else "登录密码"
+        code = admin_auth.gen_code(purpose)
+        ok, detail = admin_auth.send_code_email(admin_auth.email, code, what)
         return _flash_redirect("/admin/account",
                                ("success" if ok else "warning", detail))
 

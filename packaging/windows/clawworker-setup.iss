@@ -1,4 +1,4 @@
-; Clawworker Windows 安装包定义(Inno Setup 6+)
+﻿; Clawworker Windows 安装包定义(Inno Setup 6+)
 ; 用 build_installers.ps1 编译两次,分别产出 管理端 / 用户端 两个 Setup.exe。
 ; 手动编译单个:  iscc /DMyRole=admin  clawworker-setup.iss
 ;                 iscc /DMyRole=client clawworker-setup.iss
@@ -15,7 +15,7 @@
   #define RoleArg "client"
 #endif
 
-#define AppVersion "0.7"
+#define AppVersion "0.8"
 #define Pub "Clawworker"
 
 [Setup]
@@ -43,6 +43,8 @@ Name: "cn"; MessagesFile: "compiler:Default.isl"
 Source: "..\..\host\*";              DestDir: "{app}\host";            Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
 Source: "..\..\client\*";            DestDir: "{app}\client";          Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
 Source: "..\..\shared\*";            DestDir: "{app}\shared";          Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
+; ---- 文档(含 LLM 系统 prompt,运行时会读 docs\llm_system_prompt.md)----
+Source: "..\..\docs\*";              DestDir: "{app}\docs";            Flags: recursesubdirs createallsubdirs
 Source: "..\..\skill_packs\*";       DestDir: "{app}\skill_packs";     Flags: recursesubdirs createallsubdirs
 Source: "..\..\supervisor.py";       DestDir: "{app}"
 Source: "..\..\client_supervisor.py"; DestDir: "{app}"
@@ -53,6 +55,9 @@ Source: "requirements.txt";          DestDir: "{app}\packaging\windows"
 Source: "install.ps1";               DestDir: "{app}\packaging\windows"
 ; ---- HE 库(含 win64 DLL,装包前放进 he_libs\)----
 Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Flags: recursesubdirs createallsubdirs
+; ---- 完全离线包:随包 Python 安装器 + 全部依赖 wheel(目标机无需装 Python、无需联网)----
+Source: "python-3.11.9-amd64.exe";   DestDir: "{app}\packaging\windows"; Flags: skipifsourcedoesntexist
+Source: "wheels\*";                  DestDir: "{app}\packaging\windows\wheels"; Flags: recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
 ; 桌面 + 开始菜单图标:启动器(无窗口的 pythonw)+ 角色参数 + 自带图标

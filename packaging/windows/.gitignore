@@ -2,3 +2,6 @@
 he_libs/
 # 编译产物(.exe 安装包)
 dist/
+# 离线包构建产物(大文件,不进仓库)
+wheels/
+python-*-amd64.exe

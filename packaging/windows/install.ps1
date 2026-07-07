@@ -1,4 +1,4 @@
-<#
+﻿<#
   Clawworker Windows 安装脚本
   作用:建 venv → 装依赖 → 装 4 个 HE 库 → 在桌面生成图标(双击即开界面)。
 
@@ -32,9 +32,18 @@ $Py      = Join-Path $Venv "Scripts\python.exe"
 $Launch  = Join-Path $Here "clawworker_launch.py"
 $Icon    = Join-Path $Here "clawworker.ico"
 $HeLibs  = Join-Path $Here "he_libs"
+$Wheels   = Join-Path $Here "wheels"                    # 离线 wheel 目录(离线包会带上)
+$PyBundle = Join-Path $Here "python-3.11.9-amd64.exe"   # 随包 Python 安装器(离线包会带上)
 
 Write-Host "==== Clawworker 安装 ($Role) ====" -ForegroundColor Cyan
 Write-Host "项目根: $Project"
+
+# 离线模式:检测到 wheels\ 就完全用本地 wheel 装,不联网。
+$PipArgs = @()
+if (Test-Path $Wheels) {
+    $PipArgs = @("--no-index", "--find-links", $Wheels)
+    Write-Host "离线模式:使用随包 wheels 安装依赖(无需联网)" -ForegroundColor Yellow
+}
 
 # ---- 1. 找系统 Python(真正验证可运行)----
 function Test-PyCmd($exe, $verArg) {
@@ -52,8 +61,27 @@ if (Get-Command py -ErrorAction SilentlyContinue) {
 if (-not $pyExe -and (Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) {
     $pyExe = "python"
 }
-if (-not $pyExe) { throw "未找到可用的 Python 3.11+。请先安装并勾选 Add to PATH。" }
-Write-Host "系统 Python: $pyExe $pyArg"
+# 没找到系统 Python 但随包带了安装器 → 静默装(仅当前用户,免管理员),再探测。
+if (-not $pyExe -and (Test-Path $PyBundle)) {
+    Write-Host "未检测到 Python,正在安装随包 Python 3.11(静默,可能需一两分钟)..." -ForegroundColor Yellow
+    Start-Process -FilePath $PyBundle -Wait -ArgumentList `
+        "/quiet","InstallAllUsers=0","PrependPath=1","Include_pip=1","Include_launcher=1","Include_test=0","Include_doc=0"
+    $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+    if (Get-Command py -ErrorAction SilentlyContinue) {
+        foreach ($v in @("-3.11", "-3")) { if (Test-PyCmd "py" $v) { $pyExe = "py"; $pyArg = $v; break } }
+    }
+    if (-not $pyExe -and (Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) { $pyExe = "python" }
+    # PATH 可能尚未刷新 → 直接查随包 Python 的已知安装路径(per-user)
+    if (-not $pyExe) {
+        foreach ($cand in @(
+            (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
+            (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311-64\python.exe"))) {
+            if ((Test-Path $cand) -and (Test-PyCmd $cand $null)) { $pyExe = $cand; break }
+        }
+    }
+}
+if (-not $pyExe) { throw "未找到可用的 Python 3.11+(且无随包安装器)。请手动安装 Python 3.11 并勾选 Add to PATH。" }
+Write-Host "使用 Python: $pyExe $pyArg"
 
 # ---- 2. 建 venv(PS 自动处理含空格/中文的路径)----
 if (-not (Test-Path $Py)) {
@@ -61,18 +89,18 @@ if (-not (Test-Path $Py)) {
     if ($pyArg) { & $pyExe $pyArg -m venv $Venv } else { & $pyExe -m venv $Venv }
     if (-not (Test-Path $Py)) { throw "创建 venv 失败:$Venv" }
 }
-& $Py -m pip install --upgrade pip --quiet
+& $Py -m pip install --upgrade pip @PipArgs --quiet
 
 # ---- 3. 装依赖 ----
 Write-Host "安装依赖(requirements.txt)..." -ForegroundColor Yellow
-& $Py -m pip install -r (Join-Path $Here "requirements.txt") --quiet
+& $Py -m pip install -r (Join-Path $Here "requirements.txt") @PipArgs --quiet
 
 # ---- 4. 装 4 个 HE 库 ----
 $libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev")
 if (Test-Path $HeLibs) {
     foreach ($l in $libs) {
         $d = Join-Path $HeLibs $l
-        if (Test-Path $d) { Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow; & $Py -m pip install -e $d --quiet }
+        if (Test-Path $d) { Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow; & $Py -m pip install -e $d @PipArgs --quiet }
         else { Write-Warning "缺少 HE 库目录: $d" }
     }
 } else {
