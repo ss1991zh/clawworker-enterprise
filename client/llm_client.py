@@ -32,7 +32,10 @@ class HTTPLLMClient:
         self.host_url = host_url.rstrip("/")
         self.session_token = session_token
         self._client = httpx.Client(
-            timeout=httpx.Timeout(timeout, connect=5.0)
+            timeout=httpx.Timeout(timeout, connect=5.0),
+            # 局域网内连主机,绝不走系统代理(Clash 等)—— 否则被代理劫持返回空 502,
+            # 且 NO_PROXY 环境变量通常不含 192.168.*,用户侧无从排查
+            trust_env=False,
         )
 
     def chat(self, system: str, user: str) -> LLMResponse:

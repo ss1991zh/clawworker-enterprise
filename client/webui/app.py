@@ -206,12 +206,19 @@ def login_submit(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    host_url = host_url.rstrip("/")
+    host_url = host_url.strip().rstrip("/")
+    # 用户常直接填 "192.168.x.x:8443"(不带协议)—— httpx 会报
+    # "Request URL is missing an 'http://' or 'https://' protocol",自动补全
+    if host_url and not host_url.lower().startswith(("http://", "https://")):
+        host_url = "http://" + host_url
     try:
         r = httpx.post(
             f"{host_url}/auth/login",
             json={"username": username, "password": password},
             timeout=15,
+            # 连主机是局域网流量,绕过系统代理(Clash 等)—— 否则代理返回空 502,
+            # 界面只显示"登录失败:"没有任何详情
+            trust_env=False,
         )
     except httpx.HTTPError as e:
         return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
@@ -430,6 +437,7 @@ def api_keys_fetch_auth():
             f"{host_url}/auth/user_authorization",
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
+            trust_env=False,   # 局域网连主机不走系统代理
         )
     except httpx.HTTPError as e:
         raise HTTPException(502, f"无法连接主机:{type(e).__name__}: {e}")

@@ -15,7 +15,7 @@
   #define RoleArg "client"
 #endif
 
-#define AppVersion "0.8"
+#define AppVersion "0.9"
 #define Pub "Clawworker"
 
 [Setup]

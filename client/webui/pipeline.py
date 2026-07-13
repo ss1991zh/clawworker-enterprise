@@ -98,6 +98,7 @@ def _post_cancellable(
                 url, headers=headers, json=json_body,
                 # 整体允许 timeout 秒,但 read/write/pool 都不主动断 —— 长任务靠 cancel
                 timeout=httpx.Timeout(timeout, connect=10.0, read=None, write=None, pool=None),
+                trust_env=False,   # 局域网连主机不走系统代理(Clash 等会劫持返回空 502)
             )
         except Exception as e:
             box["err"] = e
