@@ -15,7 +15,7 @@
   #define RoleArg "client"
 #endif
 
-#define AppVersion "0.9"
+#define AppVersion "1.0"
 #define Pub "Clawworker"
 
 [Setup]
@@ -34,6 +34,9 @@ WizardStyle=modern
 PrivilegesRequired=lowest
 SetupIconFile=clawworker.ico
 UninstallDisplayIcon={app}\packaging\windows\clawworker.ico
+; 覆盖安装:同 AppId 直接装回原目录,不弹"目录已存在"警告
+DirExistsWarning=no
+UsePreviousAppDir=yes
 
 [Languages]
 Name: "cn"; MessagesFile: "compiler:Default.isl"
@@ -54,7 +57,8 @@ Source: "clawworker.ico";            DestDir: "{app}\packaging\windows"
 Source: "requirements.txt";          DestDir: "{app}\packaging\windows"
 Source: "install.ps1";               DestDir: "{app}\packaging\windows"
 ; ---- HE 库(含 win64 DLL,装包前放进 he_libs\)----
-Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Flags: recursesubdirs createallsubdirs
+; 密钥/证书/字典类文件绝不打进安装包(skf / user_authorization / dictf / evk / sk.bin)
+Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Excludes: "skf,*user_authorization*,dictf*,evk*,sk.bin"; Flags: recursesubdirs createallsubdirs
 ; ---- 完全离线包:随包 Python 安装器 + 全部依赖 wheel(目标机无需装 Python、无需联网)----
 Source: "python-3.11.9-amd64.exe";   DestDir: "{app}\packaging\windows"; Flags: skipifsourcedoesntexist
 Source: "wheels\*";                  DestDir: "{app}\packaging\windows\wheels"; Flags: recursesubdirs createallsubdirs skipifsourcedoesntexist
@@ -75,3 +79,17 @@ Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\wind
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.venv"
+
+[Code]
+{ 覆盖安装:先停掉安装目录下正在运行的服务进程(python/pythonw),避免文件被锁导致复制失败 }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  R: Integer;
+begin
+  Exec('powershell.exe',
+    '-NoProfile -Command "Get-Process python,pythonw -ErrorAction SilentlyContinue | ' +
+    'Where-Object { $_.Path -like ''' + ExpandConstant('{app}') + '\*'' } | ' +
+    'Stop-Process -Force -ErrorAction SilentlyContinue"',
+    '', SW_HIDE, ewWaitUntilTerminated, R);
+  Result := '';
+end;
