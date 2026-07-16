@@ -1,5 +1,9 @@
-# HE 库含自带密钥(skf)/证书(user_authorization)—— 绝不上传
-he_libs/
+# HE 库本体进仓库,但库内可能夹带的密钥(skf)/证书(user_authorization)/字典 —— 绝不上传
+he_libs/**/skf
+he_libs/**/*user_authorization*
+he_libs/**/dictf*
+he_libs/**/evk*
+he_libs/**/sk.bin
 # 编译产物(.exe 安装包)
 dist/
 # 离线包构建产物(大文件,不进仓库)
