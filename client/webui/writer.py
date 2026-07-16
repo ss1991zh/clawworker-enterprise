@@ -760,8 +760,8 @@ def _collect_chart_specs(r: dict) -> list:
     return specs
 
 
-# 单图类别数超过此值仍不拆分时,只在日志层面是"可看性差";split_by 是推荐解法。
-_MAX_SPLIT_CHARTS = 12   # split_by 最多出多少张子图,防爆炸
+_MAX_SPLIT_CHARTS = 12    # 一个 spec 最多出多少张图(split_by 分组 + 分页合计),防爆炸
+_MAX_ROWS_PER_CHART = 30  # 单张图最多画多少行(类别);超过则按连续区间分页,每页一张图
 
 
 def _render_charts(ws, df, specs: list, headers: list, header_row: int, n_cols: int) -> None:
@@ -870,19 +870,51 @@ def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
             if j == len(col) or col[j] != col[start]:
                 spans.append((col[start], start, j - 1))
                 start = j
-        for gval, s, e in spans[:_MAX_SPLIT_CHARTS]:
+        for gval, s, e in spans:
+            if len(charts) >= _MAX_SPLIT_CHARTS:
+                break
             if _is_total_label(gval):
                 continue  # 「合计」组不单独出图
             title = f"{gval} · {base_title}" if base_title else str(gval)
-            charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
-                                      data0 + s, data0 + e, title))
+            for fr, lr, page_title in _paginate_rows(data0 + s, data0 + e, title):
+                if len(charts) >= _MAX_SPLIT_CHARTS:
+                    break
+                charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
+                                          fr, lr, page_title))
     else:
         eff = _trim_trailing_totals(df, x)
         if eff <= 0:
             return []
-        charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
-                                  data0, data0 + eff - 1, base_title))
+        for fr, lr, page_title in _paginate_rows(data0, data0 + eff - 1, base_title):
+            charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
+                                      fr, lr, page_title))
     return charts
+
+
+def _paginate_rows(first_row: int, last_row: int, base_title: str) -> list:
+    """
+    把 [first_row, last_row] 行区间按 _MAX_ROWS_PER_CHART 分页:
+    行数不超限 → 原样一页;超限 → 均匀切成若干连续页,每页一张图,
+    标题带「(第 i/n 页 · 第 a-b 行)」后缀。页数封顶 _MAX_SPLIT_CHARTS
+    (超出时自动加大每页行数,保证所有数据仍被画全)。
+    """
+    import math
+
+    n = last_row - first_row + 1
+    if n <= _MAX_ROWS_PER_CHART:
+        return [(first_row, last_row, base_title)]
+    pages = min(math.ceil(n / _MAX_ROWS_PER_CHART), _MAX_SPLIT_CHARTS)
+    size = math.ceil(n / pages)
+    out = []
+    for i in range(pages):
+        fr = first_row + i * size
+        lr = min(last_row, fr + size - 1)
+        if fr > last_row:
+            break
+        a, b = fr - first_row + 1, lr - first_row + 1
+        suffix = f"(第 {i + 1}/{pages} 页 · 第 {a}-{b} 行)"
+        out.append((fr, lr, f"{base_title} {suffix}" if base_title else suffix))
+    return out
 
 
 def _make_chart(ws, typ: str, x_idx: int, y_idxs: list, headers: list,
