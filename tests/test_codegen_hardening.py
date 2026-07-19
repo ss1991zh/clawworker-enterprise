@@ -174,7 +174,7 @@ def test_keep_encrypted_signal_passes_through():
 
 # ─────────────────── import 白名单 ───────────────────
 
-@pytest.mark.parametrize("mod", ["time", "math", "calendar", "decimal", "random", "operator"])
+@pytest.mark.parametrize("mod", ["time", "math", "calendar", "decimal", "random", "itertools"])
 def test_safe_imports_allowed(mod):
     cg.ast_safety_check(f"import {mod}\nx = 1")
 
@@ -205,10 +205,23 @@ def test_dangerous_imports_blocked(code):
     'x = obj.__globals__',
     'x = pd.read_pickle("/etc/passwd")',                   # 反序列化入口
     'x = df.to_pickle("/tmp/x")',
+    # —— 复核发现的残余逃逸面 ——
+    'import operator\nx = operator.attrgetter("__class__")(())',  # operator 函数式反射
+    'import operator\nx = operator.methodcaller("__reduce__")(o)',
+    'x = op.attrgetter("__globals__")',
+    's = "__class__"\nx = 1',                             # 裸 dunder 字符串(attrgetter 参数)
+    'x = ct._ct.decrypt(v)',                              # 门控代理内部字段旁路
+    'x = obj._private',                                   # 任意下划线私有属性
+    'x = df._mgr',
 ])
 def test_sandbox_escape_vectors_blocked(code):
     with pytest.raises(cg.UnsafeCode):
         cg.ast_safety_check(code)
+
+
+def test_operator_not_importable():
+    with pytest.raises(cg.UnsafeCode):
+        cg.ast_safety_check("import operator")
 
 
 def test_getattr_format_not_in_safe_builtins():

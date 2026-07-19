@@ -170,12 +170,14 @@ async def _csrf_guard(request: Request, call_next):
         return JSONResponse({"detail": "非法 Host 头(拒绝跨域/rebinding 访问)"}, status_code=403)
     path = request.url.path
     method = request.method.upper()
-    # 2) 改状态请求:校验 Origin + CSRF token(静态资源、安全方法、登录表单豁免)
-    if method not in _SAFE_METHODS and path not in _CSRF_EXEMPT_PATHS \
-            and not path.startswith("/static/"):
+    if method not in _SAFE_METHODS and not path.startswith("/static/"):
+        # 2) 所有改状态请求(含登录/登出)都校验 Origin —— 挡登录 CSRF
+        #    (跨站强制受害者登入攻击者主机后把数据发往攻击者)
         if not _origin_ok(request):
             return JSONResponse({"detail": "跨站来源被拒绝"}, status_code=403)
-        if request.headers.get("x-csrf-token", "") != _CSRF_TOKEN:
+        # 3) 非豁免路径还需 CSRF token(登录表单尚无 session,仅靠上面的 Origin 兜底)
+        if path not in _CSRF_EXEMPT_PATHS \
+                and request.headers.get("x-csrf-token", "") != _CSRF_TOKEN:
             return JSONResponse({"detail": "CSRF 校验失败,请刷新页面重试"}, status_code=403)
     return await call_next(request)
 
@@ -191,7 +193,6 @@ def _validate_host_url(raw: str) -> str:
     返回补好协议的 host_url;非法则抛 ValueError。
     """
     import ipaddress
-    import socket
     from urllib.parse import urlparse
 
     url = (raw or "").strip().rstrip("/")
@@ -200,27 +201,28 @@ def _validate_host_url(raw: str) -> str:
     if not url.lower().startswith(("http://", "https://")):
         url = "http://" + url            # 用户常只填 IP:端口
     parsed = urlparse(url)
-    host = parsed.hostname or ""
+    host = (parsed.hostname or "").strip()
     if not host:
         raise ValueError("主机地址格式不正确")
-    # 解析成 IP(域名先 DNS 解析),要求全部落在私网/回环/链路本地范围内
+    # 只允许**字面 IP** 或 localhost —— 拒绝主机名。
+    # 原因:主机名要 DNS 解析,而校验时解析和 httpx 请求时解析是两次(TOCTOU),
+    # 攻击者可让域名先解私网(过校验)、请求时再解公网(DNS-rebinding)把口令/token 送外。
+    # 字面 IP 无解析歧义;localhost 由 hosts 文件固定指向回环,不可被 DNS 操纵。
+    if host.lower() == "localhost":
+        return url
     try:
-        infos = socket.getaddrinfo(host, None)
-        ips = {ai[4][0] for ai in infos}
-    except OSError:
-        # 解析不了:仅放行字面私网/回环写法,其余拒绝
-        try:
-            ip = ipaddress.ip_address(host)
-            ips = {str(ip)}
-        except ValueError:
-            raise ValueError(f"无法解析主机地址「{host}」")
-    for ip_s in ips:
-        try:
-            ip = ipaddress.ip_address(ip_s)
-        except ValueError:
-            raise ValueError(f"主机地址「{host}」非法")
-        if not (ip.is_private or ip.is_loopback or ip.is_link_local):
-            raise ValueError(f"只允许连内网/本机主机,拒绝公网地址「{ip_s}」")
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        raise ValueError(f"只允许填**内网 IP** 或 localhost,不接受主机名「{host}」(防 DNS 劫持)")
+    # IPv4-mapped IPv6(::ffff:a.b.c.d)先归一到 IPv4 再判,避免旧版误判
+    if getattr(ip, "ipv4_mapped", None) is not None:
+        ip = ip.ipv4_mapped
+    # 显式拒 link-local —— 169.254.169.254 是云元数据端点(某些 Python 版本 is_private
+    # 也含 link-local,故单独判),放行会被 SSRF 窃取实例凭证
+    if ip.is_link_local:
+        raise ValueError(f"拒绝链路本地/元数据地址「{host}」")
+    if not (ip.is_private or ip.is_loopback):
+        raise ValueError(f"只允许连内网/本机主机,拒绝地址「{host}」")
     return url
 
 

@@ -671,21 +671,28 @@ def _detect_lazy_truncation(query: str, code: str) -> bool:
 # 按行序计算的窗口/时序函数 —— 未排序就调用会算出"数值全错但不报错"的结果
 _WINDOW_FUNC_PAT = re.compile(
     r"\.(?:diff|shift|pct_change|cumsum|cumprod|cummax|cummin|rolling|expanding|ewm)\s*\(|"
-    r"window\.(?:diff|lag|rolling_mean|rolling|pct_change|cumsum)\s*\("
+    r"window\.(?:diff|lag|rolling_mean|rolling|pct_change|cumsum)\s*\(|"
+    r"\bnp\.(?:diff|gradient|cumsum|cumprod|ediff1d)\s*\("        # numpy 函数形式
 )
-_SORT_PAT = re.compile(r"\.sort_values\s*\(|\.sort_index\s*\(|window\.[A-Za-z_]+\([^)]*sort")
+_SORT_PAT = re.compile(r"\.sort_values\s*\(|\.sort_index\s*\(|\.sort\s*\(|"
+                       r"window\.[A-Za-z_]+\([^)]*sort")
 
 
 def _detect_unsorted_window_risk(code: str) -> bool:
     """
-    代码用了按行序计算的窗口函数(环比/移动平均/累计…)但**全篇没有任何排序调用**
+    代码用了按行序计算的窗口函数(环比/移动平均/累计…)但在**该调用之前没有排序**
     → 高风险:结果可能数值全错却不报错。返回 True 表示需回喂 LLM 修正 + 禁止固化缓存。
-    这是静态启发式(宁可多问一次,不让错误代码被固化后每天复用)。
+
+    顺序敏感:只认"排序出现在第一个窗口调用之前"。先 diff 再 sort 仍算风险
+    (diff 已在乱序数据上算完)。启发式:宁可多问一次,不让错误代码被固化后每天复用。
     """
     c = code or ""
-    if not _WINDOW_FUNC_PAT.search(c):
+    m = _WINDOW_FUNC_PAT.search(c)
+    if not m:
         return False
-    return not _SORT_PAT.search(c)
+    # 第一个窗口调用之前必须已出现排序;之后才排序 = 没救到窗口计算
+    sort_m = _SORT_PAT.search(c)
+    return not (sort_m and sort_m.start() < m.start())
 
 
 # 筛选类问题(找异常/超期/不达标…)合法输出子集,不做全量验收
@@ -793,18 +800,41 @@ def _looks_compound(q: str) -> bool:
 _MAX_CODEGEN_ERROR_RETRIES = 2   # 真实数据执行崩溃 → 带错误反馈重生成的最大次数
 
 
-def _format_exec_error_feedback(exc: Exception, code: str) -> str:
+def _collect_identity_values(metadata_rows, metadata_columns, cap: int = 500) -> list:
+    """取身份列的去重取值(上限 cap),用作错误反馈的脱敏黑名单。"""
+    if not metadata_rows or not metadata_columns:
+        return []
+    seen: set = set()
+    for row in metadata_rows:
+        for c in metadata_columns:
+            v = row.get(c) if isinstance(row, dict) else None
+            if v is not None:
+                s = str(v).strip()
+                if len(s) >= 2:
+                    seen.add(s)
+            if len(seen) >= cap:
+                return list(seen)
+    return list(seen)
+
+
+def _format_exec_error_feedback(exc: Exception, code: str,
+                                identity_values: Optional[list] = None) -> str:
     """
     把执行异常整理成给 LLM 的修正反馈。只回传**异常类型 + 异常消息 + 出错代码行**,
-    异常消息里可能夹带的数据值风险极低(pandas 报错通常是列名/类型),但仍做一层零明文
-    过滤,避免真实数据值随 KeyError/断言消息回流给 LLM(明文不出本机的底线)。
+    异常消息里可能夹带数据值(如 "could not convert string to float: '张三'"),回流给 LLM
+    会破坏"明文不出本机" —— 故先做零明文过滤:模式(金额/日期/长数字)+ 身份列取值黑名单
+    (姓名/客户名等文本值没有通用模式,必须靠 blocklist 显式遮蔽)。
     """
     import traceback
     etype = type(exc).__name__
     emsg = str(exc)
     try:
         from client import permissions
-        res = permissions.scan_summary(emsg)   # 检测异常消息里夹带的疑似明文数值
+        # 身份列的真实取值作黑名单 —— 覆盖姓名/客户名/产品名等无模式的文本 PII
+        bl = None
+        if identity_values:
+            bl = [str(v) for v in identity_values if v is not None and len(str(v).strip()) >= 2]
+        res = permissions.scan_summary(emsg, extra_blocklist=bl)
         if not res.clean:
             for h in sorted(res.hits, key=lambda x: x.start, reverse=True):
                 emsg = emsg[:h.start] + "<已脱敏>" + emsg[h.end:]
@@ -872,6 +902,12 @@ def _run_codegen_path(
             # (已豁免的不再重检,避免每次作废重生成、缓存名存实亡)
             if not cached["lazy_waived"] and _detect_lazy_truncation(effective_query, code):
                 log("think", "固化代码截断了数据而用户要求全量 · 作废缓存,重新生成")
+                _codegen_cache_delete(cache_key)
+                code, summary_raw = "", ""
+            # 固化代码也复检窗口未排序风险 —— 加固上线前(或早期假阴性)固化的坏代码,
+            # 否则会每天复用且永不复检。命中即作废缓存,走重新生成(会带排序修正)。
+            elif _detect_unsorted_window_risk(code):
+                log("think", "固化代码有未排序窗口风险 · 作废缓存,重新生成")
                 _codegen_cache_delete(cache_key)
                 code, summary_raw = "", ""
             else:
@@ -1095,7 +1131,8 @@ def _run_codegen_path(
         # 真实数据上执行崩溃 —— README 承诺的"回环自修复":把具体报错回喂 LLM 重生成,
         # 而不是静默切到另一套固化 skill(那会给出结构迥异的结果或再撞同一个坑)。
         if error_retries < _MAX_CODEGEN_ERROR_RETRIES:
-            fb = _format_exec_error_feedback(e, code)
+            _idvals = _collect_identity_values(metadata_rows, metadata_columns)
+            fb = _format_exec_error_feedback(e, code, identity_values=_idvals)
             log("error", f"代码执行失败:{type(e).__name__}: {e} · "
                          f"带报错反馈重生成(第 {error_retries + 1}/{_MAX_CODEGEN_ERROR_RETRIES} 次)")
             return _run_codegen_path(
@@ -1154,6 +1191,7 @@ def _run_codegen_path(
                 log=log, chk=chk, prompt_decrypt=prompt_decrypt,
                 output_mode=output_mode, run_id=run_id, cache_key=cache_key,
                 web_search=web_search,
+                error_retries=error_retries,   # 透传:截断重生成不重置 error 预算,防重试放大
                 lazy_feedback=(
                     f"⚠️ 数据共 {n_src} 行,**每一行都是独立记录,不得合并行**;"
                     f"但你上次只输出了 {trunc_rows} 行。请改为**逐行明细**:行数 = 数据行数。"

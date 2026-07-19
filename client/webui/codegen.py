@@ -385,7 +385,9 @@ _ALLOWED_IMPORTS = {
     # 安全 stdlib(纯计算 / 时间 / 文本 / 容器算法)
     "math", "datetime", "time", "calendar", "re", "json",
     "statistics", "decimal", "fractions", "random", "string",
-    "collections", "itertools", "functools", "operator", "bisect", "heapq",
+    "collections", "itertools", "functools", "bisect", "heapq",
+    # 注意:不放 operator —— operator.attrgetter("__class__") / methodcaller 是
+    # getattr 的函数式替身,能绕过 AST 的字面量 dunder 检查取到类型链逃逸。
 }
 
 # 禁止调用的内建名 / 方法名(同时拦 `name(...)` 与 `.name(...)`)
@@ -401,8 +403,9 @@ _BANNED_CALLS = {
 }
 
 
-# 匹配 "{ ... .__xxx__ ... }" 式格式串属性访问(如 "{0.__class__.__init__.__globals__}")
-_re_dunder_in_str = __import__("re").compile(r"\{[^{}]*\.__[A-Za-z0-9_]+__")
+# 匹配字符串里的 dunder:格式串属性访问 "{0.__class__...}" 或裸 dunder 名 "__class__"
+# (后者用于挡 attrgetter("__class__") 式反射)
+_re_dunder_in_str = __import__("re").compile(r"__[A-Za-z][A-Za-z0-9_]*__")
 
 
 def ast_safety_check(code: str) -> None:
@@ -430,20 +433,20 @@ def ast_safety_check(code: str) -> None:
                 raise UnsafeCode(f"禁止调用「{fn.id}」")
             if isinstance(fn, ast.Attribute) and fn.attr in _BANNED_CALLS:
                 raise UnsafeCode(f"禁止调用「.{fn.attr}」")
-        # dunder 逃逸(().__class__.__bases__ 之类)
+        # 属性逃逸:禁一切**下划线开头**的属性访问(不止 dunder)——
+        # 既堵 ().__class__.__bases__,也堵门控代理内部字段 ct._ct(否则可旁路解密授权门)、
+        # df._mgr 等私有内部。合法分析代码(pandas/numpy 公有 API)不访问下划线属性。
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__") and node.attr.endswith("__"):
-                # 放行常见安全 dunder
-                if node.attr not in ("__len__", "__name__"):
-                    raise UnsafeCode(f"禁止访问 dunder 属性「.{node.attr}」")
+            if node.attr.startswith("_"):
+                raise UnsafeCode(f"禁止访问私有/内部属性「.{node.attr}」")
         elif isinstance(node, ast.Name):
             if node.id.startswith("__") and node.id.endswith("__") and node.id != "__name__":
                 raise UnsafeCode(f"禁止使用 dunder 名「{node.id}」")
-        # 字符串字面量里藏 dunder 属性访问(如 format-spec "{0.__class__}")—— 纵深防御,
-        # 即便 .format 已被 _BANNED_CALLS 拦住,也堵住 %/自定义模板等其它注入路径。
+        # 字符串字面量里藏 dunder(format-spec "{0.__class__}" 或裸 "__class__"
+        # 作 attrgetter 参数)—— 纵深防御,堵住把 dunder 名当字符串传入的反射路径。
         elif isinstance(node, ast.Constant) and isinstance(node.value, str):
-            if "__" in node.value and _re_dunder_in_str.search(node.value):
-                raise UnsafeCode("禁止在字符串里引用 dunder 属性(疑似格式串逃逸)")
+            if _re_dunder_in_str.search(node.value):
+                raise UnsafeCode("禁止在字符串里引用 dunder 属性(疑似反射/格式串逃逸)")
 
 
 # ---------------------------------------------------------------------------

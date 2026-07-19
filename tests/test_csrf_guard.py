@@ -52,3 +52,12 @@ def test_login_form_exempt_from_csrf():
                     data={"host_url": "http://127.0.0.1:8443", "username": "x", "password": "y"},
                     follow_redirects=False)
     assert r.status_code != 403
+
+
+def test_login_cross_site_origin_rejected():
+    # 登录 CSRF:跨站强制登入 —— 豁免 token 但仍须查 Origin
+    r = client.post("/login",
+                    headers={"Host": GOOD_HOST, "Origin": "https://evil.example.com"},
+                    data={"host_url": "http://127.0.0.1:8443", "username": "x", "password": "y"},
+                    follow_redirects=False)
+    assert r.status_code == 403
