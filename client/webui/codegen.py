@@ -116,6 +116,67 @@ class UnsafeCode(Exception):
     """AST 安全扫描发现危险构造。"""
 
 
+class CodegenTimeout(Exception):
+    """生成代码执行超过 wall-clock 上限(疑似死循环 / 超大密态运算)。"""
+
+
+# 生成代码执行的 wall-clock 上限(秒)。密态百万行聚合实测 1~2s;给足余量。
+_EXEC_TIMEOUT_SEC = 300
+
+
+def _run_exec_with_timeout(compiled, sandbox_globals, timeout, should_cancel):
+    """
+    在独立线程里跑受限 exec,加 wall-clock 超时 + 取消轮询。
+    超时/取消时用 PyThreadState_SetAsyncExc 向工作线程注入异常 —— 能打断纯 Python
+    死循环(while True);阻塞在 C 扩展里的调用打断不了(HE 运算有界会自行返回)。
+    工作线程即便未及时退出也是 daemon,不阻塞主流程。
+    """
+    import ctypes
+    import threading
+
+    box: dict = {}
+    done = threading.Event()
+
+    def _worker():
+        try:
+            exec(compiled, sandbox_globals)  # noqa: S102 —— 受限命名空间 + AST 扫描
+        except BaseException as e:  # noqa: BLE001 —— 捕获注入的异常与代码自身异常
+            box["err"] = e
+        finally:
+            done.set()
+
+    th = threading.Thread(target=_worker, name="codegen-exec", daemon=True)
+    th.start()
+
+    deadline = timeout
+    step = 0.2
+    waited = 0.0
+    cancelled = False
+    while waited < deadline:
+        if done.wait(step):
+            break
+        waited += step
+        if should_cancel and should_cancel():
+            cancelled = True
+            break
+
+    if not done.is_set():
+        # 注入异常打断工作线程(纯 Python 循环会在下一条字节码处抛出)
+        exc = CodegenCancelled if cancelled else CodegenTimeout
+        tid = th.ident
+        if tid is not None:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(tid), ctypes.py_object(exc))
+        done.wait(2.0)   # 给它两秒响应注入
+        if cancelled:
+            raise CodegenCancelled("用户已停止")
+        raise CodegenTimeout(
+            f"生成代码执行超过 {int(timeout)} 秒未完成(疑似死循环或超大运算),已中断")
+
+    if "err" in box:
+        raise box["err"]
+
+
 # ---------------------------------------------------------------------------
 # ① 组装代码生成提示
 # ---------------------------------------------------------------------------
@@ -257,7 +318,8 @@ hp.initDict() / ct.initSK()(已初始化):
    统一成小数再计算,别把 0.12 和 12 两种口径混在一起算。
 6. 列名严格用 schema 里的字段名(含括号单位);字段缺失就在 summary 说明缺什么,别硬编造数。
 7. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性、
-   getattr / setattr、str.format()/format_map()(用 f-string 代替)、read_pickle/read_parquet。
+   getattr / setattr、str.format()/format_map()(用 f-string 代替)、read_pickle/read_parquet、
+   **任何 to_csv/to_excel/to_json 等落盘方法**(结果只放进 results,由系统渲染 Excel)、df.query。
 8. **全量处理铁律(每一行都是独立记录,永不合并行)**:
    输出主表一律**逐行明细**:行数 = 数据行数,可排序、可加排名/档位/派生列。
    "按大区 / 各产品线 / 汇总"指的是**排序方式**(先按该维度排、组内再按指标降序;
@@ -397,9 +459,16 @@ _BANNED_CALLS = {
     "setattr", "memoryview", "help", "exit", "quit",
     # 反射逃逸面:getattr("字符串")可绕过字面量 dunder 检查取到 __class__/__globals__;
     # str.format/format_map 的 "{0.__class__}" 格式规格同样能穿透 AST 拿到类型链。
-    "getattr", "format", "format_map", "mro",
+    # vformat/get_field/get_value:string.Formatter 的运行时字段解析同样绕 AST。
+    "getattr", "format", "format_map", "mro", "vformat", "get_field", "get_value",
     # 反序列化可执行代码(纵深防御,即便 pandas/numpy 在白名单内)
     "read_pickle", "to_pickle", "read_parquet",
+    # 文件写出方法:pandas 的 to_* 用自己的句柄不经沙盒 open,会把**解密明文**写到
+    # 输出白名单之外的任意路径 —— 全部禁掉(结果落盘只能走受控的 writer)。
+    "to_csv", "to_excel", "to_json", "to_html", "to_parquet", "to_feather",
+    "to_hdf", "to_stata", "to_markdown", "to_xml", "to_latex", "to_clipboard",
+    "savetxt", "tofile", "save", "savez", "savez_compressed",  # numpy 写盘
+    "query",  # df.query(engine="python") 可评估表达式
 }
 
 
@@ -676,7 +745,8 @@ def run_generated_code(
     }
 
     compiled = compile(code, "<generated_skill_code>", "exec")
-    exec(compiled, sandbox_globals)  # noqa: S102 —— 受限命名空间 + AST 扫描
+    # 独立线程 + wall-clock 超时 + 取消轮询 —— 防 while True 挂死守护线程、点停止无效
+    _run_exec_with_timeout(compiled, sandbox_globals, _EXEC_TIMEOUT_SEC, should_cancel)
 
     # 取回 results(代码可能重新赋值 results = [...])
     final = sandbox_globals.get("results", results)

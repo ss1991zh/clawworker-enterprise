@@ -167,6 +167,8 @@ class ScheduledTask:
     session_id: str = ""                # 该任务的聊天会话(累积它的历次运行)
     last_fired: str = ""
     next_run: str = ""
+    fail_streak: int = 0                # 连续失败次数(成功清零);达阈值自动暂停 + 告警
+    auto_paused_reason: str = ""        # 因连续失败被自动暂停的原因(非空 = 熔断暂停)
     created_at: str = field(default_factory=lambda: _iso(_now()))
 
     @property

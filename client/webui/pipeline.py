@@ -1123,6 +1123,12 @@ def _run_codegen_path(
     except codegen_mod.CodegenCancelled:
         log("error", "已停止 · 用户取消")
         return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
+    except codegen_mod.CodegenTimeout as e:
+        # 死循环/超大运算超时是终态:回退固化 skill 也可能同样超时,直接报给用户
+        log("error", f"执行超时:{e}")
+        return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
+                "error": (f"{e}。请把问题拆小(如先按维度聚合、只看 TOP-N),"
+                          "或缩小数据范围后重试。")}
     except codegen_mod.KeepEncrypted:
         log("call", "用户选择保留密文 · 导出源密文 Excel")
         try:

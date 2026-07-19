@@ -224,6 +224,32 @@ def test_operator_not_importable():
         cg.ast_safety_check("import operator")
 
 
+@pytest.mark.parametrize("code", [
+    'df.to_csv("C:/Users/Public/leak.csv")',       # 解密明文写白名单外
+    'df.to_excel("/tmp/x.xlsx")',
+    'df.to_json("out.json")',
+    'df.to_html("x.html")',
+    'import numpy as np\nnp.savetxt("x.txt", arr)',
+    'arr.tofile("x.bin")',
+    'df.query("a > @b", engine="python")',
+    'import string\nstring.Formatter().vformat(f, [o], {})',
+])
+def test_file_write_and_formatter_blocked(code):
+    with pytest.raises(cg.UnsafeCode):
+        cg.ast_safety_check(code)
+
+
+@pytest.mark.parametrize("code", [
+    'd = df.to_dict()',                            # 这些 to_* 是内存转换,合法
+    'a = df.to_numpy()',
+    's = df["x"].to_list()',
+    'f = series.to_frame()',
+    'import pandas as pd\nt = pd.to_datetime(df["月份"])',
+])
+def test_memory_conversions_still_pass(code):
+    cg.ast_safety_check(code)
+
+
 def test_getattr_format_not_in_safe_builtins():
     b = cg._safe_builtins(lambda *a, **k: None)
     assert "getattr" not in b and "format" not in b

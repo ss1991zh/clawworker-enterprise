@@ -1660,6 +1660,7 @@ def _run_pipeline(
             duration_sec=round(time.time() - t0, 2),
             used_cipher=used_cipher,
         )
+        _record_sched_outcome(sched_task, ok=False, err=err)  # 定时任务失败熔断计数
         return
 
     # 定时密态:结果加密暂存 → 累积成 EncryptedResult(按任务聚合,待批量解密)
@@ -1695,6 +1696,7 @@ def _run_pipeline(
             duration_sec=round(time.time() - t0, 2),
             tokens=int(result.get("tokens", 0) or 0),
         )
+        _record_sched_outcome(sched_task, ok=True)   # 成功 → 清零连续失败计数
         return
 
     excel_path = result.get("excel_path", "")
@@ -1885,6 +1887,47 @@ def _on_scheduler_miss(task, due_dt) -> None:
         ran_at=_now_iso(), status="missed",
         summary=f"漏跑:{due_at} 该轮未执行(服务未运行)· 已生成预警",
     )
+
+
+_SCHED_FAIL_DISABLE_AT = 3   # 连续失败达此次数 → 自动暂停任务并告警
+
+
+def _record_sched_outcome(sched_task, *, ok: bool, err: str = "") -> None:
+    """
+    记定时任务运行结果:成功清零连续失败;失败累加,达阈值自动暂停并发通知。
+    解决"定时任务每期静默失败、界面全 0、用户以为正常产出"的问题。
+    """
+    if sched_task is None:
+        return
+    try:
+        t = _task_store.get(sched_task.id)
+        if not t:
+            return
+        if ok:
+            if getattr(t, "fail_streak", 0):
+                _task_store.update(sched_task.id, fail_streak=0, auto_paused_reason="")
+            return
+        streak = int(getattr(t, "fail_streak", 0)) + 1
+        if streak >= _SCHED_FAIL_DISABLE_AT:
+            # 连续失败达阈值 → 自动暂停,避免每天静默失败刷屏且浪费算力
+            _task_store.update(sched_task.id, fail_streak=streak, enabled=False,
+                               auto_paused_reason=f"连续 {streak} 次失败已自动暂停")
+            _notice_store.add(
+                username=t.username, key=f"schedfail:{t.id}:{streak}", level="error",
+                title=f"定时任务已自动暂停 · {t.name}",
+                summary=(f"任务「{t.name}」连续 {streak} 次运行失败,已自动暂停以免持续空跑。"
+                         f"最近错误:{err[:120]}。修正后到「定时任务管理」重新启用。"),
+                created_at=_now_iso())
+        else:
+            _task_store.update(sched_task.id, fail_streak=streak)
+            _notice_store.add(
+                username=t.username, key=f"schedfail:{t.id}:{streak}", level="warning",
+                title=f"定时任务运行失败 · {t.name}",
+                summary=(f"任务「{t.name}」第 {streak} 次失败:{err[:120]}。"
+                         f"连续 {_SCHED_FAIL_DISABLE_AT} 次将自动暂停。"),
+                created_at=_now_iso())
+    except Exception:  # noqa: BLE001 —— 熔断记账失败绝不影响主流程
+        pass
 
 
 def _on_scheduler_fire(task) -> None:
