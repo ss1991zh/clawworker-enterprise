@@ -97,6 +97,16 @@ def _decrypt(cdf):
     return ct.decrypt_df(cdf)
 
 
+def _inf_to_nan(values):
+    """
+    除法结果清理:±inf(除零产物)→ NaN。
+    不清理的话 inf 会在降序排序里霸榜第一名;NaN 排序时自动沉底(na_position 默认 last)。
+    """
+    import numpy as np
+    arr = np.asarray(values, dtype=float)
+    return np.where(np.isfinite(arr), arr, np.nan)
+
+
 # ----- 时间优先排序(有时间列时,指标高低降一级,时间序在前)-----
 
 # 时间列名关键词:含这些词(或 datetime dtype)即视为时间维度。
@@ -133,10 +143,31 @@ def _time_sort_series(series):
         return dt
 
     def _key(v):
-        nums = re.findall(r"\d+", str(v))
+        txt = re.sub(r"[〇零一二两三四五六七八九十]+",
+                     lambda m: (lambda n: str(n) if n is not None else m.group(0))(
+                         _cn_to_num(m.group(0))),
+                     str(v))
+        nums = re.findall(r"\d+", txt)
         return tuple(int(x) for x in nums) if nums else (float("inf"),)
 
     return s.map(_key)
+
+
+def _cn_to_num(t: str):
+    """中文数字 → 阿拉伯数字:「三」→3、「十月」的「十」→10、「二十三」→23、
+    「二〇二六」→2026(逐字)。解析不了返回 None。覆盖月/季/周/年场景(<100 + 逐字年份)。"""
+    digits = {"〇": 0, "零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    if not t:
+        return None
+    if "十" in t:
+        a, _, b = t.partition("十")
+        if (a and a not in digits) or (b and b not in digits):
+            return None
+        return (digits[a] if a else 1) * 10 + (digits[b] if b else 0)
+    if all(ch in digits for ch in t):
+        return int("".join(str(digits[ch]) for ch in t))
+    return None
 
 
 def _sort_group_result(out, group, metric, ascending):
@@ -254,7 +285,7 @@ def skill_ratio_by_group(cdf, params: dict, metadata_rows, metadata_columns):
         最大值=(num, 'max'),
         最小值=(num, 'min'),
     )
-    grouped[metric] = grouped['分子总和'] / grouped['分母总和']
+    grouped[metric] = _inf_to_nan(grouped['分子总和'] / grouped['分母总和'])  # 除零沉底不霸榜
     out = grouped[[group, '订单数', metric, '最大值', '最小值']]
     # 分组维度是时间(按月/按季…)→ 时间升序,指标高低降一级;否则按指标降序
     out = _sort_group_result(out, group, metric, bool(params.get('ascending', False)))
@@ -294,7 +325,7 @@ def skill_row_ratio_then_group_mean(cdf, params, metadata_rows, metadata_columns
     if group not in full.columns:
         raise ValueError(f"row_ratio_then_group_mean: group_col 「{group}」不存在")
 
-    full["__ratio__"] = full[num] / full[den]
+    full["__ratio__"] = _inf_to_nan(full[num] / full[den])  # 除零沉底不霸榜
     grouped = full.groupby(group, as_index=False).agg(
         订单数=(num, 'count'),
         平均比率=("__ratio__", 'mean'),
@@ -336,7 +367,9 @@ def skill_top_n_by(cdf, params, metadata_rows, metadata_columns):
         raise ValueError(f"top_n_by: value_col「{value_col}」不存在")
 
     sorted_df = full.sort_values(value_col, ascending=ascending).head(n).reset_index(drop=True)
-    sorted_df.insert(0, "排名", range(1, len(sorted_df) + 1))
+    # 并列同名次(1,1,3 式):同值共享名次,而不是按行号硬编 1,2,3
+    ranks = sorted_df[value_col].rank(method="min", ascending=ascending)
+    sorted_df.insert(0, "排名", ranks.fillna(len(sorted_df)).astype(int))
 
     rank_type = "BOTTOM" if ascending else "TOP"
     sheet_name = params.get("sheet_name") or f"{rank_type}{n} {value_col}"
@@ -463,7 +496,7 @@ def _apply_compute(full, spec: dict):
             num_arr = full[num].to_numpy()
             den_arr = full[den].to_numpy()
             with np.errstate(divide="ignore", invalid="ignore"):
-                full[name] = np.divide(num_arr, den_arr)
+                full[name] = _inf_to_nan(np.divide(num_arr, den_arr))
         return
 
     # 形式③:formula
@@ -509,6 +542,7 @@ def _apply_compute(full, spec: dict):
         for v in arrays[1:]:
             with np.errstate(divide="ignore", invalid="ignore"):
                 result = np.divide(result, v)
+        result = _inf_to_nan(result)
     else:
         raise ValueError(f"派生列「{name}」op「{op}」不支持(可用: add/sub/mul/div/ratio)")
 

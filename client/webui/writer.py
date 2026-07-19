@@ -259,7 +259,7 @@ def write_skill_results(
     staging=True:写到暂存目录(不自动进 Downloads,供交互式「点下载才保存」)。
 
     每个 result dict 至少含 sheet_name + df,以下键全部可选(声明即美化):
-        chart:          {"type":"bar"|"line","x":..,"y":..|[..],"title":..}
+        chart:          {"type":"bar"|"line"|"pie"|"stacked_bar","x":..,"y":..|[..],"title":..}
         tier_col:       <档位文字列名> —— 该列按语义上色(不传则按列名自动识别)
         total_row:      True | {"label":"合计","sum":[列..],"mean":[列..]}
         note:           <表顶一行灰色说明>
@@ -355,8 +355,11 @@ def _render_sheet(ws, df, r: dict) -> None:
     n_cols = len(headers)
     header_row = 1
 
-    # 可选:表顶说明 caption
+    # 可选:表顶说明 caption(时间列有断档时自动追加缺期预警)
     note = r.get("note")
+    gap_warn = _time_gap_warning(df, chart_specs)
+    if gap_warn:
+        note = f"{note} · {gap_warn}" if note else gap_warn
     if note:
         c = ws.cell(1, 1, str(note))
         c.font = Font(italic=True, color="6B7280", size=10)
@@ -440,16 +443,24 @@ def _render_sheet(ws, df, r: dict) -> None:
             lo, mid, hi = "F8696B", "FFEB84", "63BE7B"  # 红→黄→绿
             if any(k in str(h) for k in _REVERSE_METRIC):
                 lo, hi = hi, lo
+            # 含负值(亏损)的列:色阶中点锚在 0,负=红正=绿;否则按中位数
+            has_neg = False
+            try:
+                import pandas as pd
+                if h in df.columns:
+                    has_neg = bool((pd.to_numeric(df[h], errors="coerce") < 0).any())
+            except Exception:
+                pass
             col = get_column_letter(ci)
             try:
-                ws.conditional_formatting.add(
-                    f"{col}{data0}:{col}{data_last}",
-                    ColorScaleRule(
-                        start_type="min", start_color=lo,
-                        mid_type="percentile", mid_value=50, mid_color=mid,
-                        end_type="max", end_color=hi,
-                    ),
-                )
+                rule = (ColorScaleRule(start_type="min", start_color=lo,
+                                       mid_type="num", mid_value=0, mid_color=mid,
+                                       end_type="max", end_color=hi)
+                        if has_neg else
+                        ColorScaleRule(start_type="min", start_color=lo,
+                                       mid_type="percentile", mid_value=50, mid_color=mid,
+                                       end_type="max", end_color=hi))
+                ws.conditional_formatting.add(f"{col}{data0}:{col}{data_last}", rule)
             except Exception:
                 pass
 
@@ -748,6 +759,48 @@ def _encrypt_numeric_columns(df):
     return merged
 
 
+def _time_gap_warning(df, chart_specs: list) -> str:
+    """
+    折线图 x 轴是时间列时检测断档:缺月的折线会把 1月直接连到 3月,看似平滑实为缺数。
+    返回「⚠ 时间不连续:缺 2月、5月」式提示(轻量版,只提示不重构图);无断档返回 ""。
+    """
+    try:
+        from client.tools.skills import _is_time_col, _time_sort_series
+    except Exception:
+        return ""
+    for spec in chart_specs or []:
+        if (spec.get("type") or "").lower() != "line":
+            continue
+        x = spec.get("x")
+        if not x or x not in df.columns or not _is_time_col(x, df[x]):
+            continue
+        try:
+            keys = {k for k in _time_sort_series(df[x]).tolist()
+                    if isinstance(k, tuple) and all(v == v and v != float("inf") for v in k)}
+            if not keys or len({len(k) for k in keys}) != 1:
+                continue
+            width = len(next(iter(keys)))
+            # 归一成线性序号:纯月份=月号;(年,月)=年*12+月;其余粒度只查同前缀内的断档
+            if width == 1:
+                nums = sorted(k[0] for k in keys)
+            elif width == 2:
+                nums = sorted(k[0] * 12 + k[1] for k in keys)
+            else:
+                continue
+            missing = [n for n in range(nums[0] + 1, nums[-1]) if n not in set(nums)]
+            if not missing:
+                continue
+            if width == 1:
+                names = [f"{m}月" for m in missing[:6]]
+            else:
+                names = [f"{(m - 1) // 12}年{(m - 1) % 12 + 1}月" for m in missing[:6]]
+            more = f" 等 {len(missing)} 期" if len(missing) > 6 else ""
+            return f"⚠ 时间不连续:缺 {'、'.join(names)}{more},折线在缺口处为跨期直连"
+        except Exception:
+            continue
+    return ""
+
+
 def _collect_chart_specs(r: dict) -> list:
     """从 result dict 收集图表规格 —— 支持单个 chart 或 charts 列表(多图)。"""
     specs: list = []
@@ -860,6 +913,21 @@ def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
     x_idx = headers.index(x) + 1
     y_idxs = [headers.index(c) + 1 for c in valid_y]
 
+    # 量纲检测:金额(百万级)和比率(0~1)画同一张图会把比率压成地平线。
+    # 多 y 系列量纲差 >50 倍时,小量纲系列放**次轴**(折线),各自有自己的刻度。
+    sec_y_idxs: list = []
+    if typ in ("bar", "line") and len(valid_y) >= 2:
+        try:
+            import pandas as pd
+            scales = {c: float(pd.to_numeric(df[c], errors="coerce").abs().max())
+                      for c in valid_y}
+            big = max(v for v in scales.values() if v == v)  # 忽略 NaN
+            small = [c for c, v in scales.items() if v > 0 and big / v > 50]
+            if small and len(small) < len(valid_y):
+                sec_y_idxs = [headers.index(c) + 1 for c in small]
+        except Exception:
+            sec_y_idxs = []
+
     charts: list = []
     if split_by and split_by in df.columns:
         # df 已按 split_by 预排序 → 每组是连续行块
@@ -880,64 +948,167 @@ def _expand_chart_spec(ws, df, spec: dict, headers: list, data0: int) -> list:
                 if len(charts) >= _MAX_SPLIT_CHARTS:
                     break
                 charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
-                                          fr, lr, page_title))
+                                          fr, lr, page_title, sec_y_idxs))
     else:
         eff = _trim_trailing_totals(df, x)
         if eff <= 0:
             return []
-        for fr, lr, page_title in _paginate_rows(data0, data0 + eff - 1, base_title):
+        blocks = _entity_block_starts(df, x, eff)   # 分页对齐实体块,不拦腰切断
+        for fr, lr, page_title in _paginate_rows(data0, data0 + eff - 1, base_title, blocks):
             charts.append(_make_chart(ws, typ, x_idx, y_idxs, headers,
-                                      fr, lr, page_title))
+                                      fr, lr, page_title, sec_y_idxs))
     return charts
 
 
-def _paginate_rows(first_row: int, last_row: int, base_title: str) -> list:
+def _entity_block_starts(df, x_name: str, n_rows: int) -> list:
     """
-    把 [first_row, last_row] 行区间按 _MAX_ROWS_PER_CHART 分页:
-    行数不超限 → 原样一页;超限 → 均匀切成若干连续页,每页一张图,
+    找实体块边界(0-based 起始偏移列表,首元素为 0)。
+    实体块 = 某文本列里连续同值的行段(逐行明细通常已按产品/大区聚块)。
+    选块数最少(最外层维度)的文本列;全同值/全唯一的列不算块维度,找不到返回 []。
+    """
+    import pandas as pd
+    best = None
+    for c in df.columns:
+        if str(c) == str(x_name):
+            continue
+        s = df[c].iloc[:n_rows]
+        if pd.api.types.is_numeric_dtype(s):
+            continue
+        vals = s.astype(str).tolist()
+        starts = [0] + [i for i in range(1, n_rows) if vals[i] != vals[i - 1]]
+        n_runs = len(starts)
+        if n_runs <= 1 or n_runs >= n_rows:
+            continue
+        if best is None or n_runs < best[0]:
+            best = (n_runs, starts)
+    return best[1] if best else []
+
+
+def _paginate_rows(first_row: int, last_row: int, base_title: str,
+                   block_starts: Optional[list] = None) -> list:
+    """
+    把 [first_row, last_row] 行区间按 _MAX_ROWS_PER_CHART 分页,每页一张图,
     标题带「(第 i/n 页 · 第 a-b 行)」后缀。页数封顶 _MAX_SPLIT_CHARTS
     (超出时自动加大每页行数,保证所有数据仍被画全)。
+
+    传入 block_starts(实体块 0-based 起始偏移)时,页边界对齐块边界——
+    整块整块装页,不把某个产品的时间序列拦腰切到两张图;单块超页容量才按行切。
     """
     import math
 
     n = last_row - first_row + 1
     if n <= _MAX_ROWS_PER_CHART:
         return [(first_row, last_row, base_title)]
-    pages = min(math.ceil(n / _MAX_ROWS_PER_CHART), _MAX_SPLIT_CHARTS)
-    size = math.ceil(n / pages)
+    size = max(_MAX_ROWS_PER_CHART, math.ceil(n / _MAX_SPLIT_CHARTS))
+
+    def _spans_by_rows(sz: int) -> list:
+        pages = math.ceil(n / sz)
+        sz = math.ceil(n / pages)   # 均匀化
+        return [(i * sz, min(n - 1, (i + 1) * sz - 1)) for i in range(pages)]
+
+    def _spans_by_blocks(sz: int) -> list:
+        bounds = list(block_starts) + [n]
+        spans, cur_s, cur_len = [], 0, 0
+        for bi in range(len(bounds) - 1):
+            b0, b1 = bounds[bi], bounds[bi + 1]
+            blk = b1 - b0
+            if blk > sz:                       # 单块超页容量 → 先收尾,再块内按行切
+                if cur_len:
+                    spans.append((cur_s, b0 - 1))
+                spans.extend((b0 + s, b0 + e) for s, e in
+                             [(i * sz, min(blk - 1, (i + 1) * sz - 1))
+                              for i in range(math.ceil(blk / sz))])
+                cur_s, cur_len = b1, 0
+            elif cur_len and cur_len + blk > sz:  # 装不下 → 换页
+                spans.append((cur_s, b0 - 1))
+                cur_s, cur_len = b0, blk
+            else:
+                if not cur_len:
+                    cur_s = b0
+                cur_len += blk
+        if cur_len:
+            spans.append((cur_s, n - 1))
+        return spans
+
+    if block_starts:
+        spans = _spans_by_blocks(size)
+        tries = 0
+        while len(spans) > _MAX_SPLIT_CHARTS and tries < 4:   # 页数超限 → 加大页容量重排
+            size = math.ceil(size * 1.5)
+            spans = _spans_by_blocks(size)
+            tries += 1
+        if len(spans) > _MAX_SPLIT_CHARTS:
+            spans = _spans_by_rows(size)
+    else:
+        spans = _spans_by_rows(size)
+
     out = []
-    for i in range(pages):
-        fr = first_row + i * size
-        lr = min(last_row, fr + size - 1)
-        if fr > last_row:
-            break
-        a, b = fr - first_row + 1, lr - first_row + 1
-        suffix = f"(第 {i + 1}/{pages} 页 · 第 {a}-{b} 行)"
-        out.append((fr, lr, f"{base_title} {suffix}" if base_title else suffix))
+    for i, (s, e) in enumerate(spans):
+        suffix = f"(第 {i + 1}/{len(spans)} 页 · 第 {s + 1}-{e + 1} 行)"
+        out.append((first_row + s, first_row + e,
+                    f"{base_title} {suffix}" if base_title else suffix))
     return out
 
 
 def _make_chart(ws, typ: str, x_idx: int, y_idxs: list, headers: list,
-                first_row: int, last_row: int, title: str):
+                first_row: int, last_row: int, title: str,
+                sec_y_idxs: Optional[list] = None):
     """
     构建一张产品级图表(支持任意连续行子区间):
     显式系列名(不依赖表头连续)/ 轴标题 / 图例底部 / 折线圆点 / Y 轴数字格式 / 网格。
+    类型:bar(默认) / line / pie(占比) / stacked_bar(构成堆积)。
     """
-    from openpyxl.chart import BarChart, LineChart, Reference, Series
+    from openpyxl.chart import BarChart, LineChart, PieChart, Reference, Series
 
     if last_row < first_row:
         return None
-    chart = (LineChart if typ == "line" else BarChart)()
+    if typ == "pie":
+        chart = PieChart()
+    elif typ == "line":
+        chart = LineChart()
+    else:
+        chart = BarChart()
+        if typ in ("stacked", "stacked_bar"):
+            chart.type = "col"
+            chart.grouping = "stacked"
+            chart.overlap = 100
     chart.title = title or None
     chart.style = 12
     chart.height = 8.5
     chart.width = 20
 
     cats = Reference(ws, min_col=x_idx, min_row=first_row, max_row=last_row)
-    for yi in y_idxs:
+    sec = set(sec_y_idxs or []) if typ != "pie" else set()
+    use_y = y_idxs[:1] if typ == "pie" else [yi for yi in y_idxs if yi not in sec]
+    if not use_y and y_idxs:   # 全被划去次轴时至少留一个在主轴
+        use_y, sec = y_idxs[:1], sec - {y_idxs[0]}
+    for yi in use_y:
         data = Reference(ws, min_col=yi, min_row=first_row, max_row=last_row)
         chart.series.append(Series(data, title=headers[yi - 1]))  # 显式系列名
     chart.set_categories(cats)
+    if sec:
+        # 次轴组合图:小量纲系列(比率等)画成折线挂在右侧第二 Y 轴
+        try:
+            sub = LineChart()
+            for yi in sorted(sec):
+                data = Reference(ws, min_col=yi, min_row=first_row, max_row=last_row)
+                sub.series.append(Series(data, title=headers[yi - 1]))
+            sub.y_axis.axId = 200
+            sub.y_axis.title = headers[sorted(sec)[0] - 1]
+            sub.y_axis.crosses = "max"
+            sub.y_axis.numFmt = _infer_number_format(headers[sorted(sec)[0] - 1]) or "0.00%"
+            from openpyxl.chart.marker import Marker
+            for s_ in sub.series:
+                s_.marker = Marker(symbol="circle", size=5)
+            chart += sub
+        except Exception:
+            pass
+    if typ == "pie":
+        try:
+            from openpyxl.chart.label import DataLabelList
+            chart.dataLabels = DataLabelList(showPercent=True)   # 占比直接标在饼上
+        except Exception:
+            pass
 
     try:
         chart.x_axis.title = headers[x_idx - 1]
