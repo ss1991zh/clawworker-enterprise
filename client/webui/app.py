@@ -647,6 +647,16 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         from client.he_ops import data_health as _dh
         df, numeric_cols, string_cols, _reports = _dh.clean_for_encryption(df)
         data_health = _dh.health_summary(_reports, len(df))
+        # 疑似重复导入检测:全行重复(同一批订单传两次)会让金额/数量汇总直接翻倍。
+        # 只提示不删——重复行也可能是合法记录(两笔一模一样的订单),由用户判断。
+        dup = int(df.duplicated().sum())
+        if dup:
+            pct = dup / max(len(df), 1) * 100
+            data_health["duplicate_rows"] = dup
+            data_health["message"] = (
+                f"{data_health.get('message', '')} · ⚠ 检测到 {dup} 行完全重复的记录"
+                f"(占 {pct:.1f}%),疑似重复导入——汇总类指标可能被放大,请核对源文件"
+            ).lstrip(" ·")
     except Exception:  # noqa: BLE001 —— 体检失败不阻断入库
         string_cols = df.select_dtypes(include=["object", "string"]).columns.tolist()
         numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()

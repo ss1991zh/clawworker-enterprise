@@ -253,6 +253,7 @@ def write_skill_results(
     path: Optional[Path] = None,
     stem: Optional[str] = None,
     staging: bool = False,
+    provenance: Optional[dict] = None,
 ) -> Path:
     """
     把 [{sheet_name, df, ...}] 列表写成产品级多 sheet xlsx。
@@ -292,8 +293,46 @@ def write_skill_results(
     if not wb.sheetnames:  # 全空兜底(openpyxl 不允许零 sheet 保存)
         wb.create_sheet(title="结果")
 
+    # 溯源 sheet:这份 Excel 用什么数据、什么口径、什么时候算的 —— 审计可回答
+    if provenance is not None:
+        try:
+            _append_provenance_sheet(wb, results, provenance)
+        except Exception:
+            pass  # 溯源失败不阻断落盘
+
     wb.save(dst)
     return dst
+
+
+def _append_provenance_sheet(wb, results: list[dict], provenance: dict) -> None:
+    """末尾附「口径说明」sheet:生成时间 + 调用方提供的溯源信息 + 各 sheet 行列数与口径。"""
+    from datetime import datetime
+    from openpyxl.styles import Alignment, Font, PatternFill
+
+    ws = wb.create_sheet(title="口径说明")
+    rows: list[tuple[str, str]] = [("生成时间", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))]
+    rows.extend((str(k), str(v)) for k, v in provenance.items())
+    for r in results:
+        df = r.get("df")
+        if df is None or getattr(df, "empty", True):
+            continue
+        nm = str(r.get("sheet_name") or "Sheet")[:31]
+        desc = f"{len(df)} 行 × {len(df.columns)} 列"
+        if r.get("note"):
+            desc += f" · {r['note']}"
+        rows.append((f"sheet「{nm}」", desc))
+
+    head = ws.cell(1, 1, "结果溯源 · 口径说明")
+    head.font = Font(bold=True, size=13, color="1E3A8A")
+    head.fill = PatternFill("solid", fgColor="DBEAFE")
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=2)
+    for i, (k, v) in enumerate(rows, 2):
+        kc = ws.cell(i, 1, k)
+        kc.font = Font(bold=True, color="374151")
+        vc = ws.cell(i, 2, v)
+        vc.alignment = Alignment(wrap_text=True, vertical="top")
+    ws.column_dimensions["A"].width = 24
+    ws.column_dimensions["B"].width = 90
 
 
 def _dedup_columns(df):
@@ -379,6 +418,17 @@ def _render_sheet(ws, df, r: dict) -> None:
     col_fmt: dict[int, str] = {}
     for ci, h in enumerate(headers, 1):
         nf = _infer_number_format(h)
+        if nf == "0.00%":
+            # 百分比口径体检:列名像"率"但值域普遍 >1.5,说明数据存的是百分数(12=12%)
+            # 而不是小数(0.12)。套 0.00% 会显示成 1200% —— 改用字面 % 格式,数值不乘 100。
+            try:
+                import pandas as pd
+                v = pd.to_numeric(df[h], errors="coerce").abs()
+                v = v[v.notna()]
+                if len(v) and float(v.median()) > 1.5:
+                    nf = '0.00"%"'
+            except Exception:
+                pass
         if nf:
             col_fmt[ci] = nf
     for col, fmt in (r.get("number_formats") or {}).items():
@@ -438,7 +488,7 @@ def _render_sheet(ws, df, r: dict) -> None:
     # 百分比列三色阶(逆向指标如逾期/超支自动反色)
     if n_data >= 2:
         for ci, h in enumerate(headers, 1):
-            if col_fmt.get(ci) != "0.00%":
+            if col_fmt.get(ci) not in ("0.00%", '0.00"%"'):
                 continue
             lo, mid, hi = "F8696B", "FFEB84", "63BE7B"  # 红→黄→绿
             if any(k in str(h) for k in _REVERSE_METRIC):
@@ -472,18 +522,59 @@ def _render_sheet(ws, df, r: dict) -> None:
             pass  # 图表失败不阻断落盘
 
 
+def _weighted_ratio_total(df, ratio_col):
+    """
+    比率列的合计口径:在表内找 分子/分母 列对(a/b 逐行 ≈ 比率列)→ 返回 sum(a)/sum(b)。
+    合计行的总回款率 = 总回款 ÷ 总销售额(加权),**不是**各行率的简单平均
+    (大客户 90% 小客户 10%,简单平均 50%,加权可能 85%)。匹配不到返回 None。
+    """
+    import numpy as np
+    import pandas as pd
+    try:
+        r = pd.to_numeric(df[ratio_col], errors="coerce").to_numpy(dtype=float)
+        mask = np.isfinite(r)
+        if mask.sum() < 2:
+            return None
+        num_cols = [c for c in df.columns
+                    if c != ratio_col and pd.api.types.is_numeric_dtype(df[c])]
+        for a in num_cols:
+            va = pd.to_numeric(df[a], errors="coerce").to_numpy(dtype=float)
+            for b in num_cols:
+                if a == b:
+                    continue
+                vb = pd.to_numeric(df[b], errors="coerce").to_numpy(dtype=float)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    q = va / vb
+                ok = np.isfinite(q) & mask
+                if ok.sum() < 2 or ok.sum() < mask.sum() * 0.9:
+                    continue
+                if np.allclose(q[ok], r[ok], rtol=5e-3, atol=1e-9):
+                    sb = float(vb[ok].sum())
+                    if sb:
+                        return float(va[ok].sum()) / sb
+        return None
+    except Exception:
+        return None
+
+
 def _write_total_row(ws, df, headers, col_fmt, data0, data_last, spec) -> None:
-    """在数据末尾追加一行合计/均值。spec=True 自动推断;dict 可指定 sum/mean 列。"""
+    """
+    在数据末尾追加一行合计/均值。spec=True 自动推断;dict 可指定
+    {label, sum:[列..], mean:[列..], values:{列:显式值}}(values 优先级最高)。
+    比率列自动尝试**加权口径**(总分子/总分母),匹配不到才退回简单均值。
+    """
     import pandas as pd
     from openpyxl.styles import Font, PatternFill
 
     label = "合计"
     sum_cols: list = []
     mean_cols: list = []
+    values: dict = {}
     if isinstance(spec, dict):
         label = spec.get("label") or "合计"
         sum_cols = list(spec.get("sum") or [])
         mean_cols = list(spec.get("mean") or [])
+        values = dict(spec.get("values") or {})
     if not sum_cols and not mean_cols:  # 自动:金额/计数列求和,百分比列取均值
         for h in headers:
             # 排名/序号是序数,求和无意义,跳过
@@ -504,7 +595,7 @@ def _write_total_row(ws, df, headers, col_fmt, data0, data_last, spec) -> None:
     # 标签放第一个"非汇总"列,避免覆盖数值
     label_ci = 1
     for ci, h in enumerate(headers, 1):
-        if h not in sum_cols and h not in mean_cols:
+        if h not in sum_cols and h not in mean_cols and h not in values:
             label_ci = ci
             break
     ws.cell(row_idx, label_ci, label)
@@ -512,10 +603,13 @@ def _write_total_row(ws, df, headers, col_fmt, data0, data_last, spec) -> None:
         if ci == label_ci:
             continue
         try:
-            if h in sum_cols and pd.api.types.is_numeric_dtype(df[h]):
+            if h in values:
+                val = float(values[h])                     # 调用方显式给的合计值最优先
+            elif h in sum_cols and pd.api.types.is_numeric_dtype(df[h]):
                 val = float(df[h].sum())
             elif h in mean_cols and pd.api.types.is_numeric_dtype(df[h]):
-                val = float(df[h].mean())
+                w = _weighted_ratio_total(df, h)           # 比率列优先加权口径
+                val = float(w) if w is not None else float(df[h].mean())
             else:
                 continue
         except Exception:

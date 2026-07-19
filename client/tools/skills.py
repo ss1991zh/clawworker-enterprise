@@ -1117,12 +1117,14 @@ SKILLS: dict[str, dict[str, Any]] = {
         "fn": skill_ratio_by_group,
         "desc": "按维度分组算每组 sum(num)/sum(den) 比率(基数加权 · 回款率/完成率/库存周转)",
         "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "filter", "sheet_name"],
+        "note": "口径:加权比率 = 组内分子总和 ÷ 分母总和(按基数加权,大单影响大)",
     },
     "row_ratio_then_group_mean": {
         "tool": "pandaseal",
         "fn": skill_row_ratio_then_group_mean,
         "desc": "先算每行 num/den 行级率,再按维度取均值(等权平均率)",
         "params": ["num_col", "den_col", "group_col", "metric_name", "ascending", "filter", "sheet_name"],
+        "note": "口径:等权平均 = 各行比率的简单平均(每行权重相同,与加权口径结果可能差异很大)",
     },
     "top_n_by": {
         "tool": "pandaseal",

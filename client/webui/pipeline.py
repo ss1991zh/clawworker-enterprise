@@ -736,7 +736,14 @@ def _build_done_files(decision, results, cipher_path, excel_stem, skill_calls, c
 
     # decrypt:明文 + 密文 两个文件,用户自由选择下载哪个(均写暂存,不自动落 Downloads)
     try:
-        dec_path = write_skill_results(results, stem=excel_stem, staging=True)
+        n_src = max((len(r["df"]) for r in results if r.get("df") is not None), default=0)
+        dec_path = write_skill_results(
+            results, stem=excel_stem, staging=True,
+            provenance={
+                "数据文件": cipher_path.name,
+                "执行方式": "固化技能" if skill_calls else "AI 生成代码(密态)",
+                "结果最大行数": str(n_src),
+            })
     except Exception as e:
         return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": clean_summary}
     log("result", f"完成 · 明文 {dec_path.name} + 密文 {enc_path.name}")
@@ -1339,7 +1346,8 @@ def _ask_impl(
             if sc.sheet_name:
                 sheet_name = sc.sheet_name
             chart = sc.chart.model_dump() if sc.chart else chart_hint
-            results.append({"sheet_name": sheet_name, "df": df, "chart": chart, "skill": sc.skill})
+            results.append({"sheet_name": sheet_name, "df": df, "chart": chart, "skill": sc.skill,
+                            "note": skill_def.get("note", "")})   # 口径说明渲染在表顶
             log("result", f"sheet「{sheet_name}」就绪 · {len(df)} 行 × {len(df.columns)} 列")
         except Exception as e:
             return {
