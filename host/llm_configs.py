@@ -218,8 +218,11 @@ class LLMConfigStore:
         if not self._path.exists():
             return
         try:
+            from host import secret_store
             data = json.loads(self._path.read_text(encoding="utf-8"))
             for item in data:
+                item = dict(item)
+                item["api_key"] = secret_store.unprotect(item.get("api_key", ""))  # 解密落盘的 key
                 cfg = LLMConfig.from_dict(item)
                 self._configs[cfg.id] = cfg
         except Exception:
@@ -227,9 +230,15 @@ class LLMConfigStore:
             pass
 
     def _save(self) -> None:
+        from host import secret_store
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        data = [c.to_dict() for c in self._configs.values()]
+        data = []
+        for c in self._configs.values():
+            d = c.to_dict()
+            d["api_key"] = secret_store.protect(d.get("api_key", ""))   # API Key 加密落盘
+            data.append(d)
         self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        secret_store.harden_file(self._path)   # 文件 ACL 收紧到仅属主可读
 
     # ---- CRUD ----
     def list_all(self) -> list[LLMConfig]:

@@ -30,6 +30,9 @@ from typing import Any, Callable, Optional
 
 SCHED_DIR = Path.home() / ".agent-system" / "scheduler"
 
+# 单次 tick 里为一个任务最多枚举多少个漏跑期(防长期停机 × 高频任务爆量;约一年每日)
+_MAX_MISS_ENUM = 366
+
 
 def _now() -> datetime:
     return datetime.now()
@@ -647,16 +650,26 @@ class Scheduler:
                 self._tasks.mark_fired(t.id)
                 continue
             if nxt <= now:
-                late = (now - nxt).total_seconds()
-                # 先推进 next_run,避免回调里异常导致重复触发
+                # 枚举 [nxt, now] 之间**所有**到点时刻 —— 停机多天的每日任务会漏 N 期,
+                # 不能像原来那样只记 1 条(mark_fired 直接跳到 now 之后会吞掉中间各期)。
+                occ = []
+                m = nxt
+                while m <= now and len(occ) < _MAX_MISS_ENUM:
+                    occ.append(m)
+                    m = t.compute_next_run(m)
+                # 先推进 next_run 到 now 之后,避免回调异常导致重复触发
                 self._tasks.mark_fired(t.id)
-                if late > self._miss_grace and self._on_miss is not None:
-                    # 到点窗口已过去很久 = 服务当时没运行(漏跑)→ 记预警,不自动补跑
-                    try:
-                        self._on_miss(t, nxt)
-                    except Exception:
-                        pass
-                else:
+                last = occ[-1] if occ else nxt
+                # 最近一期若在宽限内 = 服务刚回来、这期算"到点该跑"→ 触发它;更早的都是漏跑
+                fire_last = (now - last).total_seconds() <= self._miss_grace
+                missed = occ[:-1] if fire_last else occ
+                for md in missed:
+                    if self._on_miss is not None:
+                        try:
+                            self._on_miss(t, md)
+                        except Exception:
+                            pass
+                if fire_last:
                     try:
                         self._on_fire(t)
                     except Exception:

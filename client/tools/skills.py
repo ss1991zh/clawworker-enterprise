@@ -1107,6 +1107,110 @@ def skill_pivot_summary(cdf, params, metadata_rows, metadata_columns):
     return str(sheet)[:31], piv, chart
 
 
+# ----- skill: 库存周转天数(DIO)+ 呆滞档位 ----------------------------------
+
+def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
+    """
+    库存周转天数 DIO = 平均库存 ÷ 期间销货成本 × 天数;并按天数分呆滞/正常档位。
+    params:
+      item_col  : 物料/SKU(meta 列)
+      stock_col : 库存(金额或数量,encrypted)—— 作为"平均库存"
+      cogs_col  : 销货成本 / 出库(encrypted)
+      days?     : 期间天数(默认 365)
+      slow_days?: 呆滞阈值(默认 90);正常 ≤ warn_days,warn_days?默认 60
+    输出:物料 库存 销货成本 周转天数 库存状态(正常/关注/呆滞)
+    """
+    import pandas as pd
+    import numpy as np
+
+    item = params["item_col"]
+    stock = params["stock_col"]
+    cogs = params["cogs_col"]
+    days = float(params.get("days", 365))
+    warn_days = float(params.get("warn_days", 60))
+    slow_days = float(params.get("slow_days", 90))
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)
+    for c in (item, stock, cogs):
+        if c not in full.columns:
+            raise ValueError(f"inventory_turnover: 列「{c}」不存在")
+
+    g = full.groupby(item, as_index=False).agg(**{stock: (stock, "mean"), cogs: (cogs, "sum")})
+    g["周转天数"] = _inf_to_nan(g[stock] * days / g[cogs].replace(0, np.nan))
+
+    def _tier(d):
+        if d != d:            # NaN(无销货成本→无法周转,视为呆滞)
+            return "呆滞"
+        if d <= warn_days:
+            return "正常"
+        return "关注" if d <= slow_days else "呆滞"
+    g["库存状态"] = g["周转天数"].apply(_tier)
+    g = g.sort_values("周转天数", ascending=False, na_position="first").reset_index(drop=True)
+
+    sheet = params.get("sheet_name") or "库存周转分析"
+    chart = {"type": "bar", "x": item, "y": "周转天数", "title": sheet}
+    return str(sheet)[:31], g, chart
+
+
+# ----- skill: HR 绩效分级(优/良/中/差)+ 人效 -------------------------------
+
+def skill_hr_grade(cdf, params, metadata_rows, metadata_columns):
+    """
+    按某绩效指标给员工分级(默认按分位:优 top20% / 良 20-50% / 中 50-80% / 差 bottom20%)。
+    可选人效列(如人均产出)。
+    params:
+      name_col   : 姓名/工号(meta 列)
+      metric_col : 绩效指标(encrypted,如 绩效得分/销售额/完成率)
+      group_col? : 部门/大区(meta 列)—— 给了则**组内**分位分级
+      cuts?      : 分位切点(默认 [0.2,0.5,0.8]),对应 差|中|良|优
+    输出:姓名 [部门] 指标 绩效等级(优/良/中/差)
+    """
+    import pandas as pd
+
+    name = params["name_col"]
+    metric = params["metric_col"]
+    group = params.get("group_col") or None
+    cuts = params.get("cuts") or [0.2, 0.5, 0.8]
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)
+    for c in [name, metric] + ([group] if group else []):
+        if c not in full.columns:
+            raise ValueError(f"hr_grade: 列「{c}」不存在")
+
+    def _grade_series(s):
+        # 按分位打档;指标越高越好
+        q = s.rank(pct=True)
+        labels = ["差", "中", "良", "优"]
+        edges = [0.0] + list(cuts) + [1.0]
+        out = pd.Series(labels[-1], index=s.index)
+        for i in range(len(labels)):
+            lo, hi = edges[i], edges[i + 1]
+            mask = (q > lo) & (q <= hi) if i > 0 else (q <= hi)
+            out[mask] = labels[i]
+        return out
+
+    full = full.copy()
+    if group:
+        full["绩效等级"] = full.groupby(group)[metric].transform(_grade_series)
+    else:
+        full["绩效等级"] = _grade_series(full[metric])
+
+    keep = ([group] if group else []) + [name, metric, "绩效等级"]
+    out = full[keep]
+    # 排序:组内(或整体)按指标降序,好的在前
+    sort_cols = ([group] if group else []) + [metric]
+    out = out.sort_values(sort_cols, ascending=[True] * (1 if group else 0) + [False])
+
+    sheet = params.get("sheet_name") or "绩效分级"
+    chart = {"type": "bar", "x": name, "y": metric, "title": sheet,
+             "split_by": group if group else None}
+    return str(sheet)[:31], out.reset_index(drop=True), chart
+
+
 # ---------------------------------------------------------------------------
 # Skill 注册表 — LLM 必须从这里选
 # ---------------------------------------------------------------------------
@@ -1193,6 +1297,20 @@ SKILLS: dict[str, dict[str, Any]] = {
         "fn": skill_pivot_summary,
         "desc": "多维交叉透视(行维 × 列维 → 聚合)· 如 大区×产品线 销售额",
         "params": ["row_col", "col_col", "value_col", "agg", "filter", "sheet_name"],
+    },
+    "inventory_turnover": {
+        "tool": "pandaseal",
+        "fn": skill_inventory_turnover,
+        "desc": "库存周转天数(DIO=平均库存÷销货成本×天数)+ 正常/关注/呆滞档位",
+        "params": ["item_col", "stock_col", "cogs_col", "days", "warn_days", "slow_days", "filter", "sheet_name"],
+        "note": "口径:周转天数 = 平均库存 ÷ 期间销货成本 × 天数;无销货成本的物料判为呆滞",
+    },
+    "hr_grade": {
+        "tool": "pandaseal",
+        "fn": skill_hr_grade,
+        "desc": "HR 绩效分级(按分位分 优/良/中/差)· 可组内(部门)分级 · 逐人明细",
+        "params": ["name_col", "metric_col", "group_col", "cuts", "filter", "sheet_name"],
+        "note": "口径:按绩效指标分位分档(优top20%/良20-50%/中50-80%/差bottom20%),指标越高越好",
     },
 }
 

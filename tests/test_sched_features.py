@@ -120,10 +120,10 @@ def test_scheduler_detects_missed_vs_ontime(tmp_path):
     sc = sch.Scheduler(store, on_fire=lambda x: fired.append(x.id),
                        on_miss=lambda x, due: missed.append(x.id),
                        miss_grace_seconds=600)
-    # 设 next_run 为很久以前(服务当时没运行)→ 漏跑
+    # 设 next_run 为很久以前(服务当时没运行)→ 漏跑(可能跨多个到点期,各记一条)
     store._tasks[t.id].next_run = (datetime.now() - timedelta(days=1)).isoformat(timespec="seconds")
     sc._tick()
-    assert missed == [t.id] and fired == []
+    assert len(missed) >= 1 and all(x == t.id for x in missed) and fired == []
 
     # 重置:next_run 在宽限内(刚到点)→ 正常触发
     fired.clear(); missed.clear()
