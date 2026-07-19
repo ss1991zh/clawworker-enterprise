@@ -97,6 +97,83 @@ def _decrypt(cdf):
     return ct.decrypt_df(cdf)
 
 
+# ----- 时间优先排序(有时间列时,指标高低降一级,时间序在前)-----
+
+# 时间列名关键词:含这些词(或 datetime dtype)即视为时间维度。
+# 刻意不用裸「月/年/周」做子串(会误伤「月饼」「年龄」),改用完整词 + endswith("月")。
+_TIME_COL_KEYS = ("月份", "年月", "年份", "日期", "时间", "季度", "月度", "周次",
+                  "date", "month", "year", "quarter", "week", "period", "time")
+
+
+def _is_time_col(name, series=None) -> bool:
+    """该列是否是时间维度:datetime dtype,或列名含时间关键词。"""
+    import pandas as pd
+    if series is not None and pd.api.types.is_datetime64_any_dtype(series):
+        return True
+    s = str(name).strip().lower()
+    return any(k in s for k in _TIME_COL_KEYS) or s.endswith("月")
+
+
+def _time_sort_series(series):
+    """
+    把时间列转成可排序键,解决「"10月" < "2月"」的字符串排序陷阱:
+    datetime/数值 → 原样;字符串先试 to_datetime,再退化为提取数字序列
+    ("2026年3月" → (2026,3)、"Q2" → (2,));完全无数字排最后。
+    """
+    import re
+    import pandas as pd
+    s = series
+    if pd.api.types.is_datetime64_any_dtype(s) or pd.api.types.is_numeric_dtype(s):
+        return s
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")   # 混合格式时 to_datetime 会告警,静默逐元素解析即可
+        dt = pd.to_datetime(s, errors="coerce")
+    if dt.notna().mean() >= 0.8:
+        return dt
+
+    def _key(v):
+        nums = re.findall(r"\d+", str(v))
+        return tuple(int(x) for x in nums) if nums else (float("inf"),)
+
+    return s.map(_key)
+
+
+def _sort_group_result(out, group, metric, ascending):
+    """分组汇总表排序:分组维度本身是时间(按月/按季…)→ 时间升序;否则按指标排序。"""
+    if _is_time_col(group, out[group]):
+        key = "__tkey__"
+        out = out.assign(**{key: _time_sort_series(out[group])})
+        return out.sort_values(key).drop(columns=[key])
+    return out.sort_values(metric, ascending=ascending)
+
+
+def _smart_sort(full, sort_by, ascending, metadata_columns):
+    """
+    逐行明细表的时间优先排序:
+      无时间列 → 按 sort_by 排序(原行为);
+      有时间列 → 行序 = 实体(产品/大区…) → 组内时间升序;
+                 sort_by 指标降一级,只决定**实体之间**的先后(按实体均值排)。
+    """
+    import pandas as pd
+    time_cols = [c for c in full.columns if _is_time_col(c, full[c])]
+    if not time_cols:
+        return full.sort_values(sort_by, ascending=ascending)
+    tcol = time_cols[0]
+    tkey = "__tkey__"
+    full = full.assign(**{tkey: _time_sort_series(full[tcol])})
+    entity_cols = [c for c in (metadata_columns or [])
+                   if c in full.columns and not _is_time_col(c, full[c])]
+    if entity_cols and pd.api.types.is_numeric_dtype(full[sort_by]):
+        ecol = entity_cols[0]
+        rank = full.groupby(ecol)[sort_by].mean().sort_values(ascending=ascending)
+        order = {v: i for i, v in enumerate(rank.index)}
+        ekey = "__ekey__"
+        full = full.assign(**{ekey: full[ecol].map(order)})
+        return full.sort_values([ekey, tkey]).drop(columns=[ekey, tkey])
+    return full.sort_values(tkey).drop(columns=[tkey])
+
+
 def _apply_filter(full, params):
     """
     按 params['filter'] 过滤行,让"只看某个产品 / 大区 / 客户 / 员工"生效。
@@ -179,11 +256,12 @@ def skill_ratio_by_group(cdf, params: dict, metadata_rows, metadata_columns):
     )
     grouped[metric] = grouped['分子总和'] / grouped['分母总和']
     out = grouped[[group, '订单数', metric, '最大值', '最小值']]
-    out = out.sort_values(metric, ascending=bool(params.get('ascending', False)))
+    # 分组维度是时间(按月/按季…)→ 时间升序,指标高低降一级;否则按指标降序
+    out = _sort_group_result(out, group, metric, bool(params.get('ascending', False)))
 
     sheet_name = params.get("sheet_name") or f"按{group}-{metric}"
     chart = {
-        "type": "bar",
+        "type": "line" if _is_time_col(group, out[group]) else "bar",
         "x": group,
         "y": metric,
         "title": sheet_name,
@@ -223,10 +301,12 @@ def skill_row_ratio_then_group_mean(cdf, params, metadata_rows, metadata_columns
         最高=("__ratio__", 'max'),
         最低=("__ratio__", 'min'),
     ).rename(columns={'平均比率': metric})
-    grouped = grouped.sort_values(metric, ascending=bool(params.get("ascending", False)))
+    # 分组维度是时间 → 时间升序;否则按指标降序
+    grouped = _sort_group_result(grouped, group, metric, bool(params.get("ascending", False)))
 
     sheet_name = params.get("sheet_name") or f"按{group}-{metric}(行级均)"
-    chart = {"type": "bar", "x": group, "y": metric, "title": sheet_name}
+    chart = {"type": "line" if _is_time_col(group, grouped[group]) else "bar",
+             "x": group, "y": metric, "title": sheet_name}
     return sheet_name, grouped.reset_index(drop=True), chart
 
 
@@ -471,10 +551,11 @@ def skill_row_detail(cdf, params, metadata_rows, metadata_columns):
         meta_cols = [c for c in (metadata_columns or []) if c in full.columns]
         full = full[meta_cols + [c for c in keep if c not in meta_cols]]
 
-    # 排序
+    # 排序(时间优先:含时间列时 实体→时间升序,sort_by 指标只决定实体间先后)
     sort_by = params.get("sort_by")
     if sort_by and sort_by in full.columns:
-        full = full.sort_values(sort_by, ascending=bool(params.get("ascending", False)))
+        full = _smart_sort(full, sort_by, bool(params.get("ascending", False)),
+                           metadata_columns)
 
     # 限制行数
     n = params.get("n")
