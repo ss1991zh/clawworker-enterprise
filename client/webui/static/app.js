@@ -151,8 +151,12 @@ const state = {
 };
 
 // ============ API helpers ============
+const CSRF_TOKEN = (document.querySelector('meta[name="csrf-token"]') || {}).content || "";
+
 async function api(method, path, body, isMultipart = false) {
   const opts = { method, headers: {} };
+  // 改状态请求带 CSRF token(后端中间件校验);安全 GET 不需要但带上无害
+  if (CSRF_TOKEN) opts.headers["X-CSRF-Token"] = CSRF_TOKEN;
   if (body) {
     if (isMultipart) opts.body = body;
     else { opts.headers["Content-Type"] = "application/json"; opts.body = JSON.stringify(body); }

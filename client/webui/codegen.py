@@ -256,7 +256,8 @@ hp.initDict() / ct.initSK()(已初始化):
    ⚠ 源数据的"率"列可能已是百分数口径(存 12 表示 12%):值域普遍 >1.5 就是百分数,先 ÷100
    统一成小数再计算,别把 0.12 和 12 两种口径混在一起算。
 6. 列名严格用 schema 里的字段名(含括号单位);字段缺失就在 summary 说明缺什么,别硬编造数。
-7. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性。
+7. 禁止:文件读写(open)、os/sys/subprocess/socket、网络、eval/exec、访问 __ 开头属性、
+   getattr / setattr、str.format()/format_map()(用 f-string 代替)、read_pickle/read_parquet。
 8. **全量处理铁律(每一行都是独立记录,永不合并行)**:
    输出主表一律**逐行明细**:行数 = 数据行数,可排序、可加排名/档位/派生列。
    "按大区 / 各产品线 / 汇总"指的是**排序方式**(先按该维度排、组内再按指标降序;
@@ -387,12 +388,21 @@ _ALLOWED_IMPORTS = {
     "collections", "itertools", "functools", "operator", "bisect", "heapq",
 }
 
-# 禁止调用的内建名
+# 禁止调用的内建名 / 方法名(同时拦 `name(...)` 与 `.name(...)`)
 _BANNED_CALLS = {
     "eval", "exec", "compile", "open", "input", "__import__",
     "globals", "locals", "vars", "breakpoint", "delattr",
     "setattr", "memoryview", "help", "exit", "quit",
+    # 反射逃逸面:getattr("字符串")可绕过字面量 dunder 检查取到 __class__/__globals__;
+    # str.format/format_map 的 "{0.__class__}" 格式规格同样能穿透 AST 拿到类型链。
+    "getattr", "format", "format_map", "mro",
+    # 反序列化可执行代码(纵深防御,即便 pandas/numpy 在白名单内)
+    "read_pickle", "to_pickle", "read_parquet",
 }
+
+
+# 匹配 "{ ... .__xxx__ ... }" 式格式串属性访问(如 "{0.__class__.__init__.__globals__}")
+_re_dunder_in_str = __import__("re").compile(r"\{[^{}]*\.__[A-Za-z0-9_]+__")
 
 
 def ast_safety_check(code: str) -> None:
@@ -429,6 +439,11 @@ def ast_safety_check(code: str) -> None:
         elif isinstance(node, ast.Name):
             if node.id.startswith("__") and node.id.endswith("__") and node.id != "__name__":
                 raise UnsafeCode(f"禁止使用 dunder 名「{node.id}」")
+        # 字符串字面量里藏 dunder 属性访问(如 format-spec "{0.__class__}")—— 纵深防御,
+        # 即便 .format 已被 _BANNED_CALLS 拦住,也堵住 %/自定义模板等其它注入路径。
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if "__" in node.value and _re_dunder_in_str.search(node.value):
+                raise UnsafeCode("禁止在字符串里引用 dunder 属性(疑似格式串逃逸)")
 
 
 # ---------------------------------------------------------------------------
@@ -556,13 +571,15 @@ class _CtGate:
 # 安全 builtins 子集
 def _safe_builtins(allowed_import_fn):
     import builtins as _b
+    # 注意:不放 getattr / format —— 二者是反射逃逸面(见 ast_safety_check 与 _BANNED_CALLS)。
+    # 数值格式化用 f-string / round 代替 format();属性访问用直接点号 / dict 索引。
     safe_names = [
         "abs", "all", "any", "bool", "dict", "divmod", "enumerate", "filter",
-        "float", "format", "frozenset", "int", "isinstance", "issubclass",
+        "float", "frozenset", "int", "isinstance", "issubclass",
         "len", "list", "map", "max", "min", "next", "print", "range", "repr",
         "reversed", "round", "set", "slice", "sorted", "str", "sum", "tuple",
-        "type", "zip", "True", "False", "None", "abs", "bytes", "complex",
-        "hasattr", "getattr",
+        "type", "zip", "True", "False", "None", "bytes", "complex",
+        "hasattr",
     ]
     d = {n: getattr(_b, n) for n in safe_names if hasattr(_b, n)}
     d["__import__"] = allowed_import_fn

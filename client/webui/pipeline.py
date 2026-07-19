@@ -668,6 +668,26 @@ def _detect_lazy_truncation(query: str, code: str) -> bool:
     return bool(_TRUNCATION_PAT.search(code or ""))
 
 
+# 按行序计算的窗口/时序函数 —— 未排序就调用会算出"数值全错但不报错"的结果
+_WINDOW_FUNC_PAT = re.compile(
+    r"\.(?:diff|shift|pct_change|cumsum|cumprod|cummax|cummin|rolling|expanding|ewm)\s*\(|"
+    r"window\.(?:diff|lag|rolling_mean|rolling|pct_change|cumsum)\s*\("
+)
+_SORT_PAT = re.compile(r"\.sort_values\s*\(|\.sort_index\s*\(|window\.[A-Za-z_]+\([^)]*sort")
+
+
+def _detect_unsorted_window_risk(code: str) -> bool:
+    """
+    代码用了按行序计算的窗口函数(环比/移动平均/累计…)但**全篇没有任何排序调用**
+    → 高风险:结果可能数值全错却不报错。返回 True 表示需回喂 LLM 修正 + 禁止固化缓存。
+    这是静态启发式(宁可多问一次,不让错误代码被固化后每天复用)。
+    """
+    c = code or ""
+    if not _WINDOW_FUNC_PAT.search(c):
+        return False
+    return not _SORT_PAT.search(c)
+
+
 # 筛选类问题(找异常/超期/不达标…)合法输出子集,不做全量验收
 _FILTER_QUERY_PAT = re.compile(
     r"异常|离群|超过|低于|高于|大于|小于|超出|筛选|挑出|找出|不达标|未达标|超期|逾期|大额"
@@ -770,11 +790,56 @@ def _looks_compound(q: str) -> bool:
     return sum(1 for m in _COMPOUND_MARKERS if m in q) >= 2
 
 
+_MAX_CODEGEN_ERROR_RETRIES = 2   # 真实数据执行崩溃 → 带错误反馈重生成的最大次数
+
+
+def _format_exec_error_feedback(exc: Exception, code: str) -> str:
+    """
+    把执行异常整理成给 LLM 的修正反馈。只回传**异常类型 + 异常消息 + 出错代码行**,
+    异常消息里可能夹带的数据值风险极低(pandas 报错通常是列名/类型),但仍做一层零明文
+    过滤,避免真实数据值随 KeyError/断言消息回流给 LLM(明文不出本机的底线)。
+    """
+    import traceback
+    etype = type(exc).__name__
+    emsg = str(exc)
+    try:
+        from client import permissions
+        res = permissions.scan_summary(emsg)   # 检测异常消息里夹带的疑似明文数值
+        if not res.clean:
+            for h in sorted(res.hits, key=lambda x: x.start, reverse=True):
+                emsg = emsg[:h.start] + "<已脱敏>" + emsg[h.end:]
+    except Exception:  # noqa: BLE001
+        pass
+    # 定位出错代码行(用户生成代码在 <string> 里执行)
+    lineno = None
+    for fr in reversed(traceback.extract_tb(exc.__traceback__)):
+        if fr.filename in ("<string>", "<generated>"):
+            lineno = fr.lineno
+            break
+    hint = ""
+    lines = code.splitlines()
+    if lineno and 1 <= lineno <= len(lines):
+        hint = f"\n出错代码行(第 {lineno} 行):{lines[lineno - 1].strip()[:120]}"
+    common = {
+        "KeyError": "列名拼错或该列不存在——列名严格照 schema,注意括号单位。",
+        "TypeError": "很可能对 CipherSeries/CipherDataFrame 直接算数,或类型不匹配——先 df = ct.decrypt_df(cdf) 取明文再用 pandas 处理。",
+        "AttributeError": "调了不存在的方法——检查是不是臆造了 API。",
+        "ValueError": "数值/形状不匹配,或含 NaN/inf 未清洗——拟合/相关前先 s = s[np.isfinite(s)]。",
+        "ZeroDivisionError": "除零——分母先 .replace(0, np.nan) 或判零。",
+    }.get(etype, "")
+    return (
+        f"⚠️ 你上次的代码在**真实数据**上执行时抛了 {etype}:{emsg[:200]}。"
+        f"{hint}\n可能原因:{common or '仔细检查上面这行。'}"
+        "请修正后重写完整代码(整段自包含,别只贴补丁)。"
+    )
+
+
 def _run_codegen_path(
     *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
     host_url, token, history, custom_block, excel_stem,
     log, chk, prompt_decrypt, output_mode="interactive", run_id="",
-    cache_key="", lazy_feedback="", web_search=False,
+    cache_key="", lazy_feedback="", error_feedback="", error_retries=0,
+    web_search=False,
 ) -> Optional[dict]:
     """
     代码生成主路径:LLM 读 SKILL.md → 写代码 → AST 扫描 → 受限 exec → Excel。
@@ -797,6 +862,7 @@ def _run_codegen_path(
     code = ""
     summary_raw = ""
     lazy_waived = False
+    unsafe_window = False   # 窗口函数未排序且修正失败 → 禁止固化缓存
     if cache_key:
         cache_sig = _codegen_cache_sig(effective_query, schema)
         cached = _codegen_cache_load(cache_key, cache_sig)
@@ -830,6 +896,8 @@ def _run_codegen_path(
             )
         if lazy_feedback:
             gen_query = f"{gen_query}\n\n{lazy_feedback}"
+        if error_feedback:
+            gen_query = f"{gen_query}\n\n{error_feedback}"
         # 2.5) 复合问题:先出"步骤计划",用能力表校验(挡禁用算子/标授权解密),作为 codegen 脚手架。
         #      架构上仍由单代码块执行;计划只当护栏+提示,gated 到复合问题、全程围栏、失败即跳过。
         if _looks_compound(effective_query):
@@ -895,6 +963,31 @@ def _run_codegen_path(
             except Exception:
                 lazy_waived = True
                 log("error", "重写失败 · 按原代码继续(结果可能不全)")
+
+        # 窗口函数未排序风险:环比/移动平均等按行序算,没排序会静默算错并被固化 → 修正一次
+        if _detect_unsorted_window_risk(code):
+            log("think", "检测到窗口函数(环比/移动平均等)但代码未排序 · 要求 LLM 加时间排序")
+            retry_user = (
+                user + "\n\n⚠️ 你的代码用了 diff/shift/pct_change/rolling/cumsum 等**按行序计算**的函数,"
+                "但没有先按时间排序。这会算出**数值全错却不报错**的结果。请修正:调用这些函数前"
+                "必须先 `df = df.sort_values('<时间列>')`;多实体数据要**逐实体** groupby 后各自算"
+                "(如 `df.groupby('产品')['额'].diff()`),不能跨实体连着算。重写完整代码。"
+            )
+            try:
+                raw_w = call_llm_for_codegen(host_url, token, system, retry_user,
+                                             history=history, should_cancel=chk, web_search=web_search)
+                code_w, summary_w = codegen_mod.extract_code(raw_w)
+                if not _detect_unsorted_window_risk(code_w):
+                    code, summary_raw = code_w, summary_w
+                    log("result", "已加时间排序 · 采用修正后代码")
+                else:
+                    unsafe_window = True   # 仍未排序 · 禁止固化缓存(见下),避免每天复用错代码
+                    log("error", "修正后仍未排序 · 本次不固化缓存,避免错误代码被反复复用")
+            except CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                unsafe_window = True
+                log("error", "窗口排序修正失败 · 本次不固化缓存")
 
     def _retry_without_cache(reason: str) -> Optional[dict]:
         """固化代码失效(数据形态变了等)→ 删缓存,本次就地重新生成一遍。"""
@@ -999,13 +1092,45 @@ def _run_codegen_path(
     except Exception as e:
         if from_cache:
             return _retry_without_cache(f"固化代码执行失败:{e}")
-        log("error", f"代码执行失败:{e} · 回退固化 skill")
+        # 真实数据上执行崩溃 —— README 承诺的"回环自修复":把具体报错回喂 LLM 重生成,
+        # 而不是静默切到另一套固化 skill(那会给出结构迥异的结果或再撞同一个坑)。
+        if error_retries < _MAX_CODEGEN_ERROR_RETRIES:
+            fb = _format_exec_error_feedback(e, code)
+            log("error", f"代码执行失败:{type(e).__name__}: {e} · "
+                         f"带报错反馈重生成(第 {error_retries + 1}/{_MAX_CODEGEN_ERROR_RETRIES} 次)")
+            return _run_codegen_path(
+                effective_query=effective_query, cipher_path=cipher_path,
+                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+                host_url=host_url, token=token, history=history,
+                custom_block=custom_block, excel_stem=excel_stem,
+                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
+                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
+                web_search=web_search, lazy_feedback=lazy_feedback,
+                error_feedback=fb, error_retries=error_retries + 1,
+            )
+        log("error", f"代码执行失败且重生成 {error_retries} 次仍未通过:{e} · 回退固化 skill")
         return None
 
     if not results:
         if from_cache:
             return _retry_without_cache("固化代码没产出结果")
-        log("error", "生成代码没产出结果 · 回退固化 skill")
+        if error_retries < _MAX_CODEGEN_ERROR_RETRIES:
+            log("error", "生成代码没产出结果 · 带反馈重生成")
+            return _run_codegen_path(
+                effective_query=effective_query, cipher_path=cipher_path,
+                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
+                host_url=host_url, token=token, history=history,
+                custom_block=custom_block, excel_stem=excel_stem,
+                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
+                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
+                web_search=web_search, lazy_feedback=lazy_feedback,
+                error_feedback=(
+                    "⚠️ 你上次的代码跑完没有把任何结果放进 results 列表。"
+                    "请确保 results = [{'sheet_name':..., 'df':...}] 至少有一个元素。"
+                ),
+                error_retries=error_retries + 1,
+            )
+        log("error", "生成代码反复无产出 · 回退固化 skill")
         return None
     log("result", f"密态计算完成 · {len(results)} 个 sheet")
 
@@ -1041,9 +1166,12 @@ def _run_codegen_path(
         log("think", f"重新生成后最大 sheet 仍只有 {trunc_rows} 行 · 按现有结果继续")
 
     # 首次成功 → 固化本任务的分析代码,之后每次到点复用(输出结构一致)
-    if cache_key and not from_cache:
+    # 窗口函数未排序且修正失败的代码绝不固化——否则错误结果会被定时任务每天复用。
+    if cache_key and not from_cache and not unsafe_window:
         _codegen_cache_save(cache_key, cache_sig, code, summary_raw, lazy_waived=lazy_waived)
         log("think", "已固化本任务的分析代码 · 后续每次运行保持同一结构")
+    elif cache_key and unsafe_window:
+        log("think", "本次代码有未排序窗口风险 · 不固化,下次运行会重新生成")
 
     # 6a) 定时密态模式:结果加密暂存沙盒,不写明文 Excel
     if output_mode == "encrypted_sandbox":

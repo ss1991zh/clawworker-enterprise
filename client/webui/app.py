@@ -129,9 +129,99 @@ for _t in _task_store.all_enabled():
 app = FastAPI(title="agent-system client", version="0.4.0")
 app.mount("/static", StaticFiles(directory=str(_WEBUI_DIR / "static")), name="static")
 
+# ---- CSRF / DNS-rebinding 防护 ----------------------------------------------
+# 客户端只监听 127.0.0.1,鉴权是进程内全局 session。恶意网页可对 127.0.0.1:8444
+# 发跨站请求冒用已登录身份(CSRF),或用 DNS-rebinding 绕过同源。两道防线:
+#   1) Host 头允许名单 —— 拦 DNS-rebinding(浏览器仍带攻击者域名的 Host)
+#   2) 改状态请求需带 X-CSRF-Token 自定义头 —— 跨站无法设自定义头(会触发 CORS 预检被拒)
+_CSRF_TOKEN = secrets.token_urlsafe(32)
+_ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
+_CSRF_EXEMPT_PATHS = {"/login", "/logout"}   # 表单登录(尚无 session)靠 Host+Origin 兜底
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def _host_name_ok(host_header: str) -> bool:
+    if not host_header:
+        return False
+    name = host_header.rsplit(":", 1)[0].strip().lower() if "]" not in host_header \
+        else host_header.rsplit("]", 1)[0].strip("[").lower()
+    return name in _ALLOWED_HOST_NAMES
+
+
+def _origin_ok(request: Request) -> bool:
+    """Origin/Referer 若存在,其 host 必须是本机允许名单(缺失则放行,交给 CSRF token 兜底)。"""
+    from urllib.parse import urlparse
+    for hdr in ("origin", "referer"):
+        v = request.headers.get(hdr)
+        if v:
+            try:
+                h = urlparse(v).hostname or ""
+            except ValueError:
+                return False
+            if h.lower() not in _ALLOWED_HOST_NAMES:
+                return False
+    return True
+
+
+@app.middleware("http")
+async def _csrf_guard(request: Request, call_next):
+    # 1) Host 头:拦 DNS-rebinding(对所有请求)
+    if not _host_name_ok(request.headers.get("host", "")):
+        return JSONResponse({"detail": "非法 Host 头(拒绝跨域/rebinding 访问)"}, status_code=403)
+    path = request.url.path
+    method = request.method.upper()
+    # 2) 改状态请求:校验 Origin + CSRF token(静态资源、安全方法、登录表单豁免)
+    if method not in _SAFE_METHODS and path not in _CSRF_EXEMPT_PATHS \
+            and not path.startswith("/static/"):
+        if not _origin_ok(request):
+            return JSONResponse({"detail": "跨站来源被拒绝"}, status_code=403)
+        if request.headers.get("x-csrf-token", "") != _CSRF_TOKEN:
+            return JSONResponse({"detail": "CSRF 校验失败,请刷新页面重试"}, status_code=403)
+    return await call_next(request)
+
 
 def _is_logged_in() -> bool:
     return bool(_session_state.get("token") and _session_state.get("username"))
+
+
+def _validate_host_url(raw: str) -> str:
+    """
+    规范化并校验主机地址。主机是企业内网/本机的控制面 —— 只允许连**私网/回环**地址,
+    拒绝公网主机,防 CSRF 把 host_url 改指向攻击者服务器后把账号口令/token 送出去。
+    返回补好协议的 host_url;非法则抛 ValueError。
+    """
+    import ipaddress
+    import socket
+    from urllib.parse import urlparse
+
+    url = (raw or "").strip().rstrip("/")
+    if not url:
+        raise ValueError("主机地址不能为空")
+    if not url.lower().startswith(("http://", "https://")):
+        url = "http://" + url            # 用户常只填 IP:端口
+    parsed = urlparse(url)
+    host = parsed.hostname or ""
+    if not host:
+        raise ValueError("主机地址格式不正确")
+    # 解析成 IP(域名先 DNS 解析),要求全部落在私网/回环/链路本地范围内
+    try:
+        infos = socket.getaddrinfo(host, None)
+        ips = {ai[4][0] for ai in infos}
+    except OSError:
+        # 解析不了:仅放行字面私网/回环写法,其余拒绝
+        try:
+            ip = ipaddress.ip_address(host)
+            ips = {str(ip)}
+        except ValueError:
+            raise ValueError(f"无法解析主机地址「{host}」")
+    for ip_s in ips:
+        try:
+            ip = ipaddress.ip_address(ip_s)
+        except ValueError:
+            raise ValueError(f"主机地址「{host}」非法")
+        if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+            raise ValueError(f"只允许连内网/本机主机,拒绝公网地址「{ip_s}」")
+    return url
 
 
 def _need_login() -> JSONResponse:
@@ -181,7 +271,8 @@ def index(request: Request):
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
         request, "index.html",
-        {"username": _session_state["username"], "asset_ver": _asset_version()},
+        {"username": _session_state["username"], "asset_ver": _asset_version(),
+         "csrf_token": _CSRF_TOKEN},
     )
 
 
@@ -206,11 +297,10 @@ def login_submit(
     username: str = Form(...),
     password: str = Form(...),
 ):
-    host_url = host_url.strip().rstrip("/")
-    # 用户常直接填 "192.168.x.x:8443"(不带协议)—— httpx 会报
-    # "Request URL is missing an 'http://' or 'https://' protocol",自动补全
-    if host_url and not host_url.lower().startswith(("http://", "https://")):
-        host_url = "http://" + host_url
+    try:
+        host_url = _validate_host_url(host_url)   # 补协议 + 只允许内网/本机
+    except ValueError as e:
+        return _flash_redirect("/login", ("error", str(e)))
     try:
         r = httpx.post(
             f"{host_url}/auth/login",
@@ -277,7 +367,10 @@ async def api_config_set(request: Request):
     data = await request.json()
     with _lock:
         if "host_url" in data:
-            _config["host_url"] = str(data["host_url"]).rstrip("/")
+            try:
+                _config["host_url"] = _validate_host_url(str(data["host_url"]))
+            except ValueError as e:
+                raise HTTPException(400, str(e))
         if "backend" in data and data["backend"] in ("stub", "real"):
             _config["backend"] = data["backend"]
         _save_config(_config)
@@ -2287,8 +2380,15 @@ def api_excel_download(path: str):
     p = Path(path)
     if not p.exists() or not p.is_file():
         raise HTTPException(404, "Excel 文件不存在")
-    allowed_roots = [Path.home() / "Downloads", APP_DATA_DIR]
-    if not any(p.resolve().is_relative_to(r.resolve()) for r in allowed_roots if r.exists()):
+    # 扩展名白名单:只放行电子表格产出,绝不允许下载 sk.bin / accounts.json 等
+    # (即便它们落在下面的目录里)——堵死"把私钥当 Excel 下载"的路径。
+    if p.suffix.lower() not in (".xlsx", ".xls", ".csv"):
+        raise HTTPException(403, "只允许下载电子表格文件(.xlsx/.xls/.csv)")
+    # 根目录收窄:仅 Downloads + 产出暂存目录 outputs —— 不再放行整个 ~/.agent-system
+    # (那里有密钥沙盒 keystore/、账户 host-auth/、审计 audit/ 等敏感数据)。
+    allowed_roots = [Path.home() / "Downloads", APP_DATA_DIR / "outputs"]
+    rp = p.resolve()
+    if not any(rp.is_relative_to(r.resolve()) for r in allowed_roots if r.exists()):
         raise HTTPException(403, "拒绝下载白名单外的文件")
     return FileResponse(
         p,

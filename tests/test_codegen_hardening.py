@@ -192,6 +192,39 @@ def test_dangerous_imports_blocked(code):
         cg.ast_safety_check(code)
 
 
+# ─────────────────── 沙盒逃逸面加固(反射 / 格式串)───────────────────
+
+@pytest.mark.parametrize("code", [
+    'x = getattr((), "__class__")',                       # getattr 字符串实参逃逸
+    'x = getattr(obj, "__globals__")',
+    'x = "{0.__class__.__init__.__globals__}".format(())', # str.format 格式串逃逸
+    'x = "{0.__class__}".format(obj)',
+    'x = "hi".format_map({})',                             # format_map 同理
+    'x = type(())("").__class__',                          # 字面量 dunder(既有防线)
+    'x = ().__class__.__bases__',
+    'x = obj.__globals__',
+    'x = pd.read_pickle("/etc/passwd")',                   # 反序列化入口
+    'x = df.to_pickle("/tmp/x")',
+])
+def test_sandbox_escape_vectors_blocked(code):
+    with pytest.raises(cg.UnsafeCode):
+        cg.ast_safety_check(code)
+
+
+def test_getattr_format_not_in_safe_builtins():
+    b = cg._safe_builtins(lambda *a, **k: None)
+    assert "getattr" not in b and "format" not in b
+
+
+@pytest.mark.parametrize("code", [
+    'df = ct.decrypt_df(cdf)\nout = df.groupby("大区")["额"].sum()',   # 正常分析不误伤
+    'x = round(1.23456, 2)\ny = f"{x:.2f}"',                          # f-string 数值格式
+    's = "回款率" + "(加权)"\nn = len([1, 2, 3])',                     # 普通字符串拼接
+])
+def test_legit_analysis_code_still_passes(code):
+    cg.ast_safety_check(code)   # 不应抛
+
+
 # ─────────────────── 渲染端去重兜底 ───────────────────
 
 def test_writer_dedups_duplicate_columns():
