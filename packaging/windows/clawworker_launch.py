@@ -21,7 +21,8 @@ import webbrowser
 from pathlib import Path
 
 ROLES = {
-    "admin":  {"svc": "host",   "port": 8443, "url": "http://localhost:8443/admin", "label": "管理端"},
+    # 管理端(主机控制面)已启 TLS → https;用户端(数据面)只监听回环,保持 http
+    "admin":  {"svc": "host",   "port": 8443, "url": "https://localhost:8443/admin", "label": "管理端"},
     "client": {"svc": "client", "port": 8444, "url": "http://localhost:8444", "label": "用户端"},
 }
 
