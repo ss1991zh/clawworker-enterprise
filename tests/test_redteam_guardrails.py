@@ -120,3 +120,58 @@ def test_inventory_turnover_anomaly_blank_and_bottom():
     assert (d["库存状态"] == "数据异常").iloc[-len(bad):].all()
     # 零销货成本的呆滞(NaN=不周转)排在最前
     assert d.iloc[0]["库存状态"] == "呆滞" and np.isnan(d.iloc[0]["周转天数"])
+
+
+# ── 优化循环 T0-3(客户场景评审)修复:账龄不静默丢负账龄/NaN,合计对平总账 ──
+
+def test_ar_aging_reconciles_negative_and_nan_age():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    rows = [
+        ("A", 180000, 0),      # 当期
+        ("A", 30000, -10),     # 负账龄=未到期(旧实现会被 pd.cut 静默丢)
+        ("B", 50000, 45),      # 逾期
+        ("C", 20000, None),    # 账龄缺失(金额有效)
+    ]
+    df = pd.DataFrame(rows, columns=["客户","应收","账龄"])
+    meta = df[["客户"]].to_dict("records")
+    cdf = df[["应收","账龄"]].reset_index(drop=True)
+    _, d, _ = skills.run_skill("ar_aging", cdf,
+        {"amount_col":"应收","age_col":"账龄","group_col":"客户"}, meta, ["客户"])
+    raw = df["应收"].sum()
+    # 账龄表合计必须与应收总账对平(不因负账龄/NaN 静默丢数据)
+    assert abs(d["合计"].sum() - raw) < 1e-6
+    # 负账龄进「未到期」桶
+    assert "未到期" in d.columns and d[d["客户"]=="A"]["未到期"].iloc[0] == 30000
+    # NaN 账龄进「账龄未知」桶,不吞金额
+    assert "账龄未知" in d.columns and d[d["客户"]=="C"]["账龄未知"].iloc[0] == 20000
+
+
+def test_ar_aging_no_extra_cols_when_all_normal():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    df = pd.DataFrame([("A",100000,10),("A",50000,40)], columns=["客户","应收","账龄"])
+    _, d, _ = skills.run_skill("ar_aging", df[["应收","账龄"]].reset_index(drop=True),
+        {"amount_col":"应收","age_col":"账龄","group_col":"客户"},
+        df[["客户"]].to_dict("records"), ["客户"])
+    # 无未到期 / 无缺失账龄 → 兜底列不出现,报表不添空列
+    assert "未到期" not in d.columns and "账龄未知" not in d.columns
+
+
+def test_rfm_segments_vip_and_churn():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    import random
+    rows = []
+    for i in range(20):
+        rows.append((f"客户{i}", 3+i*4, 60-i*2, 3000000-i*120000))  # 递减:前=优后=差
+    df = pd.DataFrame(rows, columns=["客户","最近","频次","金额"])
+    _, d, _ = skills.run_skill("rfm_segment", df[["最近","频次","金额"]].reset_index(drop=True),
+        {"customer_col":"客户","recency_col":"最近","frequency_col":"频次","monetary_col":"金额"},
+        df[["客户"]].to_dict("records"), ["客户"])
+    # 最优客户(recency最小/频次金额最高)= 重要价值;最差 = 流失
+    assert d[d["客户"]=="客户0"]["分群"].iloc[0] == "重要价值客户"
+    assert d[d["客户"]=="客户19"]["分群"].iloc[0] == "流失客户"

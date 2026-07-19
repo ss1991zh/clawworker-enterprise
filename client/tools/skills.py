@@ -991,13 +991,24 @@ def skill_ar_aging(cdf, params, metadata_rows, metadata_columns):
         if c not in full.columns:
             raise ValueError(f"ar_aging: 列「{c}」不存在")
 
-    edges = list(bins) + [float("inf")]
+    # 前置「未到期」桶兜住 <起点 的账龄(负逾期天数=提前开票/未到期);末尾对 NaN 账龄兜「账龄未知」。
+    # 否则这些行会被 pd.cut 判越界/NaN → 静默丢失,账龄表合计对不上应收总账(数据产品命门)。
+    edges = [float("-inf")] + list(bins) + [float("inf")]
     labels = []
     for i in range(len(edges) - 1):
         lo, hi = edges[i], edges[i + 1]
-        labels.append(f"{int(lo)}-{int(hi)}天" if hi != float("inf") else f"{int(lo)}天以上")
+        if lo == float("-inf"):
+            labels.append("未到期")
+        elif hi == float("inf"):
+            labels.append(f"{int(lo)}天以上")
+        else:
+            labels.append(f"{int(lo)}-{int(hi)}天")
     full = full.copy()
-    full["_账龄桶"] = pd.cut(full[age_col], bins=edges, labels=labels, right=False, include_lowest=True)
+    bucket = pd.cut(full[age_col], bins=edges, labels=labels, right=False, include_lowest=True)
+    # 账龄本身缺失(NaN)但金额有效的行:单列「账龄未知」,不静默吞掉金额
+    bucket = bucket.cat.add_categories("账龄未知").fillna("账龄未知")
+    full["_账龄桶"] = bucket
+    all_labels = labels + ["账龄未知"]
 
     grp_keys = [group_col] if (group_col and group_col in full.columns) else []
     piv = full.pivot_table(index=grp_keys or None, columns="_账龄桶",
@@ -1006,10 +1017,15 @@ def skill_ar_aging(cdf, params, metadata_rows, metadata_columns):
         piv = piv.reset_index()
     else:
         piv = piv.sum().to_frame().T
-    # 合计 + 逾期占比(第一个桶视作未逾期)
-    bucket_cols = [c for c in labels if c in piv.columns]
+    # 兜底桶整列为 0(无未到期 / 无缺失账龄)→ 删掉,免得报表添空列
+    for extra in ("未到期", "账龄未知"):
+        if extra in piv.columns and (piv[extra] == 0).all():
+            piv = piv.drop(columns=extra)
+    # 合计 + 逾期占比:未到期 + 首个到期桶(当期)视作未逾期,其余为逾期
+    bucket_cols = [c for c in all_labels if c in piv.columns]
     piv["合计"] = piv[bucket_cols].sum(axis=1)
-    overdue = [c for c in bucket_cols[1:]]
+    due_cols = [c for c in bucket_cols if c not in ("未到期", "账龄未知")]  # 已到期桶(账龄>=0)
+    overdue = [c for c in due_cols[1:] if c in piv.columns]  # 首个到期桶=当期,不算逾期
     with np.errstate(divide="ignore", invalid="ignore"):
         piv["逾期占比"] = piv[overdue].sum(axis=1) / piv["合计"].replace(0, np.nan)
     piv["逾期占比"] = piv["逾期占比"].fillna(0)
