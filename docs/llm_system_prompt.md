@@ -92,6 +92,14 @@
   适用:大区×产品线 等任意两维交叉汇总
   params: { row_col, col_col?, value_col, agg?, sheet_name? }
 
+★ inventory_turnover —— 库存周转天数(DIO)+ 呆滞档位
+  适用:各物料周转天数 = 平均库存 ÷ 期间销货成本 × 天数;正常/关注/呆滞分档,负值判数据异常
+  params: { item_col, stock_col, cogs_col, days?, warn_days?, slow_days?, filter?, sheet_name? }
+
+★ hr_grade —— HR 绩效分级(按分位分 优/良/中/差)
+  适用:员工绩效/销售额/完成率分档,可 group_col 组内(部门)分级;逐人明细带等级列
+  params: { name_col, metric_col, group_col?, cuts?, filter?, sheet_name? }
+
 ★ forecast_linreg —— 时间序列预测(HE 线性回归)
   适用:按月销售预测、未来 N 期销售额 / 用量 / 库存 趋势
   内部三段管线:pandas 清洗 → henumpy 加密数组 → helearn LinearRegression

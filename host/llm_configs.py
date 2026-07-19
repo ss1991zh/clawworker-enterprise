@@ -230,15 +230,28 @@ class LLMConfigStore:
             pass
 
     def _save(self) -> None:
+        import logging
         from host import secret_store
         self._path.parent.mkdir(parents=True, exist_ok=True)
         data = []
+        downgraded = False
         for c in self._configs.values():
             d = c.to_dict()
-            d["api_key"] = secret_store.protect(d.get("api_key", ""))   # API Key 加密落盘
+            raw = d.get("api_key", "")
+            enc = secret_store.protect(raw)
+            if raw and not secret_store.is_protected(enc):
+                downgraded = True          # 加密降级(非Windows/DPAPI失败)→ key 明文落盘
+            d["api_key"] = enc
             data.append(d)
         self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        secret_store.harden_file(self._path)   # 文件 ACL 收紧到仅属主可读
+        acl_ok = secret_store.harden_file(self._path)   # 文件 ACL 收紧到仅属主可读
+        if downgraded:
+            logging.getLogger("clawworker").warning(
+                "LLM API Key 未能加密落盘(本平台无 DPAPI 或调用失败),已明文存储 —— "
+                "仅靠文件 ACL 保护,请确保 %s 权限受限", self._path)
+        if not acl_ok:
+            logging.getLogger("clawworker").warning(
+                "LLM 配置文件 ACL 收紧失败:%s —— 同机其他用户可能可读,请手动限制权限", self._path)
 
     # ---- CRUD ----
     def list_all(self) -> list[LLMConfig]:

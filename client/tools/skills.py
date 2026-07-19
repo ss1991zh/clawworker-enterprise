@@ -1140,13 +1140,17 @@ def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
     g = full.groupby(item, as_index=False).agg(**{stock: (stock, "mean"), cogs: (cogs, "sum")})
     g["周转天数"] = _inf_to_nan(g[stock] * days / g[cogs].replace(0, np.nan))
 
-    def _tier(d):
+    def _tier(row):
+        s, c, d = row[stock], row[cogs], row["周转天数"]
+        # 负库存(退货冲减)/负销货成本(净入库)→ 数据异常,单列出来别混进正常档
+        if (s == s and s < 0) or (c == c and c < 0):
+            return "数据异常"
         if d != d:            # NaN(无销货成本→无法周转,视为呆滞)
             return "呆滞"
         if d <= warn_days:
             return "正常"
         return "关注" if d <= slow_days else "呆滞"
-    g["库存状态"] = g["周转天数"].apply(_tier)
+    g["库存状态"] = g.apply(_tier, axis=1)
     g = g.sort_values("周转天数", ascending=False, na_position="first").reset_index(drop=True)
 
     sheet = params.get("sheet_name") or "库存周转分析"
@@ -1172,7 +1176,18 @@ def skill_hr_grade(cdf, params, metadata_rows, metadata_columns):
     name = params["name_col"]
     metric = params["metric_col"]
     group = params.get("group_col") or None
+    labels = ["差", "中", "良", "优"]
     cuts = params.get("cuts") or [0.2, 0.5, 0.8]
+    # 校验 cuts:必须恰好 len(labels)-1 个、严格递增、落在 (0,1) —— 否则退回默认,不让越界崩溃
+    try:
+        cuts = [float(x) for x in cuts]
+        ok = (len(cuts) == len(labels) - 1
+              and all(0 < a < b < 1 for a, b in zip(cuts, cuts[1:]))
+              and 0 < cuts[0] < 1 and 0 < cuts[-1] < 1)
+        if not ok:
+            cuts = [0.2, 0.5, 0.8]
+    except (TypeError, ValueError):
+        cuts = [0.2, 0.5, 0.8]
 
     decrypted = _decrypt(cdf)
     full = _merge_meta(decrypted, metadata_rows, metadata_columns)
@@ -1182,9 +1197,10 @@ def skill_hr_grade(cdf, params, metadata_rows, metadata_columns):
             raise ValueError(f"hr_grade: 列「{c}」不存在")
 
     def _grade_series(s):
-        # 按分位打档;指标越高越好
-        q = s.rank(pct=True)
-        labels = ["差", "中", "良", "优"]
+        # 按分位打档;指标越高越好。全员同分(或单人)→ 分位无意义,统一给"中"不误标"优"
+        if s.nunique(dropna=True) <= 1:
+            return pd.Series("中", index=s.index)
+        q = s.rank(pct=True, method="average")
         edges = [0.0] + list(cuts) + [1.0]
         out = pd.Series(labels[-1], index=s.index)
         for i in range(len(labels)):

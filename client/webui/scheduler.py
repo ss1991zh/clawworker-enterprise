@@ -22,6 +22,7 @@ import json
 import secrets
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -652,14 +653,17 @@ class Scheduler:
             if nxt <= now:
                 # 枚举 [nxt, now] 之间**所有**到点时刻 —— 停机多天的每日任务会漏 N 期,
                 # 不能像原来那样只记 1 条(mark_fired 直接跳到 now 之后会吞掉中间各期)。
-                occ = []
+                # 期数可能极多(如 */5 停机数天),用滑动窗口只保留**最近** _MAX_MISS_ENUM 期:
+                # 用户最关心的是离现在最近的漏跑,且必须拿到真正的最新一期来判断是否"现在该跑"。
+                occ = deque(maxlen=_MAX_MISS_ENUM)   # 只保留**最近** N 期(超长停机丢弃更旧的)
                 m = nxt
-                while m <= now and len(occ) < _MAX_MISS_ENUM:
+                while m <= now:
                     occ.append(m)
                     m = t.compute_next_run(m)
+                occ = list(occ)
                 # 先推进 next_run 到 now 之后,避免回调异常导致重复触发
                 self._tasks.mark_fired(t.id)
-                last = occ[-1] if occ else nxt
+                last = occ[-1]              # 真正最新一期(occ 至少含 nxt,不会空)
                 # 最近一期若在宽限内 = 服务刚回来、这期算"到点该跑"→ 触发它;更早的都是漏跑
                 fire_last = (now - last).total_seconds() <= self._miss_grace
                 missed = occ[:-1] if fire_last else occ
