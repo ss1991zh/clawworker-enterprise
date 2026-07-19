@@ -1187,12 +1187,12 @@ def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
     return str(sheet)[:31], g, chart
 
 
-# ----- skill: HR 绩效分级(优/良/中/差)+ 人效 -------------------------------
+# ----- skill: HR 绩效分级(优/良/中/差)-------------------------------------
 
 def skill_hr_grade(cdf, params, metadata_rows, metadata_columns):
     """
     按某绩效指标给员工分级(默认按分位:优 top20% / 良 20-50% / 中 50-80% / 差 bottom20%)。
-    可选人效列(如人均产出)。
+    (人均产出等人效口径见独立技能 per_capita。)
     params:
       name_col   : 姓名/工号(meta 列)
       metric_col : 绩效指标(encrypted,如 绩效得分/销售额/完成率)
@@ -1254,6 +1254,58 @@ def skill_hr_grade(cdf, params, metadata_rows, metadata_columns):
     chart = {"type": "bar", "x": name, "y": metric, "title": sheet,
              "split_by": group if group else None}
     return str(sheet)[:31], out.reset_index(drop=True), chart
+
+
+# ----- skill: 人效 / 人均分析(人均产出·人均利润·人均成本)---------------------
+
+def skill_per_capita(cdf, params, metadata_rows, metadata_columns):
+    """
+    人效/人均:按维度(部门/大区)算 人均指标 = 指标总和 ÷ 人数。
+    params:
+      group_col   : 分组维度(部门/大区,meta 列)
+      value_col   : 产出 / 利润 / 成本(encrypted)
+      name_col?   : 姓名/工号(meta 列)—— 给了则人数=去重人头;不给=按行数计人数
+      metric_name?: 人均列名(默认「人均+value_col」)
+      ascending?  : 排序方向(默认降序,人效高的在前)
+    输出:维度 指标总和 人数 人均指标 (+合计行;合计人均=总额÷总人数,加权口径)
+    """
+    import pandas as pd
+    import numpy as np
+
+    group = params["group_col"]
+    value = params["value_col"]
+    name = params.get("name_col") or None
+    ascending = bool(params.get("ascending", False))
+    metric_name = params.get("metric_name") or f"人均{value}"
+
+    decrypted = _decrypt(cdf)
+    full = _merge_meta(decrypted, metadata_rows, metadata_columns)
+    full = _apply_filter(full, params)
+    for c in [group, value] + ([name] if name else []):
+        if c not in full.columns:
+            raise ValueError(f"per_capita: 列「{c}」不存在")
+
+    # 人数:给了姓名列 → 组内去重人头(同一人多行记录不重复计数);否则按行数
+    if name:
+        agg = full.groupby(group).agg(**{"指标总和": (value, "sum"),
+                                         "人数": (name, "nunique")}).reset_index()
+    else:
+        agg = full.groupby(group).agg(**{"指标总和": (value, "sum"),
+                                         "人数": (value, "size")}).reset_index()
+    agg[metric_name] = _inf_to_nan(agg["指标总和"] / agg["人数"].replace(0, np.nan))
+    agg = agg.sort_values(metric_name, ascending=ascending,
+                          na_position="last").reset_index(drop=True)
+
+    # 合计行:人均按「总额 ÷ 总人数」加权,不是各部门人均的简单平均(否则大部门被稀释)
+    total_val = agg["指标总和"].sum()
+    total_head = agg["人数"].sum()
+    total_row = {group: "合计", "指标总和": total_val, "人数": total_head,
+                 metric_name: (total_val / total_head if total_head else np.nan)}
+    agg = pd.concat([agg, pd.DataFrame([total_row])], ignore_index=True)
+
+    sheet = params.get("sheet_name") or "人效分析"
+    chart = {"type": "bar", "x": group, "y": metric_name, "title": sheet}
+    return str(sheet)[:31], agg, chart
 
 
 # ---------------------------------------------------------------------------
@@ -1356,6 +1408,13 @@ SKILLS: dict[str, dict[str, Any]] = {
         "desc": "HR 绩效分级(按分位分 优/良/中/差)· 可组内(部门)分级 · 逐人明细",
         "params": ["name_col", "metric_col", "group_col", "cuts", "filter", "sheet_name"],
         "note": "口径:按绩效指标分位分档(优top20%/良20-50%/中50-80%/差bottom20%),指标越高越好",
+    },
+    "per_capita": {
+        "tool": "pandaseal",
+        "fn": skill_per_capita,
+        "desc": "人效/人均分析:按部门/大区算 人均指标=指标总和÷人数(人均产出/利润/成本)· 带加权合计",
+        "params": ["group_col", "value_col", "name_col", "metric_name", "ascending", "filter", "sheet_name"],
+        "note": "口径:人均=组内指标总和÷人数(给姓名列则去重人头);合计行人均=总额÷总人数(加权,非部门人均的平均)",
     },
 }
 

@@ -175,3 +175,54 @@ def test_rfm_segments_vip_and_churn():
     # 最优客户(recency最小/频次金额最高)= 重要价值;最差 = 流失
     assert d[d["客户"]=="客户0"]["分群"].iloc[0] == "重要价值客户"
     assert d[d["客户"]=="客户19"]["分群"].iloc[0] == "流失客户"
+
+
+# ── 优化循环 T0-4(HR场景评审)新增:人效技能 + 绩效分级并列同档 ──
+
+def test_per_capita_weighted_total_and_headcount():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    rows = [
+        ("A部","张",1000000),("A部","李",800000),          # A: 2人 共180万 → 人均90万
+        ("B部","王",600000),("B部","赵",600000),("B部","孙",600000),  # B: 3人 共180万 → 人均60万
+    ]
+    df = pd.DataFrame(rows, columns=["部门","姓名","产出"])
+    _, d, _ = skills.run_skill("per_capita", df[["产出"]].reset_index(drop=True),
+        {"group_col":"部门","value_col":"产出","name_col":"姓名","metric_name":"人均产出"},
+        df[["部门","姓名"]].to_dict("records"), ["部门","姓名"])
+    a = d[d["部门"]=="A部"].iloc[0]
+    assert a["人数"] == 2 and abs(a["人均产出"] - 900000) < 1e-6
+    # 合计人均 = 总额360万 ÷ 总人数5 = 72万(加权),不是(90+60)/2=75万
+    tot = d[d["部门"]=="合计"].iloc[0]
+    assert tot["人数"] == 5 and abs(tot["人均产出"] - 720000) < 1e-6
+    # 排序:人均降序,A部(90万)在 B部(60万)前
+    order = list(d[d["部门"]!="合计"]["部门"])
+    assert order.index("A部") < order.index("B部")
+
+
+def test_per_capita_dedup_headcount():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    # 同一人多行记录 → 去重人头只算 1 人
+    rows = [("A部","张",500000),("A部","张",300000),("A部","李",200000)]
+    df = pd.DataFrame(rows, columns=["部门","姓名","产出"])
+    _, d, _ = skills.run_skill("per_capita", df[["产出"]].reset_index(drop=True),
+        {"group_col":"部门","value_col":"产出","name_col":"姓名"},
+        df[["部门","姓名"]].to_dict("records"), ["部门","姓名"])
+    a = d[d["部门"]=="A部"].iloc[0]
+    assert a["人数"] == 2  # 张(2行)+李 = 2 人头
+
+
+def test_hr_grade_ties_same_grade():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    # 同分员工必须同档(rank average),不因行序给不同档
+    rows = [("张",80),("李",80),("王",80),("赵",50),("孙",90)]
+    df = pd.DataFrame(rows, columns=["姓名","绩效"])
+    _, d, _ = skills.run_skill("hr_grade", df[["绩效"]].reset_index(drop=True),
+        {"name_col":"姓名","metric_col":"绩效"}, df[["姓名"]].to_dict("records"), ["姓名"])
+    g = dict(zip(d["姓名"], d["绩效等级"]))
+    assert g["张"] == g["李"] == g["王"]  # 三个 80 分同档
