@@ -119,8 +119,14 @@ def build_admin_router(
             login_throttle.record_success(tkey)
         token = admin_auth.login()
         resp = RedirectResponse("/admin/", status_code=303)
+        # 主机走 HTTPS(TLS 证书存在即启用)→ cookie 加 Secure,禁止明文回传
+        try:
+            from host import tls_cert
+            secure = tls_cert.current_fingerprint() is not None
+        except Exception:  # noqa: BLE001
+            secure = False
         resp.set_cookie(ADMIN_COOKIE, token, max_age=SESSION_TTL,
-                        httponly=True, samesite="lax")
+                        httponly=True, samesite="lax", secure=secure)
         return resp
 
     @router.post("/logout")

@@ -30,6 +30,8 @@ from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
 
+import ssl
+
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
@@ -86,7 +88,7 @@ _decrypt_lock = threading.Lock()
 
 def _load_config() -> dict[str, Any]:
     defaults = {
-        "host_url": "http://127.0.0.1:8443",
+        "host_url": "https://127.0.0.1:8443",   # 主机端已启 TLS
         "backend": "real",
     }
     if CLIENT_CONFIG_FILE.exists():
@@ -136,7 +138,8 @@ app.mount("/static", StaticFiles(directory=str(_WEBUI_DIR / "static")), name="st
 #   2) 改状态请求需带 X-CSRF-Token 自定义头 —— 跨站无法设自定义头(会触发 CORS 预检被拒)
 _CSRF_TOKEN = secrets.token_urlsafe(32)
 _ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
-_CSRF_EXEMPT_PATHS = {"/login", "/logout"}   # 表单登录(尚无 session)靠 Host+Origin 兜底
+# 表单登录/重新信任(尚无 session,可能登录被证书变更阻断)靠 Host+Origin 兜底
+_CSRF_EXEMPT_PATHS = {"/login", "/logout", "/host-trust/repin"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -262,6 +265,46 @@ def _asset_version() -> str:
         return "0"
 
 
+@app.get("/host-trust", response_class=HTMLResponse)
+def host_trust_page():
+    """主机证书信任核对页 —— 首次登记或证书轮换后,核对指纹一致再点重新信任。
+    无需登录(证书变更会阻断登录),仅本机 + 同源可访问(中间件 Host+Origin 兜底)。"""
+    from client import host_trust
+    host_url = host_trust.to_https(_config.get("host_url", "") or "https://127.0.0.1:8443")
+    pinned = host_trust.pinned_fingerprint(host_url) or "(尚未锁定)"
+    seen = host_trust.server_fingerprint(host_url) or "(取不到 · 主机未启动?)"
+    match = pinned == seen
+    tip = ("✓ 指纹一致,主机可信。" if match and pinned != "(尚未锁定)"
+           else "⚠ 指纹不一致或未锁定。请向管理员核对下面『主机当前指纹』无误后,再点『重新信任』。")
+    return f"""<!doctype html><meta charset=utf-8><title>主机信任核对</title>
+<style>body{{font:14px/1.7 system-ui;max-width:680px;margin:48px auto;padding:0 20px;color:#1f2937}}
+code{{background:#f3f4f6;padding:2px 6px;border-radius:4px;font-size:12px;word-break:break-all}}
+.b{{background:#2563eb;color:#fff;border:0;padding:10px 18px;border-radius:8px;font-size:14px;cursor:pointer}}
+h2{{margin-bottom:4px}}</style>
+<h2>主机 TLS 证书信任</h2><p>主机地址:<code>{host_url}</code></p>
+<p>{tip}</p>
+<p>已锁定指纹:<br><code>{pinned}</code></p>
+<p>主机当前指纹:<br><code>{seen}</code></p>
+<form method=post action=/host-trust/repin>
+<button class=b type=submit>重新信任主机当前证书</button>
+&nbsp;<a href=/login>返回登录</a></form>
+<p style=color:#6b7280;font-size:12px;margin-top:24px>
+只有当你已通过其它渠道(如管理员口头/后台)确认『主机当前指纹』确实是本机构主机的,才点重新信任 ——
+否则可能把中间人的证书当成主机信任。</p>"""
+
+
+@app.post("/host-trust/repin")
+def host_trust_repin():
+    """用户核对指纹后重新锁定主机当前证书。"""
+    from client import host_trust
+    host_url = _config.get("host_url", "") or "https://127.0.0.1:8443"
+    try:
+        host_trust.repin(host_url)
+        return _flash_redirect("/login", ("info", "已重新信任主机证书,请重新登录。"))
+    except Exception as e:  # noqa: BLE001
+        return _flash_redirect("/host-trust", ("error", f"重新信任失败:{e}"))
+
+
 # ----------------------------------------------------------------------------
 # 登录 / 主页
 # ----------------------------------------------------------------------------
@@ -303,15 +346,31 @@ def login_submit(
         host_url = _validate_host_url(host_url)   # 补协议 + 只允许内网/本机
     except ValueError as e:
         return _flash_redirect("/login", ("error", str(e)))
+    from client import host_trust
+    host_url = host_trust.to_https(host_url)      # 主机端已启 TLS
+    try:
+        verify = host_trust.verify_for(host_url)  # TOFU:首连锁定主机证书,之后校验一致
+    except Exception as e:  # noqa: BLE001 —— 抓不到证书(主机没起/网络)
+        return _flash_redirect("/login", ("error", f"无法连接主机(取证书失败):{e}"))
     try:
         r = httpx.post(
             f"{host_url}/auth/login",
             json={"username": username, "password": password},
             timeout=15,
-            # 连主机是局域网流量,绕过系统代理(Clash 等)—— 否则代理返回空 502,
-            # 界面只显示"登录失败:"没有任何详情
+            verify=verify,      # 校验主机出示的正是已锁定的那张证书
+            # 连主机是局域网流量,绕过系统代理(Clash 等)—— 否则代理返回空 502
             trust_env=False,
         )
+    except (httpx.ConnectError, ssl.SSLError) as e:
+        # 证书校验失败 = 主机证书变了(重装/中间人)→ 给出双指纹,指向"重新信任"
+        seen = host_trust.server_fingerprint(host_url) or "?"
+        pinned = host_trust.pinned_fingerprint(host_url) or "?"
+        if seen != pinned:
+            return _flash_redirect("/login", ("error",
+                f"⚠ 主机证书已变更(可能主机重装了证书,或存在中间人)。"
+                f"已锁定指纹 {pinned[:23]}…,当前 {seen[:23]}…。"
+                f"确认是主机方变更后,打开 /host-trust 核对指纹并重新信任。"))
+        return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
     except httpx.HTTPError as e:
         return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
     if r.status_code != 200:
@@ -331,6 +390,33 @@ def login_submit(
         _save_config(_config)
     _bind_runtime_vault()   # 绑定该用户 vault → 引擎用其上传的密钥/字典/授权
     return RedirectResponse("/", status_code=303)
+
+
+@app.get("/api/host/trust")
+def api_host_trust():
+    """主机 TLS 信任状态:已锁定指纹 / 当前主机指纹 / 是否一致。供设置页展示核对。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client import host_trust
+    host_url = _session_state.get("host_url", "") or _config.get("host_url", "")
+    pinned = host_trust.pinned_fingerprint(host_url)
+    seen = host_trust.server_fingerprint(host_url)
+    return {"host_url": host_url, "pinned": pinned, "server": seen,
+            "match": bool(pinned and seen and pinned == seen)}
+
+
+@app.post("/api/host/repin")
+def api_host_repin():
+    """重新信任主机当前证书(证书轮换/重装后,用户核对指纹一致后调用)。"""
+    if not _is_logged_in():
+        return _need_login()
+    from client import host_trust
+    host_url = _session_state.get("host_url", "") or _config.get("host_url", "")
+    try:
+        fp = host_trust.repin(host_url)
+        return {"ok": True, "fingerprint": fp}
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"重新信任失败(取证书):{type(e).__name__}: {e}")
 
 
 @app.post("/logout")
@@ -527,11 +613,13 @@ def api_keys_fetch_auth():
         return _need_login()
     host_url = _session_state["host_url"]
     token = _session_state["token"]
+    from client import host_trust
     try:
         r = httpx.get(
             f"{host_url}/auth/user_authorization",
             headers={"Authorization": f"Bearer {token}"},
             timeout=30,
+            verify=host_trust.verify_for(host_url),   # 校验主机 TLS 证书(TOFU 锁定)
             trust_env=False,   # 局域网连主机不走系统代理
         )
     except httpx.HTTPError as e:

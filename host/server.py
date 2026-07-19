@@ -184,6 +184,19 @@ def login(req: LoginRequest, request: Request):
     return {"token": sess.token, "expires_at": sess.expires_at.isoformat()}
 
 
+@app.get("/tls/fingerprint")
+def tls_fingerprint():
+    """
+    返回主机 TLS 证书指纹(公开信息,供客户端首次登记时人工核对,防中间人)。
+    admin 也可在后台看到同一指纹,读给终端用户核对。
+    """
+    try:
+        from host import tls_cert
+        return {"fingerprint": tls_cert.current_fingerprint()}
+    except Exception:  # noqa: BLE001
+        return {"fingerprint": None}
+
+
 @app.post("/client/report-init-failed")
 def report_init_failed(sess=Depends(get_current_session)):
     """

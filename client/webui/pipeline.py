@@ -108,6 +108,8 @@ def _post_cancellable(
     """
     chk = should_cancel or (lambda: False)
     _usage_bump_call()   # 全局调用计数 + 硬上限,防重试回环失控(超限抛 LLMCallBudgetExceeded)
+    from client import host_trust
+    verify = host_trust.verify_for(url)   # 校验主机 TLS 证书(TOFU 锁定)
     box: dict = {}
 
     def worker():
@@ -117,6 +119,7 @@ def _post_cancellable(
                 # 整体 + 读都设有限上限(read=timeout):host 发头后静默 stall 不再无限等,
                 # 最长 timeout 秒后抛出;用户点停止可更早中断。
                 timeout=httpx.Timeout(timeout, connect=10.0, read=timeout, write=timeout, pool=timeout),
+                verify=verify,
                 trust_env=False,   # 局域网连主机不走系统代理(Clash 等会劫持返回空 502)
             )
         except Exception as e:
@@ -546,9 +549,10 @@ def _report_init_failed_to_host(host_url: str, token: str, log) -> None:
     """把授权初始化失败上报主机(best-effort,失败不影响给用户的报错)。"""
     try:
         import httpx
+        from client import host_trust
         httpx.post(f"{host_url}/client/report-init-failed",
                    headers={"Authorization": f"Bearer {token}"},
-                   timeout=8, trust_env=False)
+                   timeout=8, verify=host_trust.verify_for(host_url), trust_env=False)
         log("think", "已通知主机端:本机授权初始化失败")
     except Exception:  # noqa: BLE001
         log("think", "上报主机授权失效未成功(不影响本次报错提示)")
