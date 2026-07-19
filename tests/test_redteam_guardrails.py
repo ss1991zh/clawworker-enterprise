@@ -251,3 +251,19 @@ def test_denoise_he_preserves_small_real_values_above_eps():
     df = pd.DataFrame({"x": [0.01, 1e-5, 1e-3]})
     out = _denoise_he(df.copy())
     assert (out["x"] == pd.Series([0.01, 1e-5, 1e-3])).all()
+
+
+# ── 优化循环 T1-1(真实LLM验证):R3 加密数值列不做字符串模糊匹配规则 ──
+
+def test_codegen_prompt_forbids_string_match_on_encrypted_numeric():
+    from client.webui.codegen import CODEGEN_SYSTEM
+    # 规则要点:数值列不做字符串/模糊匹配、改数值范围
+    assert "字符串" in CODEGEN_SYSTEM and "数值范围" in CODEGEN_SYSTEM
+    assert "str.contains" in CODEGEN_SYSTEM or "模糊匹配" in CODEGEN_SYSTEM
+
+
+def test_skill_prompt_forbids_string_match_on_encrypted_numeric():
+    import pathlib
+    sp = pathlib.Path(__file__).resolve().parents[1] / "docs" / "llm_system_prompt.md"
+    text = sp.read_text(encoding="utf-8")
+    assert "数值范围" in text and "模糊匹配" in text
