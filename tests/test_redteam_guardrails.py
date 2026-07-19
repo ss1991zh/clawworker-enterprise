@@ -74,3 +74,49 @@ def test_yoy_mom_amount_vs_rate_format():
         assert _infer_number_format(h) == _MONEY_FMT, f"{h} 应为金额格式"
     for h in ("环比增长率", "同比增长率", "环比率", "同比率", "差异率"):
         assert _infer_number_format(h) == "0.00%", f"{h} 应为百分比"
+
+
+# ── 优化循环 T0-2(库存场景评审)修复:ABC剔负值不溢出 + 周转数据异常隔离 ──
+
+def _inv_frames():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    rows = [
+        ("正常件A","IT", 55000, 400000),   # DIO~50 正常
+        ("慢件B","办公", 96000, 240000),   # DIO~146 呆滞
+        ("零动C","礼品", 20000, 0),        # 零销货成本 → 呆滞(NaN)
+        ("退货冲减","耗材", -15000, 90000), # 负库存 → 数据异常
+        ("退供件","耗材", 60000, -20000),  # 负销货成本 → 数据异常
+    ]
+    df = pd.DataFrame(rows, columns=["物料名称","类别","库存金额","销货成本"])
+    meta = df[["物料名称","类别"]].to_dict("records")
+    cdf = df[["库存金额","销货成本"]].reset_index(drop=True)
+    return skills, cdf, meta
+
+
+def test_pareto_abc_excludes_nonpositive_no_overflow():
+    skills, cdf, meta = _inv_frames()
+    _, d, _ = skills.run_skill("pareto_abc", cdf,
+        {"label_col":"物料名称","value_col":"库存金额"}, meta, ["物料名称","类别"])
+    pos = d[d["ABC类"] != "数据异常"]
+    # 正值累计占比不得突破 100%
+    assert pos["累计占比"].max() <= 1.0 + 1e-9
+    # 负值行被隔离为「数据异常」,占比/累计留空,不混入 ABC
+    bad = d[d["ABC类"] == "数据异常"]
+    assert len(bad) == 1 and bad["占比"].isna().all() and bad["累计占比"].isna().all()
+
+
+def test_inventory_turnover_anomaly_blank_and_bottom():
+    import numpy as np
+    skills, cdf, meta = _inv_frames()
+    _, d, _ = skills.run_skill("inventory_turnover", cdf,
+        {"item_col":"物料名称","stock_col":"库存金额","cogs_col":"销货成本","days":365},
+        meta, ["物料名称","类别"])
+    # 数据异常行:周转天数置空(不显示无意义负数)
+    bad = d[d["库存状态"] == "数据异常"]
+    assert len(bad) == 2 and bad["周转天数"].isna().all()
+    # 数据异常置于表尾
+    assert (d["库存状态"] == "数据异常").iloc[-len(bad):].all()
+    # 零销货成本的呆滞(NaN=不周转)排在最前
+    assert d.iloc[0]["库存状态"] == "呆滞" and np.isnan(d.iloc[0]["周转天数"])

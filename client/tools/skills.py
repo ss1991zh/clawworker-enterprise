@@ -1047,10 +1047,13 @@ def skill_pareto_abc(cdf, params, metadata_rows, metadata_columns):
             raise ValueError(f"pareto_abc: 列「{c}」不存在")
 
     g = full.groupby(label_col)[value_col].sum().reset_index()
-    g = g.sort_values(value_col, ascending=False).reset_index(drop=True)
-    total = g[value_col].sum() or 1.0
-    g["占比"] = g[value_col] / total
-    g["累计占比"] = g["占比"].cumsum()
+    # ABC/帕累托是「正贡献的 80/20」:≤0 的值(退货冲减 / 录入异常)不参与占比与累计——
+    # 否则总额被负值拉小,正值累计占比会突破 100%。把它们单拎出来标「数据异常」置于表尾。
+    pos = g[g[value_col] > 0].sort_values(value_col, ascending=False).reset_index(drop=True)
+    bad = g[g[value_col] <= 0].sort_values(value_col).reset_index(drop=True)
+    total = pos[value_col].sum() or 1.0
+    pos["占比"] = pos[value_col] / total
+    pos["累计占比"] = pos["占比"].cumsum()
 
     def _abc(cum):
         if cum <= a_cut:
@@ -1058,7 +1061,12 @@ def skill_pareto_abc(cdf, params, metadata_rows, metadata_columns):
         if cum <= b_cut:
             return "B"
         return "C"
-    g["ABC类"] = g["累计占比"].apply(_abc)
+    pos["ABC类"] = pos["累计占比"].apply(_abc)
+    if len(bad):
+        bad["占比"] = np.nan
+        bad["累计占比"] = np.nan
+        bad["ABC类"] = "数据异常"
+    g = pd.concat([pos, bad], ignore_index=True)
 
     sheet = params.get("sheet_name") or "帕累托ABC分析"
     chart = {"type": "bar", "x": label_col, "y": value_col, "title": sheet}
@@ -1151,7 +1159,12 @@ def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
             return "正常"
         return "关注" if d <= slow_days else "呆滞"
     g["库存状态"] = g.apply(_tier, axis=1)
-    g = g.sort_values("周转天数", ascending=False, na_position="first").reset_index(drop=True)
+    # 排序用显式键,不靠 NaN 位置:零销货成本的呆滞(NaN=不周转)视为最滞→∞置顶;
+    # 数据异常(负值)→ -∞ 一律置尾,并把其无意义的负周转天数置空,免得财务误读。
+    is_bad = g["库存状态"] == "数据异常"
+    sort_key = g["周转天数"].fillna(np.inf).where(~is_bad, -np.inf)
+    g = g.assign(_k=sort_key).sort_values("_k", ascending=False).drop(columns="_k").reset_index(drop=True)
+    g.loc[g["库存状态"] == "数据异常", "周转天数"] = np.nan
 
     sheet = params.get("sheet_name") or "库存周转分析"
     chart = {"type": "bar", "x": item, "y": "周转天数", "title": sheet}
