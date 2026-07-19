@@ -137,7 +137,10 @@ def enforce_excel_path(path: Path) -> Path:
 # ----------------------------------------------------------------------------
 
 # 逆向指标:数值越大越"坏",百分比色阶要反色(红高绿低)
-_REVERSE_METRIC = ("逾期", "超支", "流失", "异常", "缺货", "呆滞", "波动", "差异率", "降幅")
+_REVERSE_METRIC = ("逾期", "超支", "流失", "异常", "缺货", "呆滞", "波动", "降幅")
+# 方向取决于是成本类还是收入类,通用渲染层无从判断(收入差异率高=好、成本差异率高=坏)——
+# 这类列不套三色阶,红绿由方向准确的档位列(超额/超支等)承担,避免把"收入超额"误染成红。
+_AMBIGUOUS_DIRECTION = ("差异率", "差额率", "偏差率", "变动率")
 
 
 # 金额格式:正数千分位,负数会计惯例红字括号
@@ -198,7 +201,7 @@ _TIER_MAP = {
     "优": _TIER_BEST, "优秀": _TIER_BEST,
     # —— 绿(好)——
     "达成": _TIER_GOOD, "已达成": _TIER_GOOD, "完成": _TIER_GOOD, "正常": _TIER_GOOD,
-    "健康": _TIER_GOOD, "活跃": _TIER_GOOD,
+    "健康": _TIER_GOOD, "活跃": _TIER_GOOD, "超额": _TIER_GOOD, "达标": _TIER_GOOD,
     "盈利": _TIER_GOOD, "节约": _TIER_GOOD, "favorable": _TIER_GOOD, "a": _TIER_GOOD,
     "a类": _TIER_GOOD, "a档": _TIER_GOOD, "重要价值": _TIER_GOOD, "高价值": _TIER_GOOD,
     "高": _TIER_GOOD, "充足": _TIER_GOOD, "良": _TIER_GOOD,
@@ -207,7 +210,7 @@ _TIER_MAP = {
     "中等": _TIER_WARN, "临期": _TIER_WARN, "b": _TIER_WARN, "b类": _TIER_WARN,
     "b档": _TIER_WARN, "潜力": _TIER_WARN, "待挽留": _TIER_WARN, "一般价值": _TIER_WARN,
     # —— 红(差/风险)——
-    "未达成": _TIER_BAD, "未完成": _TIER_BAD, "异常": _TIER_BAD, "超支": _TIER_BAD,
+    "未达成": _TIER_BAD, "未完成": _TIER_BAD, "未达": _TIER_BAD, "异常": _TIER_BAD, "超支": _TIER_BAD,
     "逾期": _TIER_BAD, "呆滞": _TIER_BAD, "流失": _TIER_BAD, "已流失": _TIER_BAD,
     "差": _TIER_BAD, "亏损": _TIER_BAD, "高风险": _TIER_BAD, "unfavorable": _TIER_BAD,
     "c": _TIER_BAD, "c类": _TIER_BAD, "c档": _TIER_BAD, "低": _TIER_BAD, "缺货": _TIER_BAD,
@@ -580,6 +583,8 @@ def _render_sheet(ws, df, r: dict) -> None:
         for ci, h in enumerate(headers, 1):
             if col_fmt.get(ci) not in ("0.00%", '0.00"%"'):
                 continue
+            if any(k in str(h) for k in _AMBIGUOUS_DIRECTION):
+                continue   # 方向歧义列不套色阶,红绿交给档位列
             lo, mid, hi = "F8696B", "FFEB84", "63BE7B"  # 红→黄→绿
             if any(k in str(h) for k in _REVERSE_METRIC):
                 lo, hi = hi, lo

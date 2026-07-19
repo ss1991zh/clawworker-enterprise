@@ -44,3 +44,22 @@ def test_freechat_prompt_refuses_prompt_disclosure():
     # R9:闲聊路径也要拒绝复述系统提示词 + 忽略注入
     from client.webui.pipeline import _FREECHAT_SYSTEM
     assert "系统提示词" in _FREECHAT_SYSTEM and "忽略" in _FREECHAT_SYSTEM
+
+
+# ── 优化循环 T0-1(财务场景评审)修复:预算差异档位色 + 方向歧义率不误染 ──
+
+def test_budget_variance_tier_colors():
+    from client.webui.writer import _tier_fill, _TIER_GOOD, _TIER_BAD
+    def bg(v):
+        r = _tier_fill(v)
+        return r[0].fgColor.rgb[-6:] if r else None
+    # 收入方向:超额/达标=好(绿),未达=坏(红);成本方向 超支=红/节约=绿
+    assert bg("超额") == _TIER_GOOD[0] and bg("达标") == _TIER_GOOD[0]
+    assert bg("未达") == _TIER_BAD[0] and bg("超支") == _TIER_BAD[0]
+    assert bg("节约") == _TIER_GOOD[0]
+
+
+def test_ambiguous_direction_rate_not_reverse_colored():
+    from client.webui.writer import _AMBIGUOUS_DIRECTION, _REVERSE_METRIC
+    # 差异率方向取决于成本/收入,不套逆向色阶(交给档位列),避免把收入超额染红
+    assert "差异率" in _AMBIGUOUS_DIRECTION and "差异率" not in _REVERSE_METRIC
