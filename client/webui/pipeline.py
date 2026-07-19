@@ -1066,14 +1066,17 @@ def _run_codegen_path(
     try:
         cdf = load_cipher_df(cipher_path)
     except AuthorizationInitError as e:
-        # 授权过期/被吊销 —— 上报主机(闭合自动 disable 链路),并给用户明确指引
-        _report_init_failed_to_host(host_url, token, log)
-        log("error", f"授权失效:{e}")
-        return {
-            "status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
-            "error": ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
-                      "请联系管理员续期/重新签发授权后,到「同态密钥」重新拉取证书。"),
-        }
+        # 仅当错误像"授权失效"才上报主机 disable —— 字典损坏/版本不匹配不上报,避免自锁账户
+        if getattr(e, "likely_authorization", True):
+            _report_init_failed_to_host(host_url, token, log)
+            hint = ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
+                    "请联系管理员续期/重新签发授权后,到「同态密钥」重新拉取证书。")
+        else:
+            hint = (f"密钥/字典初始化失败:{e}。多为字典文件损坏或版本不匹配 —— "
+                    "请到「同态密钥」重新上传正确的 sk / 字典文件后重试。")
+        log("error", f"初始化失败:{e}")
+        return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
+                "error": hint}
     except Exception as e:
         log("error", f"密文加载失败:{e} · 回退固化 skill")
         return None
@@ -1505,11 +1508,16 @@ def _ask_impl(
         log("error", "已停止 · 用户取消")
         return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
     except AuthorizationInitError as e:
-        _report_init_failed_to_host(host_url, token, log)
-        log("error", f"授权失效:{e}")
+        if getattr(e, "likely_authorization", True):
+            _report_init_failed_to_host(host_url, token, log)
+            hint = ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
+                    "请联系管理员续期后重新拉取证书。")
+        else:
+            hint = (f"密钥/字典初始化失败:{e}。多为字典文件损坏或版本不匹配 —— "
+                    "请到「同态密钥」重新上传正确文件后重试。")
+        log("error", f"初始化失败:{e}")
         return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
-                "error": ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
-                          "请联系管理员续期后重新拉取证书。")}
+                "error": hint}
     except Exception as e:
         return {"status": "failed", "error": f"密文加载失败: {e}", "summary": summary_raw}
 

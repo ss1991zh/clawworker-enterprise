@@ -62,7 +62,13 @@ def _harden_acl(path: Path) -> bool:
 
 
 def _path_owner_only(path: Path) -> bool:
-    """该路径是否只有属主可访问(POSIX 看权限位;Windows 看 NTFS ACL)。"""
+    """
+    该路径是否只有属主可访问(POSIX 看权限位;Windows 看 NTFS ACL)。
+    Windows 采用**白名单 + fail-closed**:解析 icacls 的每条 ACE 主体,
+    只有当被授权主体**全部**属于 {当前用户、SYSTEM、Administrators} 时才算独占;
+    出现任何其它主体(含各语言本地化的 Users/Everyone/经过身份验证的用户)→ 判未独占。
+    这样对中文/任意语言系统都不会误判为合规(未知宽泛组不在白名单 → False)。
+    """
     import subprocess
     try:
         if os.name != "nt":
@@ -73,10 +79,23 @@ def _path_owner_only(path: Path) -> bool:
         if r.returncode != 0:
             return False
         import re as _re
-        # 只看真正的 ACE 授权(主体名紧跟 ":(权限)"),避免把路径里的 C:\Users\ 误当授权。
-        # 授权给下列宽泛主体即视为未独占(覆盖中英文系统组名)。
-        broad = r"(Everyone|Authenticated Users|BUILTIN\\Users|\bUsers|所有人|Todos)"
-        return not _re.search(broad + r"\s*:\s*\(", r.stdout)
+        user = (os.environ.get("USERNAME") or "").lower()
+        domain = (os.environ.get("USERDOMAIN") or "").lower()
+        allowed = set()
+        if user:
+            allowed.add(user)
+            if domain:
+                allowed.add(f"{domain}\\{user}")
+        if not allowed:
+            return False
+        # 先把查询的文件路径从输出里剔除(它与首个主体同在第一行,否则会被粘进主体名)
+        out = r.stdout.replace(str(path), " ")
+        # 每个 ACE 形如 "<主体>:(权限...)";主体名不含 ":(",取每处 ":(" 之前的文本
+        principals = [m.strip().lower() for m in _re.findall(r"([^\r\n]+?):\(", out)]
+        if not principals:
+            return False                        # 解析不出授权 → 保守判未独占
+        # 加固后只剩当前用户;出现任何其它主体(SYSTEM/Admins/各语言 Users 组等)→ 未独占
+        return all(name in allowed for name in principals)
     except Exception:  # noqa: BLE001
         return False
 

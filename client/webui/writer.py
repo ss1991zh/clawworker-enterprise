@@ -225,7 +225,10 @@ def _tier_fill(value):
             idx = key.find(k)
             if idx < 0:
                 continue
-            negated = idx > 0 and key[idx - 1] in _TIER_NEGATIONS
+            # 否定检测:向档位词左侧回看一个小窗口(而非仅紧邻前一字),
+            # 覆盖"未能达成/没有完成/不太活跃/并非达成"等隔字否定 → 好↔差翻转
+            window = key[max(0, idx - 3):idx]
+            negated = any(n in window for n in _TIER_NEGATIONS)
             pal = _flip_tier(p) if negated else p
             break
     if not pal:

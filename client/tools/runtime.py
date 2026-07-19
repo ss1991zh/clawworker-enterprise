@@ -20,7 +20,26 @@ Backend = Literal["stub", "real"]
 
 
 class AuthorizationInitError(RuntimeError):
-    """授权文件在位但 SDK initDict 失败 —— 多半授权已过期/被吊销/损坏(区别于文件缺失)。"""
+    """
+    授权文件在位但 SDK init(SK/Dict)失败 —— 多半授权已过期/被吊销(区别于文件缺失)。
+    `likely_authorization`:错误消息像"过期/吊销/授权/license"才为 True;
+    像字典损坏/版本不匹配则为 False —— 只有 True 时上层才上报主机 disable,
+    避免"用户传了个坏字典就把自己账号锁死"的误伤。
+    """
+    def __init__(self, msg: str, likely_authorization: bool = True):
+        super().__init__(msg)
+        self.likely_authorization = likely_authorization
+
+
+# 判定 init 错误是否像"授权失效"(而非文件损坏/版本问题)
+_AUTH_ERR_KEYS = ("expire", "expired", "expiration", "authoriz", "revok", "license",
+                  "permission denied", "not valid", "invalid user",
+                  "过期", "吊销", "授权", "许可", "无效用户", "到期")
+
+
+def _looks_like_auth_error(msg: str) -> bool:
+    m = (msg or "").lower()
+    return any(k in m for k in _AUTH_ERR_KEYS)
 
 # 默认密钥/字典/授权文件解析(跨平台)。优先级:
 #   环境变量(AGENT_SK_PATH / AGENT_DICT_DIR / AGENT_USER_AUTH)
@@ -249,7 +268,13 @@ class Runtime:
             )
         import crypto_toolkit as ct
 
-        ct.initSK(skFilePath=sk_path)
+        # sk 在位但 initSK 失败 → 可能授权已过期/被吊销,与 initDict 一致抛专用异常,供上层上报
+        try:
+            ct.initSK(skFilePath=sk_path)
+        except Exception as e:  # noqa: BLE001
+            raise AuthorizationInitError(
+                f"密钥初始化失败:{type(e).__name__}: {e}",
+                likely_authorization=_looks_like_auth_error(str(e))) from e
         self._sk_initialized = True
 
     def license_status(self) -> dict:
@@ -300,7 +325,8 @@ class Runtime:
                 lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
         except Exception as e:  # noqa: BLE001
             raise AuthorizationInitError(
-                f"授权初始化失败(可能已过期或被吊销):{type(e).__name__}: {e}") from e
+                f"授权初始化失败:{type(e).__name__}: {e}",
+                likely_authorization=_looks_like_auth_error(str(e))) from e
         self._license = _parse_license(captured)
         self._dict_initialized = True
 

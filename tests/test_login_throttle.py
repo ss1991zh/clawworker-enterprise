@@ -35,6 +35,29 @@ def test_keys_are_independent():
     assert t.check("u:dave") == 0.0       # 互不影响
 
 
+def test_memory_bounded_under_key_flood():
+    from host.login_throttle import _MAX_KEYS
+    t = LoginThrottle()
+    # 模拟轮换 IP 洪水:远超容量的一次性键
+    for i in range(_MAX_KEYS + 5000):
+        t.record_failure(f"ip:10.0.{i // 256}.{i % 256}")
+    # 清扫 + LRU 淘汰后不应无界增长(留有余量)
+    assert len(t._last) <= _MAX_KEYS, f"键数 {len(t._last)} 未被限制"
+
+
+def test_locked_keys_survive_eviction():
+    t = LoginThrottle()
+    # 先锁定一个受害键
+    for _ in range(_FAIL_THRESHOLD):
+        t.record_failure("u:victim")
+    assert t.check("u:victim") > 0.0
+    # 洪水淘汰不应释放仍在锁定期的键
+    from host.login_throttle import _MAX_KEYS
+    for i in range(_MAX_KEYS + 2000):
+        t.record_failure(f"ip:172.16.{i // 256}.{i % 256}")
+    assert t.check("u:victim") > 0.0, "锁定中的键被误淘汰"
+
+
 def test_default_password_detection():
     import tempfile
     from pathlib import Path
