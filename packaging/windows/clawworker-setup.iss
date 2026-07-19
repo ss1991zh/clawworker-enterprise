@@ -77,6 +77,11 @@ Filename: "powershell.exe"; \
 Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\windows\clawworker_launch.py"" {#RoleArg}"; \
   Description: "立即启动 {#AppName}"; Flags: postinstall nowait skipifsilent
 
+[UninstallRun]
+; 卸载时从受信任根移除本产品自签证书(按 CN 匹配,best-effort)
+Filename: "certutil.exe"; Parameters: "-user -delstore Root ""Clawworker Enterprise Local"""; \
+  Flags: runhidden; RunOnceId: "DelTlsCert"
+
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.venv"
 

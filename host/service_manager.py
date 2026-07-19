@@ -103,21 +103,20 @@ def _py_exe() -> str:
 
 def service_run_argv(svc_key: str) -> list[str]:
     """拉起单个服务的命令行(uvicorn)。supervisor 用它 spawn 子进程。
-    host(控制面)启 HTTPS:证书不存在则自动生成(自签 + 指纹锁定 TOFU)。
-    client(:8444)只监听回环,保持 HTTP(本机无嗅探面,且简化本地访问)。"""
+    host(控制面)与 client(数据面)都启 HTTPS,共用同一张自签证书(覆盖 localhost + 本机 IP)。
+    证书随安装导入 Windows 信任库 → 浏览器不弹警告;客户端连主机另有指纹锁定(TOFU)。"""
     svc = SERVICES[svc_key]
     argv = [
         _py_exe(), "-m", "uvicorn", svc["app"],
         "--host", svc["bind"], "--port", str(svc["port"]),
         "--timeout-keep-alive", "75",
     ]
-    if svc_key == "host":
-        try:
-            from host import tls_cert
-            cert_path, key_path, _fp = tls_cert.ensure_cert()
-            argv += ["--ssl-keyfile", str(key_path), "--ssl-certfile", str(cert_path)]
-        except Exception:  # noqa: BLE001 —— 证书生成失败则退回 HTTP,不阻断启动(日志会记)
-            pass
+    try:
+        from host import tls_cert
+        cert_path, key_path, _fp = tls_cert.ensure_cert()
+        argv += ["--ssl-keyfile", str(key_path), "--ssl-certfile", str(cert_path)]
+    except Exception:  # noqa: BLE001 —— 证书生成失败则退回 HTTP,不阻断启动(日志会记)
+        pass
     return argv
 
 

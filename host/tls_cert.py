@@ -76,8 +76,9 @@ def generate(cert_dir: Path = CERT_DIR) -> tuple[Path, Path, str]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     hostname = socket.gethostname() or "clawworker-host"
+    # CN 用固定可识别串(现代 TLS 主机名匹配看 SAN 不看 CN)—— 便于卸载时按名删信任库
     subject = issuer = x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, hostname),
+        x509.NameAttribute(NameOID.COMMON_NAME, "Clawworker Enterprise Local"),
         x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Clawworker Enterprise"),
     ])
     alt_names: list = [x509.DNSName("localhost"), x509.DNSName(hostname)]
