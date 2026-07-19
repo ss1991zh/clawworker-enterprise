@@ -12,6 +12,13 @@ from client.permissions import AutoApproveAuthorizer
 from client.tools import ZFHE
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_backend: 需真实 HE 后端 + 本机密钥 vault(缺则自动 skip)",
+    )
+
+
 @pytest.fixture
 def zfhe() -> ZFHE:
     return ZFHE()

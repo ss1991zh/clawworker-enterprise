@@ -226,3 +226,28 @@ def test_hr_grade_ties_same_grade():
         {"name_col":"姓名","metric_col":"绩效"}, df[["姓名"]].to_dict("records"), ["姓名"])
     g = dict(zip(d["姓名"], d["绩效等级"]))
     assert g["张"] == g["李"] == g["王"]  # 三个 80 分同档
+
+
+# ── 优化循环 T0-5(密态边界):同态近零噪声去噪(纯函数,无需密钥)──
+
+def test_denoise_he_snaps_near_zero():
+    import pandas as pd
+    from client.tools.skills import _denoise_he
+    # 模拟 HE 解密结果:精确 0→1e-15、真实值带 1e-13 抖动、身份列不动
+    df = pd.DataFrame({
+        "金额": [1e-15, 100.0, 2500.5000000000002, -3e-16],
+        "名称": ["甲", "乙", "丙", "丁"],
+    })
+    out = _denoise_he(df.copy())
+    assert out["金额"].iloc[0] == 0.0 and out["金额"].iloc[3] == 0.0   # 近零归零
+    assert out["金额"].iloc[1] == 100.0                                # 正常值不动
+    assert list(out["名称"]) == ["甲", "乙", "丙", "丁"]               # 非数值列不动
+
+
+def test_denoise_he_preserves_small_real_values_above_eps():
+    import pandas as pd
+    from client.tools.skills import _denoise_he
+    # 阈值 1e-6 以上的真实小值必须保留(不误杀)
+    df = pd.DataFrame({"x": [0.01, 1e-5, 1e-3]})
+    out = _denoise_he(df.copy())
+    assert (out["x"] == pd.Series([0.01, 1e-5, 1e-3])).all()
