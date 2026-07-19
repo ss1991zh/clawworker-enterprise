@@ -160,10 +160,11 @@ def _infer_number_format(col_name: str) -> Optional[str]:
     """按列名推断 Excel 数字格式 —— 覆盖销售/财务/库存/HR/客户常见指标。"""
     name = str(col_name)
     lower = name.lower()
-    # 百分比(率 / 占比 / 同比环比 / 增长)
+    # 百分比 —— 注意:「同比增长/环比增长」是**绝对增长额(元)**不是比率,
+    # 只有带「率」或明确「涨幅/降幅/占比」的才是百分比(下面金额段会接住增长额)
     if any(k in lower for k in ("rate", "ratio", "percentage", "pct")):
         return "0.00%"
-    if any(k in name for k in ("率", "比例", "占比", "百分比", "同比", "环比", "增长", "涨幅", "降幅")):
+    if any(k in name for k in ("率", "比例", "占比", "百分比", "涨幅", "降幅")):
         return "0.00%"
     # 天数 / 账龄 / 周转
     if "days" in lower or any(k in name for k in ("天数", "账龄", "周转")):
@@ -173,7 +174,8 @@ def _infer_number_format(col_name: str) -> Optional[str]:
         return _MONEY_FMT
     if any(k in name for k in (
         "金额", "额", "收入", "成本", "利润", "营收", "回款", "应收", "应付", "余额",
-        "预算", "实际", "(元)", "（元）", "工资", "薪酬", "薪资", "提成", "奖金", "单价", "总价",
+        "预算", "实际", "增长", "增减", "差额", "净增", "净额",   # 同比/环比增长额等
+        "(元)", "（元）", "工资", "薪酬", "薪资", "提成", "奖金", "单价", "总价",
     )):
         return _MONEY_FMT
     # 计数 / 人数 / 排名(整数)
@@ -185,15 +187,18 @@ def _infer_number_format(col_name: str) -> Optional[str]:
 
 
 # 语义档位 → (背景色, 字体色)。覆盖销售/财务/库存/HR/客户各场景的常见标签。
-_TIER_GOOD = ("C6EFCE", "006100")   # 绿:达成 / 正常 / 优 / 健康 / 活跃 / A / 节约 / 盈利
+_TIER_BEST = ("00B050", "FFFFFF")   # 深绿:头档(优/优秀)—— 与"良"的浅绿区分,四档不塌成三色
+_TIER_GOOD = ("C6EFCE", "006100")   # 绿:达成 / 正常 / 良 / 健康 / 活跃 / A / 节约 / 盈利
 _TIER_WARN = ("FFEB9C", "9C5700")   # 黄:预警 / 关注 / 中 / B / 临期 / 潜力
 _TIER_BAD  = ("FFC7CE", "9C0006")   # 红:未达成 / 异常 / 超支 / 逾期 / 呆滞 / 流失 / C / 亏损
 _TIER_INFO = ("DDEBF7", "1F4E78")   # 蓝:预测 / 新增 / 重点(中性强调)
 
 _TIER_MAP = {
+    # —— 深绿(头档)——
+    "优": _TIER_BEST, "优秀": _TIER_BEST,
     # —— 绿(好)——
     "达成": _TIER_GOOD, "已达成": _TIER_GOOD, "完成": _TIER_GOOD, "正常": _TIER_GOOD,
-    "优": _TIER_GOOD, "优秀": _TIER_GOOD, "健康": _TIER_GOOD, "活跃": _TIER_GOOD,
+    "健康": _TIER_GOOD, "活跃": _TIER_GOOD,
     "盈利": _TIER_GOOD, "节约": _TIER_GOOD, "favorable": _TIER_GOOD, "a": _TIER_GOOD,
     "a类": _TIER_GOOD, "a档": _TIER_GOOD, "重要价值": _TIER_GOOD, "高价值": _TIER_GOOD,
     "高": _TIER_GOOD, "充足": _TIER_GOOD, "良": _TIER_GOOD,
@@ -257,7 +262,7 @@ def _tier_fill(value):
 
 def _flip_tier(pal):
     """好↔差翻转;中性/关注档(黄/蓝)否定后语义模糊 → 不上色。"""
-    if pal == _TIER_GOOD:
+    if pal in (_TIER_GOOD, _TIER_BEST):
         return _TIER_BAD
     if pal == _TIER_BAD:
         return _TIER_GOOD
@@ -272,8 +277,19 @@ def _disp_width(s) -> float:
     return w
 
 
+# CSV/公式注入前缀:Excel 把以这些字符开头的字符串当公式执行(DDE/HYPERLINK 钓鱼/数据外带)
+_INJECTION_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _defuse_formula(s: str) -> str:
+    """身份列文本若以危险字符开头,前置单引号,让 Excel 当纯文本而非公式。"""
+    if s and s[0] in _INJECTION_PREFIXES:
+        return "'" + s
+    return s
+
+
 def _clean_val(v):
-    """numpy 标量 → python;NaN/NaT → None(避免 Excel 里出现 'nan')。"""
+    """numpy 标量 → python;NaN/NaT → None(避免 Excel 里出现 'nan');字符串防公式注入。"""
     try:
         import pandas as pd
         if v is None:
@@ -282,6 +298,8 @@ def _clean_val(v):
             return None
     except Exception:
         pass
+    if isinstance(v, str):
+        return _defuse_formula(v)      # 解密后的身份列文本可能夹带 =cmd|... 之类注入载荷
     if hasattr(v, "item") and not isinstance(v, (str, bytes)):
         try:
             return v.item()
@@ -465,14 +483,26 @@ def _render_sheet(ws, df, r: dict) -> None:
     for ci, h in enumerate(headers, 1):
         nf = _infer_number_format(h)
         if nf == "0.00%":
-            # 百分比口径体检:列名像"率"但值域普遍 >1.5,说明数据存的是百分数(12=12%)
-            # 而不是小数(0.12)。套 0.00% 会显示成 1200% —— 改用字面 % 格式,数值不乘 100。
+            # 百分比口径体检:列名像"率"但数据存成整数百分数(85 表示 85%)而非小数(0.85)。
+            # 判据要**保守**:超额完成率(1.6=160%)是合法小数,不能误判成整数百分数缩小 100 倍。
+            # 只有当中位数明显大(>5)且几乎无小于 1.5 的值(整数百分数列不会有 0.x)时才认定。
             try:
                 import pandas as pd
                 v = pd.to_numeric(df[h], errors="coerce").abs()
                 v = v[v.notna()]
-                if len(v) and float(v.median()) > 1.5:
+                if len(v) >= 2 and float(v.median()) > 5 and float((v > 1.5).mean()) >= 0.9:
                     nf = '0.00"%"'
+            except Exception:
+                pass
+        # 列名推断不出格式,但该列是**大数值**列(如账龄桶金额、透视里以产品线命名的金额列)
+        # → 兜底给千分位,避免 1234567890 显示成科学计数 1.23E+09
+        if nf is None:
+            try:
+                import pandas as pd
+                s = pd.to_numeric(df[h], errors="coerce")
+                s = s[s.notna()]
+                if len(s) and float(s.abs().max()) >= 10000:
+                    nf = _MONEY_FMT if (s != s.round()).any() else "#,##0"
             except Exception:
                 pass
         if nf:
@@ -524,12 +554,19 @@ def _render_sheet(ws, df, r: dict) -> None:
             pass
         ws.column_dimensions[get_column_letter(ci)].width = min(max(w + 2.5, 10), 40)
 
-    # 冻结表头(+ 宽表冻结身份首列:列多且首列是文本身份列时,横向滚动仍见行标识)
+    # 冻结表头(+ 宽表冻结身份首列:列多时,横向滚动仍见行标识)
+    # 身份列判定:非数值列,或列名像身份(编号/工号/ID/姓名/物料/客户…)—— 后者覆盖
+    # "员工编号被读成 int" 这类数值型身份列(否则会随滚动移出视野)
     freeze_col = 1
     try:
         import pandas as pd
-        if n_cols > 6 and len(df.columns) and not pd.api.types.is_numeric_dtype(df.iloc[:, 0]):
-            freeze_col = 2
+        if n_cols > 6 and len(df.columns):
+            first = str(df.columns[0])
+            id_name = any(k in first for k in (
+                "编号", "工号", "编码", "代码", "ID", "id", "姓名", "名称", "物料",
+                "客户", "代表", "产品", "员工", "SKU", "单号", "订单号"))
+            if id_name or not pd.api.types.is_numeric_dtype(df.iloc[:, 0]):
+                freeze_col = 2
     except Exception:
         pass
     ws.freeze_panes = ws.cell(data0, freeze_col).coordinate
@@ -730,7 +767,7 @@ def export_cipher_as_is(
         cell.alignment = Alignment(horizontal="center", vertical="center")
     for ri, row in enumerate(cipher_df.itertuples(index=False), 2):
         for ci, val in enumerate(row, 1):
-            ws.cell(ri, ci, val)
+            ws.cell(ri, ci, _defuse_formula(val) if isinstance(val, str) else val)
     for ci, h in enumerate(headers, 1):
         ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
     ws.freeze_panes = "A2"
@@ -838,7 +875,8 @@ def export_skill_results_encrypted(
             cell.alignment = center
         for ri, row in enumerate(enc_df.itertuples(index=False), header_row + 1):
             for ci, val in enumerate(row, 1):
-                ws.cell(ri, ci, val if val is not None else "")
+                cv = _defuse_formula(val) if isinstance(val, str) else val
+                ws.cell(ri, ci, cv if cv is not None else "")
         for ci, h in enumerate(headers, 1):
             ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
         ws.freeze_panes = f"A{header_row + 1}"
@@ -1267,11 +1305,14 @@ def _make_chart(ws, typ: str, x_idx: int, y_idxs: list, headers: list,
         except Exception:
             pass
     if typ == "pie":
+        # 饼图无 x/y 轴:单独设图例底部 + 百分比标签,不进下面的轴配置块(否则 AttributeError)
         try:
             from openpyxl.chart.label import DataLabelList
             chart.dataLabels = DataLabelList(showPercent=True)   # 占比直接标在饼上
+            chart.legend.position = "b"
         except Exception:
             pass
+        return chart
 
     try:
         chart.x_axis.title = headers[x_idx - 1]

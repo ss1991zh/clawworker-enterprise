@@ -52,8 +52,25 @@ ShouldCancel = Callable[[], bool]
 _usage_tls = threading.local()
 
 
+# 单次分析(一个 ask())允许的 LLM 调用总数硬上限 —— 防各层重试叠加打爆
+_MAX_LLM_CALLS_PER_ASK = 12
+
+
+class LLMCallBudgetExceeded(Exception):
+    """单次分析的 LLM 调用数超过硬上限(疑似重试回环失控)。"""
+
+
 def _usage_reset() -> None:
     _usage_tls.total = 0
+    _usage_tls.calls = 0
+
+
+def _usage_bump_call() -> None:
+    n = int(getattr(_usage_tls, "calls", 0) or 0) + 1
+    _usage_tls.calls = n
+    if n > _MAX_LLM_CALLS_PER_ASK:
+        raise LLMCallBudgetExceeded(
+            f"本次分析已调用 LLM {n} 次,超过上限 {_MAX_LLM_CALLS_PER_ASK} 次(疑似重试失控),已中止")
 
 
 def _usage_add(u: Any) -> None:
@@ -90,14 +107,16 @@ def _post_cancellable(
     用户点停止 → 不等 LLM 返回直接抛 CancelledError,孤儿线程会自己结束被回收。
     """
     chk = should_cancel or (lambda: False)
+    _usage_bump_call()   # 全局调用计数 + 硬上限,防重试回环失控(超限抛 LLMCallBudgetExceeded)
     box: dict = {}
 
     def worker():
         try:
             box["resp"] = httpx.post(
                 url, headers=headers, json=json_body,
-                # 整体允许 timeout 秒,但 read/write/pool 都不主动断 —— 长任务靠 cancel
-                timeout=httpx.Timeout(timeout, connect=10.0, read=None, write=None, pool=None),
+                # 整体 + 读都设有限上限(read=timeout):host 发头后静默 stall 不再无限等,
+                # 最长 timeout 秒后抛出;用户点停止可更早中断。
+                timeout=httpx.Timeout(timeout, connect=10.0, read=timeout, write=timeout, pool=timeout),
                 trust_env=False,   # 局域网连主机不走系统代理(Clash 等会劫持返回空 502)
             )
         except Exception as e:
@@ -1280,7 +1299,9 @@ def _run_codegen_path(
                 "excel_path": "", "skill_calls": ["codegen"]}
 
     # 6c) 产出下载文件(decrypt=明文+密文两个;keep_encrypted=密文+可事后解密)
-    fr = scan_summary(summary_raw)
+    # 零明文过滤带上身份列取值黑名单 —— 遮蔽 summary 里可能出现的姓名/客户名等文本 PII
+    fr = scan_summary(summary_raw,
+                      extra_blocklist=_collect_identity_values(metadata_rows, metadata_columns))
     clean = summary_raw if fr.clean else "已生成分析,详见 Excel(summary 命中明文规则已隐去)。"
     log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
     return _build_done_files(decision, results, cipher_path, excel_stem, ["codegen"], clean, log)
@@ -1289,7 +1310,12 @@ def _run_codegen_path(
 def ask(**kwargs) -> dict:
     """外层入口:重置本次 token 累计,跑完后把总用量注入 result["tokens"]。"""
     _usage_reset()
-    result = _ask_impl(**kwargs)
+    try:
+        result = _ask_impl(**kwargs)
+    except LLMCallBudgetExceeded as e:
+        result = {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
+                  "error": (f"{e}。这通常是问题过于复杂反复重生成所致 —— "
+                            "请把问题拆小、明确要什么指标后重试。")}
     if isinstance(result, dict):
         result.setdefault("tokens", _usage_total())
     return result
@@ -1597,7 +1623,9 @@ def _ask_impl(
         return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止", "excel_path": "", "skill_calls": [r["skill"] for r in results]}
 
     # 6) 产出下载文件(decrypt=明文+密文两个;keep_encrypted=密文+可事后解密)· summary 零明文过滤
-    fr = scan_summary(summary_raw)
+    # 带上身份列取值黑名单,遮蔽姓名/客户名等无模式文本 PII
+    fr = scan_summary(summary_raw,
+                      extra_blocklist=_collect_identity_values(metadata_rows, metadata_columns))
     clean = summary_raw if fr.clean else "已生成多 sheet 分析,详见 Excel(模型 summary 命中明文规则,已隐去)。"
     log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
     return _build_done_files(decision, results, cipher_path, excel_stem,

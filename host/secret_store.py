@@ -34,13 +34,46 @@ def _blob_bytes(blob: "_DATA_BLOB") -> bytes:
     return out
 
 
-def _dpapi(data: bytes, encrypt: bool) -> bytes:
+# 应用级 entropy:绑定到本应用 + 本次安装 —— 同用户下的通用木马即便调 DPAPI
+# 也解不开(它不知道这份 entropy)。= 固定 app 常量 + 每安装随机密钥(ACL 保护的边文件)。
+_APP_ENTROPY_CONST = b"clawworker-enterprise/llm-key/v1"
+_ENTROPY_FILE = os.path.join(os.path.expanduser("~"), ".agent-system",
+                             "host-config", ".secret_entropy")
+_entropy_cache: bytes | None = None
+
+
+def _entropy() -> bytes:
+    global _entropy_cache
+    if _entropy_cache is not None:
+        return _entropy_cache
+    secret = b""
+    try:
+        if os.path.exists(_ENTROPY_FILE):
+            with open(_ENTROPY_FILE, "rb") as f:
+                secret = f.read()
+        if len(secret) < 16:
+            os.makedirs(os.path.dirname(_ENTROPY_FILE), exist_ok=True)
+            secret = os.urandom(32)
+            with open(_ENTROPY_FILE, "wb") as f:
+                f.write(secret)
+            harden_file(_ENTROPY_FILE)     # 边密钥文件收紧 ACL 到仅属主
+    except Exception:  # noqa: BLE001 —— 拿不到 install 密钥则仅用 app 常量(仍强于无 entropy)
+        secret = b""
+    _entropy_cache = _APP_ENTROPY_CONST + secret
+    return _entropy_cache
+
+
+def _dpapi(data: bytes, encrypt: bool, use_entropy: bool = True) -> bytes:
     fn = (ctypes.windll.crypt32.CryptProtectData if encrypt
           else ctypes.windll.crypt32.CryptUnprotectData)
     inp = _blob(data)
+    ent_ptr = None
+    if use_entropy:
+        ent = _blob(_entropy())      # pOptionalEntropy:加解密必须一致
+        ent_ptr = ctypes.byref(ent)
     out = _DATA_BLOB()
     # flags=1 → CRYPTPROTECT_UI_FORBIDDEN(不弹 UI,适合服务/后台)
-    ok = fn(ctypes.byref(inp), None, None, None, None, 1, ctypes.byref(out))
+    ok = fn(ctypes.byref(inp), None, ent_ptr, None, None, 1, ctypes.byref(out))
     if not ok:
         raise OSError("DPAPI 调用失败")
     return _blob_bytes(out)
@@ -61,10 +94,17 @@ def unprotect(stored: str) -> str:
     """解密 protect() 产出的值;非本方案前缀的值原样返回(兼容历史明文)。"""
     if not stored or not stored.startswith(_PREFIX):
         return stored
+    raw = None
     try:
         raw = base64.b64decode(stored[len(_PREFIX):])
-        return _dpapi(raw, encrypt=False).decode("utf-8")
+        return _dpapi(raw, encrypt=False, use_entropy=True).decode("utf-8")
     except Exception:  # noqa: BLE001
+        # 兼容:本改动之前的密文是**无 entropy** 加密的,回退再试一次
+        if raw is not None:
+            try:
+                return _dpapi(raw, encrypt=False, use_entropy=False).decode("utf-8")
+            except Exception:  # noqa: BLE001
+                pass
         return stored
 
 
