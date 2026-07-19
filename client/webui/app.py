@@ -189,6 +189,26 @@ def _is_logged_in() -> bool:
     return bool(_session_state.get("token") and _session_state.get("username"))
 
 
+def _session_fresh() -> bool:
+    """会话是否仍在主机核验有效期内(session expires_at 未过)。
+
+    解密是把密文还原成明文的敏感动作。客户端本地持有 sk,解密纯本地发生 ——
+    主机无法实时阻止离线解密。用会话 TTL 作「短 TTL 强制回主机」的吊销闭环:
+    过期会话必须先回主机重新登录,主机在登录时应用吊销/禁用(见 host user_manager.login),
+    从而把「离线可无限解密」的窗口收敛到会话 TTL(默认 8h)。见 docs/revocation-model.md。
+    """
+    exp = _session_state.get("expires_at")
+    if not exp:
+        return False
+    try:
+        from datetime import datetime
+        dt = datetime.fromisoformat(str(exp))
+    except (ValueError, TypeError):
+        return False
+    now = datetime.now(dt.tzinfo) if dt.tzinfo else datetime.now()
+    return now <= dt
+
+
 def _validate_host_url(raw: str) -> str:
     """
     规范化并校验主机地址。主机是企业内网/本机的控制面 —— 只允许连**私网/回环**地址,
@@ -231,6 +251,15 @@ def _validate_host_url(raw: str) -> str:
 
 def _need_login() -> JSONResponse:
     return JSONResponse({"error": "not_logged_in"}, status_code=401)
+
+
+def _need_revalidate() -> JSONResponse:
+    """会话超过有效期,解密前须回主机重新登录核验(吊销闭环)。"""
+    return JSONResponse(
+        {"error": "session_stale",
+         "detail": "会话已超过有效期,为核验授权未被吊销,请重新登录后再解密。"},
+        status_code=401,
+    )
 
 
 def _clear_local_session() -> None:
@@ -1549,6 +1578,10 @@ async def api_decrypt_decision(sid: str, mid: str, request: Request):
     choice = (data.get("choice") or "").strip()
     if choice not in ("decrypt", "keep_encrypted", "cancel"):
         raise HTTPException(400, "choice 必须是 decrypt / keep_encrypted / cancel")
+    # 吊销闭环:真正产出明文的「解密」选择须会话新鲜;过期先回主机重登(应用吊销)。
+    # keep_encrypted / cancel 不产出明文,放行。
+    if choice == "decrypt" and not _session_fresh():
+        return _need_revalidate()
     with _decrypt_lock:
         _decrypt_decisions[mid] = choice
         evt = _decrypt_events.get(mid)
@@ -1571,6 +1604,9 @@ def api_decrypt_file(sid: str, mid: str):
         return {"ok": True, "excel_path": msg.excel_path, "excel_name": msg.excel_name}
     if not (msg.can_decrypt and msg.dec_run_id):
         raise HTTPException(400, "该结果不支持事后解密(无加密暂存)")
+    # 吊销闭环:事后解密同样须会话新鲜,过期先回主机重登核验(见 _session_fresh)
+    if not _session_fresh():
+        return _need_revalidate()
     try:
         from client.webui import sched_results
         dec_path = sched_results.decrypt_persisted_run_to_excel(msg.dec_run_id, msg.dec_stem or "analysis")
@@ -2428,6 +2464,9 @@ def api_task_decrypt(task_id: str):
     """批量解密一个密态任务累积的所有加密结果 → 落到一个文件夹。"""
     if not _is_logged_in():
         return _need_login()
+    # 吊销闭环:批量解密同样须会话新鲜,过期先回主机重登核验(见 _session_fresh)
+    if not _session_fresh():
+        return _need_revalidate()
     u = _session_state["username"]
     items = _enc_results.pending_for_task(task_id)
     items = [r for r in items if r.username == u]
