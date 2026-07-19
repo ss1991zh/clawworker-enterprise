@@ -18,6 +18,10 @@ from typing import Literal, Optional
 
 Backend = Literal["stub", "real"]
 
+
+class AuthorizationInitError(RuntimeError):
+    """授权文件在位但 SDK initDict 失败 —— 多半授权已过期/被吊销/损坏(区别于文件缺失)。"""
+
 # 默认密钥/字典/授权文件解析(跨平台)。优先级:
 #   环境变量(AGENT_SK_PATH / AGENT_DICT_DIR / AGENT_USER_AUTH)
 #   > 已安装 HE 包内自带文件 <pkg>/file/...(随包走,Windows/Linux/Mac 通用)
@@ -289,8 +293,14 @@ class Runtime:
 
         # initDict 时原生库会向 stdout 打印授权信息("Serial number … N days left to expiration"),
         # 仅首次打印 → fd 级捕获并解析,供 license 到期预警。捕获失败绝不影响初始化。
-        captured = _init_with_fd_capture(
-            lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
+        # 文件都在位但 initDict 仍失败 → 多半是授权**已过期/被吊销/损坏**,抛专用异常,
+        # 供上层上报主机(闭合"过期→自动 disable"链路),区别于"文件缺失"的未配置态。
+        try:
+            captured = _init_with_fd_capture(
+                lambda: hp.initDict(dictFilePath=dict_path, userFilePath=user_auth))
+        except Exception as e:  # noqa: BLE001
+            raise AuthorizationInitError(
+                f"授权初始化失败(可能已过期或被吊销):{type(e).__name__}: {e}") from e
         self._license = _parse_license(captured)
         self._dict_initialized = True
 

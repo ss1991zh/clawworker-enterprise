@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -48,7 +48,9 @@ provider_manager = ProviderManager(llm_config_store)
 call_stats = CallStatStore()
 
 from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
+from host.login_throttle import LoginThrottle
 admin_auth = AdminAuth()
+_login_throttle = LoginThrottle()   # 用户登录 + admin 登录共用
 
 
 def _bootstrap_legacy_env_config() -> None:
@@ -108,6 +110,7 @@ app.include_router(
         provider_manager=provider_manager,
         call_stats=call_stats,
         admin_auth=admin_auth,
+        login_throttle=_login_throttle,
     )
 )
 
@@ -163,12 +166,33 @@ class LoginRequest(BaseModel):
 
 
 @app.post("/auth/login")
-def login(req: LoginRequest):
+def login(req: LoginRequest, request: Request):
+    # 限速:按 用户名 + 来源IP 双 key,防在线爆破
+    ip = request.client.host if request.client else "?"
+    keys = [f"u:{req.username}", f"ip:{ip}"]
+    wait = max(_login_throttle.check(k) for k in keys)
+    if wait > 0:
+        raise HTTPException(429, f"登录尝试过于频繁,请 {int(wait) + 1} 秒后再试")
     try:
         sess = user_manager.login(username=req.username, password=req.password)
     except PermissionError as e:
+        for k in keys:
+            _login_throttle.record_failure(k)
         raise HTTPException(401, str(e))
+    for k in keys:
+        _login_throttle.record_success(k)
     return {"token": sess.token, "expires_at": sess.expires_at.isoformat()}
+
+
+@app.post("/client/report-init-failed")
+def report_init_failed(sess=Depends(get_current_session)):
+    """
+    客户端 SDK initDict 失败(授权过期/被吊销/损坏)时上报。
+    主机标记该用户授权失效 → 后续登录/取证书被拒,并在 admin 状态可见。
+    闭合"过期 → 客户端 init 失败 → 上报 → 自动 disable"链路。
+    """
+    auth_manager.report_init_failed(sess.username)
+    return {"ok": True, "username": sess.username}
 
 
 @app.get("/auth/user_authorization")

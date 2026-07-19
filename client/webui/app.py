@@ -661,23 +661,27 @@ def _smart_read(path: Path, suffix: str):
                     if s >= 2 and s > best_n:
                         best, best_n = i, s
                 df = pd.read_csv(path, skiprows=best)
-                return df, "csv", best
-            return df, "csv", 0
+                return df, "csv", best, []
+            return df, "csv", 0, []
         except Exception:
             raise
 
-    # xlsx
+    # xlsx —— 多 sheet 工作簿只取"数据最丰满"的一张;其余有数据的 sheet 名单一并返回,
+    # 由上层提示用户(避免"传了多表却只加密了一张"的静默数据丢失)
     all_sheets = pd.read_excel(path, sheet_name=None)
     best_name, best_score = None, -1
+    nonempty = []
     for n, sh in all_sheets.items():
         if sh is None or sh.empty:
             continue
+        nonempty.append(str(n))
         score = sh.shape[0] * (sh.select_dtypes(include="number").shape[1] + 1) + sh.shape[1]
         if score > best_score:
             best_name, best_score = n, score
     if best_name is None:
         first = next(iter(all_sheets))
-        return all_sheets[first], str(first), 0
+        return all_sheets[first], str(first), 0, []
+    dropped = [n for n in nonempty if n != str(best_name)]
     df = all_sheets[best_name]
     header_row = 0
     if _is_bad(df):
@@ -690,7 +694,7 @@ def _smart_read(path: Path, suffix: str):
                 break
         if header_row > 0:
             df = pd.read_excel(path, sheet_name=best_name, header=header_row)
-    return df, str(best_name), header_row
+    return df, str(best_name), header_row, dropped
 
 
 def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Optional[str] = None) -> dict:
@@ -712,7 +716,7 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         raise ValueError(f"暂不支持的格式:{raw_suffix} · 仅 CSV / XLSX")
 
     try:
-        df, sheet_name, header_row = _smart_read(src_path, raw_suffix)
+        df, sheet_name, header_row, dropped_sheets = _smart_read(src_path, raw_suffix)
     except Exception as e:
         raise ValueError(f"无法解析文件:{type(e).__name__}: {e}")
     if df.empty or df.shape[1] == 0:
@@ -801,6 +805,15 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
     schema_dst = dst.with_suffix(dst.suffix + ".schema.json")
     schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    # 多 sheet 工作簿只加密了 sheet_name 这一张 —— 显式告知用户其余表未入库,避免静默丢数据
+    multi_sheet_warning = ""
+    if dropped_sheets:
+        shown = "、".join(dropped_sheets[:5]) + ("…" if len(dropped_sheets) > 5 else "")
+        multi_sheet_warning = (
+            f"⚠ 该文件有多个工作表,本次只加密了数据最全的「{sheet_name}」。"
+            f"未入库的表:{shown}。如需分析这些表,请分别上传或拆成单表文件。"
+        )
+
     return {
         "name": dst.name, "path": str(dst),
         "size_kb": round(dst.stat().st_size / 1024, 1) if dst.exists() else 0,
@@ -813,6 +826,8 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         "nan_filled": nan_counts,
         "data_health": data_health,
         "formula_filled": formula_filled,
+        "dropped_sheets": dropped_sheets,
+        "multi_sheet_warning": multi_sheet_warning,
     }
 
 

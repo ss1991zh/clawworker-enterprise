@@ -30,6 +30,57 @@ DEFAULT_KEYSTORE_DIR = Path.home() / ".agent-system" / "keystore"
 VAULT_SUBDIR = "vault"   # 每用户子目录:keystore/<username>/vault/
 
 
+def _harden_acl(path: Path) -> bool:
+    """
+    收紧文件/目录权限,让同机其他本地用户无法读取密钥。
+    - 非 Windows:os.chmod 0700/0600(POSIX 权限位真实生效)。
+    - Windows:os.chmod 只改只读位、**不设 NTFS ACL**,故改用 icacls
+      去继承 + 只授当前用户 —— 否则 sk.bin 对同机其他账户可读。
+    返回 True 表示已应用了有效的属主独占权限。
+    """
+    import subprocess
+    try:
+        if os.name != "nt":
+            os.chmod(path, stat.S_IRWXU if path.is_dir() else (stat.S_IRUSR | stat.S_IWUSR))
+            return True
+        # Windows:去除继承的 ACE,只保留当前用户完全控制
+        user = os.environ.get("USERNAME") or ""
+        domain = os.environ.get("USERDOMAIN") or ""
+        principal = f"{domain}\\{user}" if domain and user else (user or "")
+        if not principal:
+            return False
+        r = subprocess.run(
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:(OI)(CI)F"]
+            if path.is_dir() else
+            ["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:F"],
+            capture_output=True, text=True, timeout=15,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return r.returncode == 0
+    except Exception:  # noqa: BLE001 —— 加固失败不阻断功能,但由 sandbox_audit 如实上报
+        return False
+
+
+def _path_owner_only(path: Path) -> bool:
+    """该路径是否只有属主可访问(POSIX 看权限位;Windows 看 NTFS ACL)。"""
+    import subprocess
+    try:
+        if os.name != "nt":
+            mode = stat.S_IMODE(path.stat().st_mode)
+            return mode & 0o077 == 0            # 组/其他无任何权限
+        r = subprocess.run(["icacls", str(path)], capture_output=True, text=True,
+                           timeout=15, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            return False
+        import re as _re
+        # 只看真正的 ACE 授权(主体名紧跟 ":(权限)"),避免把路径里的 C:\Users\ 误当授权。
+        # 授权给下列宽泛主体即视为未独占(覆盖中英文系统组名)。
+        broad = r"(Everyone|Authenticated Users|BUILTIN\\Users|\bUsers|所有人|Todos)"
+        return not _re.search(broad + r"\s*:\s*\(", r.stdout)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @dataclass
 class KeyPaths:
     sk_path: Path
@@ -50,17 +101,17 @@ class Keystore:
     def __init__(self, root: Optional[Path] = None):
         self._root = root or DEFAULT_KEYSTORE_DIR
         self._root.mkdir(parents=True, exist_ok=True)
-        os.chmod(self._root, stat.S_IRWXU)
+        _harden_acl(self._root)
 
     # ----- 沙盒辅助 -----
     def _vault_dir(self, username: str) -> Path:
         """返回 keystore/<username>/vault/,自动 0700。"""
         user_dir = self._root / username
         user_dir.mkdir(parents=True, exist_ok=True)
-        os.chmod(user_dir, stat.S_IRWXU)
+        _harden_acl(user_dir)
         vault = user_dir / VAULT_SUBDIR
         vault.mkdir(parents=True, exist_ok=True)
-        os.chmod(vault, stat.S_IRWXU)
+        _harden_acl(vault)
         # 兼容迁移:老版本把密钥直接放 user_dir,新版本搬进 vault/
         for legacy_name in ("sk.bin", "evk.bin", "user_authorization"):
             legacy = user_dir / legacy_name
@@ -68,7 +119,7 @@ class Keystore:
             if legacy.exists() and not new.exists():
                 try:
                     legacy.replace(new)
-                    os.chmod(new, stat.S_IRUSR | stat.S_IWUSR)
+                    _harden_acl(new)
                 except Exception:
                     pass
         return vault
@@ -78,9 +129,9 @@ class Keystore:
         # 先写临时再 rename,避免半成品被读到
         tmp = dst.with_suffix(dst.suffix + ".tmp")
         tmp.write_bytes(data)
-        os.chmod(tmp, stat.S_IRUSR | stat.S_IWUSR)
+        _harden_acl(tmp)
         tmp.replace(dst)
-        os.chmod(dst, stat.S_IRUSR | stat.S_IWUSR)
+        _harden_acl(dst)
 
     def _resolve_in_sandbox(self, p: Path) -> Path:
         """解析后必须落在 self._root 内,否则视为攻击。"""
@@ -159,31 +210,32 @@ class Keystore:
         return self._vault_dir(username)
 
     def sandbox_audit(self, username: str) -> dict:
-        """返回当前沙盒的健康检查报告(供 UI 展示)。"""
+        """
+        返回当前沙盒的健康检查报告(供 UI 展示)。
+        跨平台如实判定属主独占:POSIX 看权限位 == 0o700/0o600;Windows 看 NTFS ACL
+        (icacls 输出里不得授权给 Users/Everyone/Authenticated Users)——
+        不再用无意义的 POSIX 位在 Windows 上给出虚假合规结论。
+        """
         vault = self._vault_dir(username)
-        root_mode = stat.S_IMODE(self._root.stat().st_mode)
-        vault_mode = stat.S_IMODE(vault.stat().st_mode)
+        root_ok = _path_owner_only(self._root)
+        vault_ok = _path_owner_only(vault)
         files = {}
+        files_ok = True
         for name in ("sk.bin", "evk.bin", "user_authorization"):
             p = vault / name
             if p.exists():
-                files[name] = {
-                    "present": True,
-                    "mode": oct(stat.S_IMODE(p.stat().st_mode)),
-                    "size_bytes": p.stat().st_size,
-                }
+                locked = _path_owner_only(p)
+                files_ok = files_ok and locked
+                files[name] = {"present": True, "owner_only": locked,
+                               "size_bytes": p.stat().st_size}
             else:
                 files[name] = {"present": False}
         return {
             "root": str(self._root),
             "vault": str(vault),
-            "root_mode": oct(root_mode),     # 期望 0o700
-            "vault_mode": oct(vault_mode),
-            "root_ok": root_mode == 0o700,
-            "vault_ok": vault_mode == 0o700,
-            "files_ok": all(
-                (not v["present"]) or v["mode"] == "0o600"
-                for v in files.values()
-            ),
+            "platform": os.name,
+            "root_ok": root_ok,
+            "vault_ok": vault_ok,
+            "files_ok": files_ok,
             "files": files,
         }

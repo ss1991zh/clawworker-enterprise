@@ -99,6 +99,11 @@ class AdminAuth:
         self._d["initialized"] = bool(value)
         self._save()
 
+    def is_default_password(self) -> bool:
+        """是否仍在使用出厂默认口令 123456 —— 用于在 UI 上提示强制改密。"""
+        salt = self._d.get("password_salt", "")
+        return bool(salt) and self._d.get("password_hash") == _hash_password("123456", salt)
+
     def verify_login(self, username: str, password: str) -> bool:
         if (username or "").strip() != self.username:
             return False

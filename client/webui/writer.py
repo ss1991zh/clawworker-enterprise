@@ -197,25 +197,50 @@ _TIER_MAP = {
 _TIER_COL_HINTS = ("类型", "档位", "等级", "分类", "分群", "状态", "评级", "是否", "标签", "情况", "abc")
 
 
+# 否定前缀:出现在档位词之前会翻转语义("不活跃"=差、"未流失"=好)
+_TIER_NEGATIONS = ("不", "未", "非", "无", "没")
+
+
 def _tier_fill(value):
-    """档位文字 → (PatternFill, Font) 或 None。"""
+    """
+    档位文字 → (PatternFill, Font) 或 None。
+    两个防误染:
+      ① 否定词感知:匹配到的档位词前若紧跟 不/未/非/无/没,好↔差**翻转**
+         (否则"不活跃"含"活跃"被染绿、"未流失"含"流失"被染红,与真实语义相反);
+      ② 单字键(高/中/低/优/良/差/a/b/c)只做**精确**匹配,不参与模糊包含
+         (否则"华中"含"中"、"Stable"含"a" 被乱染)。
+    """
     from openpyxl.styles import Font, PatternFill
     if value is None:
         return None
     key = str(value).strip().lower()
     if not key:
         return None
-    pal = _TIER_MAP.get(key)
+    pal = _TIER_MAP.get(key)   # 精确匹配(单字键也在此命中,如整格就是"高")
     if pal is None:
-        # 模糊包含匹配(如"达成率高"含"高"、"A类客户"含"a类")
+        # 模糊包含:仅多字键参与;命中后按前缀否定翻转
         for k, p in _TIER_MAP.items():
-            if p is not None and k in key:
-                pal = p
-                break
+            if p is None or len(k) <= 1:
+                continue
+            idx = key.find(k)
+            if idx < 0:
+                continue
+            negated = idx > 0 and key[idx - 1] in _TIER_NEGATIONS
+            pal = _flip_tier(p) if negated else p
+            break
     if not pal:
         return None
     bg, fg = pal
     return PatternFill("solid", fgColor=bg), Font(color=fg, bold=True)
+
+
+def _flip_tier(pal):
+    """好↔差翻转;中性/关注档(黄/蓝)否定后语义模糊 → 不上色。"""
+    if pal == _TIER_GOOD:
+        return _TIER_BAD
+    if pal == _TIER_BAD:
+        return _TIER_GOOD
+    return None
 
 
 def _disp_width(s) -> float:

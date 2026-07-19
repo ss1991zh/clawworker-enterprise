@@ -78,6 +78,7 @@ def build_admin_router(
     provider_manager: ProviderManager,
     call_stats: CallStatStore,
     admin_auth=None,
+    login_throttle=None,
 ) -> APIRouter:
     """构造 admin 路由 router。"""
     router = APIRouter(prefix="/admin", tags=["admin"])
@@ -92,15 +93,30 @@ def build_admin_router(
         # 已登录直接进首页
         if admin_auth and admin_auth.valid(request.cookies.get(ADMIN_COOKIE)):
             return RedirectResponse("/admin/", status_code=303)
+        msgs = _pop_messages(request)
+        if admin_auth and admin_auth.is_default_password():
+            msgs = list(msgs) + [("warn", "当前仍在使用默认口令 admin/123456,登录后请立即到「账户」修改!")]
         return templates.TemplateResponse(
             request, "admin_login.html",
-            {"messages": _pop_messages(request), "username": admin_auth.username if admin_auth else "admin"},
+            {"messages": msgs, "username": admin_auth.username if admin_auth else "admin"},
         )
 
     @router.post("/login")
     def admin_login(request: Request, username: str = Form(...), password: str = Form(...)):
+        # 限速:按来源IP,防在线爆破 admin 口令
+        ip = request.client.host if request.client else "?"
+        tkey = f"admin:{ip}"
+        if login_throttle:
+            wait = login_throttle.check(tkey)
+            if wait > 0:
+                return _flash_redirect("/admin/login",
+                                       ("error", f"尝试过于频繁,请 {int(wait) + 1} 秒后再试"))
         if not admin_auth or not admin_auth.verify_login(username, password):
+            if login_throttle:
+                login_throttle.record_failure(tkey)
             return _flash_redirect("/admin/login", ("error", "用户名或密码错误"))
+        if login_throttle:
+            login_throttle.record_success(tkey)
         token = admin_auth.login()
         resp = RedirectResponse("/admin/", status_code=303)
         resp.set_cookie(ADMIN_COOKIE, token, max_age=SESSION_TTL,

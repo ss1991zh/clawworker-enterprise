@@ -25,7 +25,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from client import skills_loader
-from client.tools.runtime import Runtime
+from client.tools.runtime import Runtime, AuthorizationInitError
 from client.tools.skills import run_skill, SKILLS
 from client.webui import codegen as codegen_mod
 from client.webui.plan_validator import validate_and_repair_plan
@@ -522,6 +522,18 @@ def call_llm_for_plan(
 # ----------------------------------------------------------------------------
 # 加载密文 → CipherDataFrame
 # ----------------------------------------------------------------------------
+
+def _report_init_failed_to_host(host_url: str, token: str, log) -> None:
+    """把授权初始化失败上报主机(best-effort,失败不影响给用户的报错)。"""
+    try:
+        import httpx
+        httpx.post(f"{host_url}/client/report-init-failed",
+                   headers={"Authorization": f"Bearer {token}"},
+                   timeout=8, trust_env=False)
+        log("think", "已通知主机端:本机授权初始化失败")
+    except Exception:  # noqa: BLE001
+        log("think", "上报主机授权失效未成功(不影响本次报错提示)")
+
 
 def load_cipher_df(cipher_path: Path):
     """ps.read_excel(index_col=0) / ps.read_csv 加载密文文件。"""
@@ -1053,6 +1065,15 @@ def _run_codegen_path(
     log("call", f"加载密文 {cipher_path.name}")
     try:
         cdf = load_cipher_df(cipher_path)
+    except AuthorizationInitError as e:
+        # 授权过期/被吊销 —— 上报主机(闭合自动 disable 链路),并给用户明确指引
+        _report_init_failed_to_host(host_url, token, log)
+        log("error", f"授权失效:{e}")
+        return {
+            "status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
+            "error": ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
+                      "请联系管理员续期/重新签发授权后,到「同态密钥」重新拉取证书。"),
+        }
     except Exception as e:
         log("error", f"密文加载失败:{e} · 回退固化 skill")
         return None
@@ -1483,6 +1504,12 @@ def _ask_impl(
     except CancelledError:
         log("error", "已停止 · 用户取消")
         return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
+    except AuthorizationInitError as e:
+        _report_init_failed_to_host(host_url, token, log)
+        log("error", f"授权失效:{e}")
+        return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
+                "error": ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
+                          "请联系管理员续期后重新拉取证书。")}
     except Exception as e:
         return {"status": "failed", "error": f"密文加载失败: {e}", "summary": summary_raw}
 

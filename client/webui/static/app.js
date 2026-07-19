@@ -2776,9 +2776,11 @@ async function renderFilesModal() {
       const ff = res.formula_filled || [];
       const ffLine = ff.length
         ? `<br><span class="af-s">已按源表公式补算派生列:${esc(ff.join("、"))}</span>` : "";
+      const msWarn = res.multi_sheet_warning
+        ? `<br><span class="af-s" style="color:#b45309">${esc(res.multi_sheet_warning)}</span>` : "";
       $("fileUpStatus").innerHTML =
         `<div class="alert-box success">✓ 已加密入库:<strong>${esc(res.name)}</strong>
-         <br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行${dhLine}${ffLine}</div>`;
+         <br>${enc.length} 列加密 · ${pt.length} 列身份标识 · ${res.row_count || "?"} 行${dhLine}${ffLine}${msWarn}</div>`;
       setHint("点击或拖入 <strong>CSV / XLSX</strong> 数据文件");
       inp.value = "";
       await loadFiles(); renderFilesList();
