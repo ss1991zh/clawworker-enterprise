@@ -63,3 +63,14 @@ def test_ambiguous_direction_rate_not_reverse_colored():
     from client.webui.writer import _AMBIGUOUS_DIRECTION, _REVERSE_METRIC
     # 差异率方向取决于成本/收入,不套逆向色阶(交给档位列),避免把收入超额染红
     assert "差异率" in _AMBIGUOUS_DIRECTION and "差异率" not in _REVERSE_METRIC
+
+
+# ── 优化循环 T0-1b(财务同比环比评审)锁口径:增长额=金额、增长率=% ──
+
+def test_yoy_mom_amount_vs_rate_format():
+    from client.webui.writer import _infer_number_format, _MONEY_FMT
+    # 增长额/差额是绝对金额 → 金额格式(红括号);增长率/率是百分比 → 0.00%
+    for h in ("环比增长额", "同比增长额", "环比增长", "同比增长", "差异额"):
+        assert _infer_number_format(h) == _MONEY_FMT, f"{h} 应为金额格式"
+    for h in ("环比增长率", "同比增长率", "环比率", "同比率", "差异率"):
+        assert _infer_number_format(h) == "0.00%", f"{h} 应为百分比"
