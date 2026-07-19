@@ -713,5 +713,11 @@ def run_generated_code(
                 item[k] = v
         if trunc_note:
             item["note"] = (str(item["note"]) + " " + trunc_note) if item.get("note") else trunc_note
+            # 合计行改标"(前N行)"—— 截断后合计只覆盖前 N 行,不能呈现为全量合计
+            if item.get("total_row"):
+                tr = item["total_row"]
+                label = f"合计(前{_OUTPUT_ROW_LIMIT}行)"
+                item["total_row"] = ({**tr, "label": label} if isinstance(tr, dict)
+                                     else {"label": label})
         cleaned.append(item)
     return cleaned

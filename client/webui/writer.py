@@ -20,6 +20,8 @@ from typing import Any, Optional
 # 交互式输出暂存目录:Excel 先写这里(不自动落 Downloads),用户点「下载」才存到 Downloads
 OUTPUTS_DIR = Path.home() / ".agent-system" / "outputs"
 
+_ENC_ROW_LIMIT = 50_000   # 密文版 Excel 单表行数上限(再加密慢+文件巨大),超则截断并标注
+
 
 def make_excel_path(stem: Optional[str] = None, staging: bool = False) -> Path:
     """
@@ -138,6 +140,22 @@ def enforce_excel_path(path: Path) -> Path:
 _REVERSE_METRIC = ("逾期", "超支", "流失", "异常", "缺货", "呆滞", "波动", "差异率", "降幅")
 
 
+# 金额格式:正数千分位,负数会计惯例红字括号
+_MONEY_FMT = "#,##0.00;[Red](#,##0.00)"
+
+
+def _rotated_text_props(deg: int):
+    """构造图表轴标签旋转的 txPr(角度单位 1/60000 度)。"""
+    from openpyxl.chart.text import RichText
+    from openpyxl.drawing.text import (
+        CharacterProperties, Paragraph, ParagraphProperties, RichTextProperties,
+    )
+    return RichText(
+        bodyPr=RichTextProperties(rot=int(deg * 60000), vert="horz"),
+        p=[Paragraph(pPr=ParagraphProperties(defRPr=CharacterProperties()), endParaRPr=None)],
+    )
+
+
 def _infer_number_format(col_name: str) -> Optional[str]:
     """按列名推断 Excel 数字格式 —— 覆盖销售/财务/库存/HR/客户常见指标。"""
     name = str(col_name)
@@ -150,14 +168,14 @@ def _infer_number_format(col_name: str) -> Optional[str]:
     # 天数 / 账龄 / 周转
     if "days" in lower or any(k in name for k in ("天数", "账龄", "周转")):
         return "0.0"
-    # 金额(财务/销售/HR 薪酬)
+    # 金额(财务/销售/HR 薪酬)—— 负数用会计惯例红字括号 (1,234.00)
     if any(k in lower for k in ("amount", "value", "price", "cost", "revenue", "profit", "sales", "budget")):
-        return "#,##0.00"
+        return _MONEY_FMT
     if any(k in name for k in (
         "金额", "额", "收入", "成本", "利润", "营收", "回款", "应收", "应付", "余额",
         "预算", "实际", "(元)", "（元）", "工资", "薪酬", "薪资", "提成", "奖金", "单价", "总价",
     )):
-        return "#,##0.00"
+        return _MONEY_FMT
     # 计数 / 人数 / 排名(整数)
     if any(k in lower for k in ("count", "num", "qty")):
         return "0"
@@ -506,8 +524,15 @@ def _render_sheet(ws, df, r: dict) -> None:
             pass
         ws.column_dimensions[get_column_letter(ci)].width = min(max(w + 2.5, 10), 40)
 
-    # 冻结表头 + 自动筛选
-    ws.freeze_panes = ws.cell(data0, 1).coordinate
+    # 冻结表头(+ 宽表冻结身份首列:列多且首列是文本身份列时,横向滚动仍见行标识)
+    freeze_col = 1
+    try:
+        import pandas as pd
+        if n_cols > 6 and len(df.columns) and not pd.api.types.is_numeric_dtype(df.iloc[:, 0]):
+            freeze_col = 2
+    except Exception:
+        pass
+    ws.freeze_panes = ws.cell(data0, freeze_col).coordinate
     if n_cols and n_data:
         ws.auto_filter.ref = (
             f"{ws.cell(header_row, 1).coordinate}:{get_column_letter(n_cols)}{data_last}"
@@ -609,7 +634,7 @@ def _write_total_row(ws, df, headers, col_fmt, data0, data_last, spec) -> None:
             if any(k in str(h) for k in ("排名", "名次", "序号")):
                 continue
             fmt = _infer_number_format(h)
-            if fmt in ("#,##0.00", "0"):
+            if fmt in (_MONEY_FMT, "0"):
                 sum_cols.append(h)
             elif fmt == "0.00%":
                 mean_cols.append(h)
@@ -786,21 +811,37 @@ def export_skill_results_encrypted(
         if df is None or df.empty:
             continue
 
+        # 行数护栏:再加密逐值很慢且会产出打不开的巨型文件 —— 超上限截断并在 note 标注
+        enc_trunc = ""
+        if len(df) > _ENC_ROW_LIMIT:
+            enc_trunc = f"⚠ 结果 {len(df)} 行,密文版已截断前 {_ENC_ROW_LIMIT} 行。"
+            df = df.head(_ENC_ROW_LIMIT)
+
         enc_df = _encrypt_numeric_columns(df)
 
         ws = wb.create_sheet(title=sheet_name)
         headers = [str(c) for c in enc_df.columns]
+        # 口径说明行:与明文版一致地把 note(加权/等权口径、缺期预警等)写在表顶,
+        # 避免"密文留存版看不到口径、明文版能看到"的两套结论
+        header_row = 1
+        sheet_note = (str(r.get("note") or "").strip() + " " + enc_trunc).strip()
+        if sheet_note:
+            c = ws.cell(1, 1, sheet_note)
+            c.font = Font(italic=True, color="6B7280", size=10)
+            if len(headers) > 1:
+                ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+            header_row = 2
         for ci, h in enumerate(headers, 1):
-            cell = ws.cell(1, ci, h)
+            cell = ws.cell(header_row, ci, h)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
-        for ri, row in enumerate(enc_df.itertuples(index=False), 2):
+        for ri, row in enumerate(enc_df.itertuples(index=False), header_row + 1):
             for ci, val in enumerate(row, 1):
                 ws.cell(ri, ci, val if val is not None else "")
         for ci, h in enumerate(headers, 1):
             ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
-        ws.freeze_panes = "A2"
+        ws.freeze_panes = f"A{header_row + 1}"
 
     wb.save(dst)
     return dst
@@ -1241,6 +1282,14 @@ def _make_chart(ws, typ: str, x_idx: int, y_idxs: list, headers: list,
         chart.y_axis.majorGridlines = ChartLines()
         chart.y_axis.numFmt = _infer_number_format(headers[y_idxs[0] - 1]) or "General"
         chart.legend.position = "b"
+        # 长类目名(如产品全称)斜排 -45°,避免 x 轴标签挤成一团
+        try:
+            cats_max = max((len(str(ws.cell(r, x_idx).value or ""))
+                            for r in range(first_row, last_row + 1)), default=0)
+            if cats_max >= 6:
+                chart.x_axis.txPr = _rotated_text_props(-45)
+        except Exception:
+            pass
     except Exception:
         pass
 

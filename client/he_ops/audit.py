@@ -12,13 +12,43 @@
 from __future__ import annotations
 
 import contextvars
+import hashlib
 import json
 import os
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
 AUDIT_DIR = Path(os.path.expanduser("~/.agent-system/audit"))
+
+_GENESIS = "0" * 64                       # 链首 prev_hash
+_chain_lock = threading.Lock()
+_last_hash: dict[str, str] = {}           # 每文件最后一条事件的 hash 缓存
+
+
+def _event_hash(event: dict) -> str:
+    """对事件(不含 'hash' 字段)做规范化 sha256。"""
+    payload = {k: event[k] for k in event if k != "hash"}
+    canon = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def _read_last_hash(path: Path) -> str:
+    """冷启动:从文件最后一行取上一条 hash(文件不存在/损坏 → 链首)。"""
+    try:
+        if not path.exists():
+            return _GENESIS
+        last = ""
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    last = line
+        if not last:
+            return _GENESIS
+        return json.loads(last).get("hash", _GENESIS)
+    except Exception:  # noqa: BLE001
+        return _GENESIS
 
 # 请求作用域上下文(user, session)—— 在分析入口 set_context 一次,
 # 各埋点 record_* 不传 user/session 时从这里取(避免层层穿参)。
@@ -45,13 +75,50 @@ def _path(user: Optional[str]) -> Path:
 
 
 def _append(user: Optional[str], event: dict) -> None:
-    """写一行审计事件;失败绝不影响主流程。"""
+    """写一行审计事件(带哈希链:seq + prev_hash + hash);失败绝不影响主流程。"""
     try:
-        event = {"ts": _now(), **event}
-        with _path(user).open("a", encoding="utf-8") as f:
-            f.write(json.dumps(event, ensure_ascii=False) + "\n")
+        path = _path(user)
+        key = str(path)
+        with _chain_lock:
+            prev = _last_hash.get(key)
+            if prev is None:
+                prev = _read_last_hash(path)
+            event = {"ts": _now(), **event, "prev_hash": prev}
+            event["hash"] = _event_hash(event)
+            with path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(event, ensure_ascii=False) + "\n")
+            _last_hash[key] = event["hash"]
     except Exception:  # noqa: BLE001 —— 审计失败不能阻断分析
         pass
+
+
+def verify_chain(user: Optional[str]) -> dict:
+    """
+    校验某用户审计日志的哈希链完整性 —— 检测事后篡改/删行/改字段。
+    返回 {ok, total, broken_at, reason}。broken_at 是第一处断裂的行号(1-based)。
+    注:本地日志由用户自己所有,哈希链检测**部分篡改**;抵御整档重写需主机侧定期锚定(另议)。
+    """
+    path = _path(user)
+    if not path.exists():
+        return {"ok": True, "total": 0, "broken_at": None, "reason": "无日志"}
+    prev = _GENESIS
+    n = 0
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for i, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                n += 1
+                ev = json.loads(line)
+                stored = ev.get("hash")
+                if ev.get("prev_hash") != prev:
+                    return {"ok": False, "total": n, "broken_at": i, "reason": "prev_hash 断链(疑似删行/插行)"}
+                if _event_hash(ev) != stored:
+                    return {"ok": False, "total": n, "broken_at": i, "reason": "hash 不匹配(疑似改字段)"}
+                prev = stored
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "total": n, "broken_at": None, "reason": f"解析失败: {e}"}
+    return {"ok": True, "total": n, "broken_at": None, "reason": "链完整"}
 
 
 def _field_names(schema: dict) -> list[str]:

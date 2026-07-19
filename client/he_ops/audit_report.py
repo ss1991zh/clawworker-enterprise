@@ -127,12 +127,17 @@ def build_docx(user: str) -> bytes:
 
     # ---- 三、关键指标 ----
     doc.add_heading("三、关键指标", level=1)
+    from client.he_ops.audit import verify_chain
+    chain = verify_chain(user)
+    chain_txt = ("完整(未被篡改)" if chain["ok"]
+                 else f"⚠ 第 {chain['broken_at']} 条起异常:{chain['reason']}")
     _kv_table(doc, [
         ("分析次数(AI 参与写逻辑)", s.get("llm_exposures", 0)),
         ("AI 看到具体数据值的次数", "0(AI 只看到字段名)" if ok else f"疑似 {s.get('plaintext_breaches',0)} 次"),
         ("解密授权次数", f"{s.get('decrypt_authorizations',0)}　"
                        f"(您批准 {s.get('decrypt_granted',0)} 次 / 拒绝或保留密文 {s.get('decrypt_denied',0)} 次)"),
         ("记录时间范围", f"{_ts(s.get('first_event'))} ~ {_ts(s.get('last_event'))}" if s.get("first_event") else "暂无记录"),
+        ("审计链完整性(防篡改校验)", chain_txt),
     ])
 
     # ---- 四、AI 只看到字段名(逐次记录) ----
