@@ -496,7 +496,11 @@ def _render_sheet(ws, df, r: dict) -> None:
                 import pandas as pd
                 v = pd.to_numeric(df[h], errors="coerce").abs()
                 v = v[v.notna()]
-                if len(v) >= 1 and float(v.median()) > 5 and float((v > 1.5).mean()) >= 0.9:
+                # 零值对"整数百分数 vs 小数"没有判别力(两种口径下都是 0),必须排除:
+                # 否则 [85,92,88,75,0] 里那个合法的 0 把占比拉到 0.8 < 0.9,体检失效,
+                # 85 被当小数渲染成 8500%。
+                nz = v[v > 0]
+                if len(nz) >= 1 and float(nz.median()) > 5 and float((nz > 1.5).mean()) >= 0.9:
                     nf = '0.00"%"'
             except Exception:
                 pass

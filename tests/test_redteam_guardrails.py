@@ -624,3 +624,47 @@ def test_pipeline_finally_clears_decrypt_decision_too():
     tail = src[src.rindex("finally:"):]
     assert "_cancelled_msgs.discard" in tail
     assert "_decrypt_decisions.pop" in tail
+
+
+# ── 优化循环第18轮(端到端整合):codegen 路径解密去噪 + 含0百分数列 ──
+
+def test_codegen_path_denoises_decrypted_zero():
+    # codegen 路径的解密由 LLM 代码直接调 ct.*,不走 skills._decrypt。
+    # 收口 _gated_decrypt 必须同样去噪,否则零分母=1e-15,LLM 的除零护栏
+    # (replace(0,nan)/where(x>0)) 全失效,比率炸成 -5e19。
+    import numpy as np, pandas as pd
+    from client.webui.codegen import _denoise_decrypted
+    df = pd.DataFrame({"a": [1e-15, 100.0], "b": [2.0, -3e-16]})
+    out = _denoise_decrypted(df)
+    assert out["a"].iloc[0] == 0.0 and out["b"].iloc[1] == 0.0
+    assert out["a"].iloc[1] == 100.0
+    arr = _denoise_decrypted(np.array([1e-15, 5.0, -2e-16]))
+    assert arr[0] == 0.0 and arr[2] == 0.0 and arr[1] == 5.0
+    s = _denoise_decrypted(pd.Series([1e-15, 7.0]))
+    assert s.iloc[0] == 0.0 and s.iloc[1] == 7.0
+
+
+def test_integer_percent_with_legit_zero_still_detected():
+    import pandas as pd, openpyxl
+    from client.webui import writer
+    # [85,92,88,75,0]:那个合法的 0 曾把「>1.5 占比」拉到 0.8<0.9,体检失效 → 85 渲染成 8500%。
+    # 0 对"整数百分数 vs 小数"没有判别力,必须排除在判据之外。
+    df = pd.DataFrame({"大区": list("ABCDE"), "完成率": [85.0, 92.0, 88.0, 75.0, 0.0]})
+    p = writer.write_skill_results([{"sheet_name": "t", "df": df}], stem="pct0", staging=True)
+    ws = openpyxl.load_workbook(p)["t"]
+    c = ws.cell(2, 2)
+    if not isinstance(c.value, (int, float)):
+        c = ws.cell(3, 2)
+    assert c.number_format != "0.00%", "含 0 的整数百分数列被当小数 → 会显示 8500%"
+
+
+def test_true_decimal_ratio_with_zero_unaffected():
+    import pandas as pd, openpyxl
+    from client.webui import writer
+    df = pd.DataFrame({"大区": list("ABC"), "完成率": [0.85, 0.92, 0.0]})
+    p = writer.write_skill_results([{"sheet_name": "t", "df": df}], stem="pctdec0", staging=True)
+    ws = openpyxl.load_workbook(p)["t"]
+    c = ws.cell(2, 2)
+    if not isinstance(c.value, (int, float)):
+        c = ws.cell(3, 2)
+    assert c.number_format == "0.00%"   # 真小数不受影响

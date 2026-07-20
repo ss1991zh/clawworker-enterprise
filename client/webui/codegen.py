@@ -577,7 +577,39 @@ def _attach_identity(plain_df, cipher_arg, original_cdf, meta_df):
         return plain_df
 
 
+def _denoise_decrypted(obj):
+    """同态解密结果去噪:精确 0 会被解成 ~1e-15,非零值带 ~1e-13 抖动。
+
+    codegen 路径的解密由 **LLM 生成的代码直接调 ct.***,不经过 skills._decrypt,
+    所以必须在这个收口再做一次。否则零分母解出来是 1e-15 而不是 0,LLM 写的除零护栏
+    (`replace(0, nan)` / `np.where(x > 0, ...)`)统统失效 —— 1e-15 既不等于 0、
+    又大于 0,比率会炸成 -5e19 这种天文数字并混进排名表。
+    """
+    try:
+        import numpy as np
+        import pandas as pd
+        from client.tools.skills import _HE_ZERO_EPS, _denoise_he
+        if isinstance(obj, pd.DataFrame):
+            return _denoise_he(obj)
+        if isinstance(obj, pd.Series):
+            if pd.api.types.is_numeric_dtype(obj):
+                return obj.mask(obj.abs() < _HE_ZERO_EPS, 0.0)
+            return obj
+        if isinstance(obj, np.ndarray) and obj.dtype.kind == "f":
+            return np.where(np.abs(obj) < _HE_ZERO_EPS, 0.0, obj)
+    except Exception:  # noqa: BLE001 —— 去噪失败不能吞掉解密结果
+        pass
+    return obj
+
+
 def _gated_decrypt(real_ct, name, args, kwargs, original_cdf=None, meta_df=None):
+    """解密收口:真实解密(见 _gated_decrypt_raw)+ 统一吸附同态近零噪声。"""
+    return _denoise_decrypted(
+        _gated_decrypt_raw(real_ct, name, args, kwargs,
+                           original_cdf=original_cdf, meta_df=meta_df))
+
+
+def _gated_decrypt_raw(real_ct, name, args, kwargs, original_cdf=None, meta_df=None):
     """
     调真实解密 + 对 pandaseal 类型自动纠偏 + 整表解密自动拼回身份列。
 
