@@ -35,18 +35,26 @@ def _event_hash(event: dict) -> str:
 
 
 def _read_last_hash(path: Path) -> str:
-    """冷启动:从文件最后一行取上一条 hash(文件不存在/损坏 → 链首)。"""
+    """冷启动:取最后一条**能解析**的事件的 hash(文件不存在 → 链首)。
+
+    末行可能因写入时崩溃/断电而残缺。若因残行直接回退成链首,新事件会从中间
+    另起一条链,verify 时表现为"断链",与真篡改混淆 —— 故跳过残行往前找。
+    """
     try:
         if not path.exists():
             return _GENESIS
-        last = ""
+        last_ok = _GENESIS
         with path.open("r", encoding="utf-8") as f:
             for line in f:
-                if line.strip():
-                    last = line
-        if not last:
-            return _GENESIS
-        return json.loads(last).get("hash", _GENESIS)
+                if not line.strip():
+                    continue
+                try:
+                    h = json.loads(line).get("hash")
+                except Exception:  # noqa: BLE001 —— 残行,跳过继续往前找
+                    continue
+                if h:
+                    last_ok = h
+        return last_ok
     except Exception:  # noqa: BLE001
         return _GENESIS
 
@@ -85,7 +93,19 @@ def _append(user: Optional[str], event: dict) -> None:
                 prev = _read_last_hash(path)
             event = {"ts": _now(), **event, "prev_hash": prev}
             event["hash"] = _event_hash(event)
+            # 上次写入若崩在半途,末行没有换行符 —— 直接 append 会把新事件**粘在残行尾部**,
+            # 既丢了这条事件,又让日志永久损坏。先补一个换行,保证新事件独占一行。
+            need_nl = False
+            try:
+                if path.exists() and path.stat().st_size:
+                    with path.open("rb") as fb:
+                        fb.seek(-1, os.SEEK_END)
+                        need_nl = fb.read(1) != b"\n"
+            except Exception:  # noqa: BLE001
+                need_nl = False
             with path.open("a", encoding="utf-8") as f:
+                if need_nl:
+                    f.write("\n")
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
             _last_hash[key] = event["hash"]
     except Exception:  # noqa: BLE001 —— 审计失败不能阻断分析
@@ -103,13 +123,22 @@ def verify_chain(user: Optional[str]) -> dict:
         return {"ok": True, "total": 0, "broken_at": None, "reason": "无日志"}
     prev = _GENESIS
     n = 0
+    pending_bad: Optional[int] = None   # 解析不了的行号(先记着,看后面还有没有内容)
     try:
         with path.open("r", encoding="utf-8") as f:
             for i, line in enumerate(f, 1):
                 if not line.strip():
                     continue
+                if pending_bad is not None:
+                    # 残行后面还有正常内容 → 不是"崩在最后一行",按损坏/篡改处理
+                    return {"ok": False, "total": n, "broken_at": pending_bad,
+                            "reason": "行损坏(疑似删改)"}
+                try:
+                    ev = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    pending_bad = i
+                    continue
                 n += 1
-                ev = json.loads(line)
                 stored = ev.get("hash")
                 if ev.get("prev_hash") != prev:
                     return {"ok": False, "total": n, "broken_at": i, "reason": "prev_hash 断链(疑似删行/插行)"}
@@ -118,6 +147,10 @@ def verify_chain(user: Optional[str]) -> dict:
                 prev = stored
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "total": n, "broken_at": None, "reason": f"解析失败: {e}"}
+    if pending_bad is not None:
+        # 只有**末行**残缺 —— 断电/被杀进程的写入残留,不是篡改。如实区分,别误报。
+        return {"ok": False, "total": n, "broken_at": pending_bad, "truncated_tail": True,
+                "reason": f"末行不完整(疑似写入时崩溃,非篡改);其前 {n} 条链完整"}
     return {"ok": True, "total": n, "broken_at": None, "reason": "链完整"}
 
 

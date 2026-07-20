@@ -508,3 +508,66 @@ def test_monthly_rolls_over_year():
     from datetime import datetime
     t = _monthly(31)
     assert t.compute_next_run(datetime(2026, 12, 31, 9, 30)).date().isoformat() == "2027-01-31"
+
+
+# ── 优化循环第16轮(补货:审计链)崩溃截断不再误报篡改/吞事件 ──
+
+def _audit_tmp(tmp_path, monkeypatch):
+    from client.he_ops import audit
+    monkeypatch.setattr(audit, "_path", lambda u: tmp_path / f"{u}.jsonl")
+    audit._last_hash.clear()
+    return audit
+
+
+def test_audit_crash_truncated_tail_not_reported_as_tamper(tmp_path, monkeypatch):
+    audit = _audit_tmp(tmp_path, monkeypatch)
+    for i in range(3):
+        audit._append("u", {"type": "t", "i": i})
+    p = tmp_path / "u.jsonl"
+    p.write_text(p.read_text(encoding="utf-8")[:-15], encoding="utf-8")   # 模拟写入时崩溃
+    r = audit.verify_chain("u")
+    # 末行残缺是崩溃残留,不能与"疑似篡改"混为一谈
+    assert r.get("truncated_tail") is True
+    assert "崩溃" in r["reason"] and "篡改" not in r["reason"].split("非篡改")[0]
+
+
+def test_audit_append_after_crash_does_not_swallow_event(tmp_path, monkeypatch):
+    audit = _audit_tmp(tmp_path, monkeypatch)
+    for i in range(3):
+        audit._append("u", {"type": "t", "i": i})
+    p = tmp_path / "u.jsonl"
+    p.write_text(p.read_text(encoding="utf-8")[:-15], encoding="utf-8")
+    before = len([l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()])
+    audit._last_hash.clear()
+    audit._append("u", {"type": "t", "i": "after-crash"})
+    after = len([l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()])
+    # 残行没有换行符,旧实现会把新事件粘上去 → 行数不变=事件被吞
+    assert after == before + 1
+
+
+def test_audit_still_detects_real_tampering(tmp_path, monkeypatch):
+    import json
+    audit = _audit_tmp(tmp_path, monkeypatch)
+    for i in range(3):
+        audit._append("u", {"type": "t", "i": i})
+    p = tmp_path / "u.jsonl"
+    ls = p.read_text(encoding="utf-8").splitlines()
+    ev = json.loads(ls[1]); ev["i"] = 999                 # 改中间行字段
+    ls[1] = json.dumps(ev, ensure_ascii=False)
+    p.write_text("\n".join(ls) + "\n", encoding="utf-8")
+    r = audit.verify_chain("u")
+    assert r["ok"] is False and "hash 不匹配" in r["reason"]
+
+
+def test_audit_chain_survives_concurrent_appends(tmp_path, monkeypatch):
+    import threading
+    audit = _audit_tmp(tmp_path, monkeypatch)
+
+    def w(n):
+        for i in range(20):
+            audit._append("u", {"type": "c", "t": n, "i": i})
+    ths = [threading.Thread(target=w, args=(k,)) for k in range(5)]
+    [t.start() for t in ths]
+    [t.join() for t in ths]
+    r = audit.verify_chain("u")
+    assert r["ok"] is True and r["total"] == 100
