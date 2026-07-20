@@ -202,15 +202,20 @@ class ScheduledTask:
                 target = target + timedelta(days=7)
             return target
         if self.schedule_kind == "monthly":
-            dom = min(max(int(self.day_of_month or 1), 1), 28)
-            target = base.replace(day=dom, hour=self.at_hour, minute=self.at_minute,
-                                  second=0, microsecond=0)
+            # 想要的日子超过当月天数(31 号遇到 2 月)→ 落到该月**最后一天**,即"月末"语义。
+            # 旧实现一律夹到 28 号:用户设「每月31号」跑月结,1月/3月(31天)也在28号跑,
+            # 提前 3 天赶在月末结账前,而 UI 仍显示「每月 31 号」—— 显示与实际不符。
+            import calendar
+            want = min(max(int(self.day_of_month or 1), 1), 31)
+
+            def _at(y: int, m: int) -> datetime:
+                d = min(want, calendar.monthrange(y, m)[1])
+                return datetime(y, m, d, self.at_hour, self.at_minute)
+
+            target = _at(base.year, base.month)
             if target <= base:
-                # 进到下个月同一天
-                if target.month == 12:
-                    target = target.replace(year=target.year + 1, month=1)
-                else:
-                    target = target.replace(month=target.month + 1)
+                y, m = (base.year + 1, 1) if base.month == 12 else (base.year, base.month + 1)
+                target = _at(y, m)
             return target
         # daily(默认)
         target = base.replace(hour=self.at_hour, minute=self.at_minute,

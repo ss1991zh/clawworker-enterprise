@@ -475,3 +475,36 @@ def test_single_title_row_still_detected(tmp_path):
     p = tmp_path / "title.xlsx"; wb.save(p)
     df, sheet, header_row, dropped = app_mod._smart_read(p, ".xlsx")
     assert [str(c) for c in df.columns] == ["大区", "金额", "成本"]
+
+
+# ── 优化循环第15轮(补货:定时任务)每月31号=月末,不再一律夹到28号 ──
+
+def _monthly(dom):
+    from client.webui.scheduler import ScheduledTask
+    return ScheduledTask(id="x", username="u", name="月结", question="q",
+                         schedule_kind="monthly", day_of_month=dom, at_hour=9, at_minute=0)
+
+
+def test_monthly_month_end_lands_on_real_last_day():
+    from datetime import datetime
+    t = _monthly(31)
+    # 31 天的月份必须真的落在 31 号(旧实现一律 28 号 → 月结报表赶不上月末)
+    assert t.compute_next_run(datetime(2026, 1, 5)).date().isoformat() == "2026-01-31"
+    assert t.compute_next_run(datetime(2026, 3, 5)).date().isoformat() == "2026-03-31"
+    # 2 月自动落到当月最后一天;闰年是 29 号
+    assert t.compute_next_run(datetime(2026, 2, 5)).date().isoformat() == "2026-02-28"
+    assert t.compute_next_run(datetime(2028, 2, 5)).date().isoformat() == "2028-02-29"
+
+
+def test_monthly_mid_month_unchanged():
+    from datetime import datetime
+    t = _monthly(15)
+    for base, want in ((datetime(2026, 1, 5), "2026-01-15"),
+                       (datetime(2026, 2, 5), "2026-02-15")):
+        assert t.compute_next_run(base).date().isoformat() == want
+
+
+def test_monthly_rolls_over_year():
+    from datetime import datetime
+    t = _monthly(31)
+    assert t.compute_next_run(datetime(2026, 12, 31, 9, 30)).date().isoformat() == "2027-01-31"
