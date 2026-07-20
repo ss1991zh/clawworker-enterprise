@@ -36,6 +36,11 @@ PROJECT_DIR = Path(__file__).resolve().parent.parent          # agent-system/
 SUPERVISOR_PY = PROJECT_DIR / "supervisor.py"
 STATE_DIR = Path.home() / ".agent-system" / "supervisor"
 STATE_FILE = STATE_DIR / "state.json"
+# 期望托管的角色集合(并集)。supervisor 是单例,但启动它的人可能只想要某一个角色
+# (桌面「管理端」图标只要 host、「用户端」图标只要 client)。没有这个并集文件时,
+# 先启动的那个角色会**永久堵死**另一个:后来的 supervisor 撞上单例锁直接退出,
+# 而在跑的那个又不托管新角色 —— 表现为点了图标毫无反应。
+DESIRED_FILE = STATE_DIR / "desired_services.json"
 SUP_LOG = STATE_DIR / "supervisor.log"
 
 # 服务定义(supervisor 与 admin 共用这一份事实来源)。
@@ -170,6 +175,28 @@ def read_state() -> dict:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, ValueError):
         return {}
+
+
+def read_desired() -> list[str]:
+    """读期望托管的角色并集(文件不存在/损坏 → 空)。"""
+    try:
+        keys = json.loads(DESIRED_FILE.read_text(encoding="utf-8"))
+        return [k for k in keys if k in SERVICES]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def add_desired(keys: list[str]) -> list[str]:
+    """把 keys 并进期望集合并返回并集 —— 让在跑的单例 supervisor 接管新角色。"""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    merged = sorted(set(read_desired()) | {k for k in keys if k in SERVICES})
+    try:
+        tmp = DESIRED_FILE.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
+        tmp.replace(DESIRED_FILE)
+    except Exception:  # noqa: BLE001 —— 写失败不阻断启动
+        pass
+    return merged
 
 
 def write_state(state: dict) -> None:

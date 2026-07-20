@@ -66,16 +66,22 @@ def _handle_signal(signum, frame):  # noqa: ARG001
 
 def main() -> int:
     # ---- 单例守护:已有健康 supervisor 在跑就退出 ----
+    # 退出前先把本进程想托管的角色并进「期望集合」—— 在跑的那个每轮会读它并接管。
+    # 否则角色分片 + 单例锁会互相堵死:先起的只管 client,后来点「管理端」图标起的
+    # supervisor 撞锁即退,没人拉 host,表现为点图标毫无反应。
+    want = sm.managed_service_keys()
     running, pid = sm.supervisor_running()
     if running and pid and pid != os.getpid():
-        _log(f"已有 supervisor 在运行(pid={pid}),本进程退出")
+        merged = sm.add_desired(want)
+        _log(f"已有 supervisor 在运行(pid={pid}),已请求其接管 {want}(期望集合={merged}),本进程退出")
         return 0
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
 
     started_at = _now()
-    managed = sm.managed_service_keys()
+    # 本进程角色 ∪ 历史期望集合(上次别的角色请求过、重启后不该丢)
+    managed = sm.add_desired(want)
     _log(f"启动 · pid={os.getpid()} · 托管 {managed}")
 
     # 每个服务的运行态
@@ -104,6 +110,15 @@ def main() -> int:
         })
 
     while _running:
+        # 接管新角色:别的 launcher(如桌面「管理端」图标)撞上单例锁退出前,
+        # 会把它想要的角色写进期望集合 —— 这里读到就纳入托管,下一轮即拉起。
+        for key in sm.read_desired():
+            if key not in mgr:
+                managed.append(key)
+                mgr[key] = {"proc": None, "restarts": 0, "last_start": 0.0,
+                            "backoff": BACKOFF_BASE, "healthy_since": 0.0,
+                            "last_restart": None}
+                _log(f"接管新角色 {key}(来自期望集合)")
         for key in managed:
             svc = sm.SERVICES[key]
             m = mgr[key]
