@@ -489,11 +489,13 @@ def _render_sheet(ws, df, r: dict) -> None:
             # 百分比口径体检:列名像"率"但数据存成整数百分数(85 表示 85%)而非小数(0.85)。
             # 判据要**保守**:超额完成率(1.6=160%)是合法小数,不能误判成整数百分数缩小 100 倍。
             # 只有当中位数明显大(>5)且几乎无小于 1.5 的值(整数百分数列不会有 0.x)时才认定。
+            # 单行结果表(汇总/单实体)也要体检 —— 否则 85 会被当小数渲染成 8500%;
+            # 中位数>5 的门槛已足够挡住合法小数(1.6=160% 不会误判)。
             try:
                 import pandas as pd
                 v = pd.to_numeric(df[h], errors="coerce").abs()
                 v = v[v.notna()]
-                if len(v) >= 2 and float(v.median()) > 5 and float((v > 1.5).mean()) >= 0.9:
+                if len(v) >= 1 and float(v.median()) > 5 and float((v > 1.5).mean()) >= 0.9:
                     nf = '0.00"%"'
             except Exception:
                 pass

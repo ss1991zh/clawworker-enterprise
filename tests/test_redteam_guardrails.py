@@ -277,3 +277,34 @@ def test_codegen_prompt_forbids_hoisting_negatives_to_top():
     assert 'na_position="last"' in CODEGEN_SYSTEM
     assert 'na_position="first"' in CODEGEN_SYSTEM   # 以「禁止」形式出现
     assert "置顶" in CODEGEN_SYSTEM and "误导" in CODEGEN_SYSTEM
+
+
+# ── 优化循环第10轮(补货红队):单行结果表百分数列体检失效 → 显示错100倍 ──
+
+def test_single_row_integer_percent_not_rendered_100x():
+    import pandas as pd, openpyxl
+    from client.webui import writer
+    # 单行汇总表,完成率存的是整数百分数 85(=85%)。旧实现因 len>=2 跳过体检,
+    # 套 0.00% 会渲染成 8500%。
+    df = pd.DataFrame([("华东", 85.0)], columns=["大区", "完成率"])
+    p = writer.write_skill_results([{"sheet_name": "t", "df": df}], stem="pct1row", staging=True)
+    ws = openpyxl.load_workbook(p)["t"]
+    c = ws.cell(2, 2)
+    if not isinstance(c.value, (int, float)):
+        c = ws.cell(3, 2)
+    # 整数百分数 → 用字面 % 格式(不再乘100)
+    assert c.number_format != "0.00%", "单行整数百分数被当小数,会显示成 8500%"
+    assert c.value == 85
+
+
+def test_single_row_true_decimal_ratio_still_percent():
+    import pandas as pd, openpyxl
+    from client.webui import writer
+    # 单行 1.6 = 160% 超额完成,是合法小数,不能被误判缩小 100 倍
+    df = pd.DataFrame([("华东", 1.6)], columns=["大区", "完成率"])
+    p = writer.write_skill_results([{"sheet_name": "t", "df": df}], stem="pct1row_dec", staging=True)
+    ws = openpyxl.load_workbook(p)["t"]
+    c = ws.cell(2, 2)
+    if not isinstance(c.value, (int, float)):
+        c = ws.cell(3, 2)
+    assert c.number_format == "0.00%" and abs(c.value - 1.6) < 1e-9
