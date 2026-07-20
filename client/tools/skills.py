@@ -344,10 +344,17 @@ def skill_row_ratio_then_group_mean(cdf, params, metadata_rows, metadata_columns
     full["__ratio__"] = _inf_to_nan(full[num] / full[den])  # 除零沉底不霸榜
     grouped = full.groupby(group, as_index=False).agg(
         订单数=(num, 'count'),
+        有效行数=("__ratio__", 'count'),   # 真正进入均值的行数(除零/缺失已被剔除)
         平均比率=("__ratio__", 'mean'),
         最高=("__ratio__", 'max'),
         最低=("__ratio__", 'min'),
     ).rename(columns={'平均比率': metric})
+    # 均值的分母是「有效行数」而非「订单数」:有除零/缺失被剔除时两者不等,
+    # 不显性列出来,财务按「均值×订单数」反推会对不上账。全等时不添噪声列。
+    if bool((grouped["订单数"] != grouped["有效行数"]).any()):
+        grouped = grouped[[group, "订单数", "有效行数", metric, "最高", "最低"]]
+    else:
+        grouped = grouped.drop(columns=["有效行数"])
     # 分组维度是时间 → 时间升序;否则按指标降序
     grouped = _sort_group_result(grouped, group, metric, bool(params.get("ascending", False)))
 
@@ -382,7 +389,18 @@ def skill_top_n_by(cdf, params, metadata_rows, metadata_columns):
     if value_col not in full.columns:
         raise ValueError(f"top_n_by: value_col「{value_col}」不存在")
 
-    sorted_df = full.sort_values(value_col, ascending=ascending).head(n).reset_index(drop=True)
+    ordered = full.sort_values(value_col, ascending=ascending).reset_index(drop=True)
+    # 截断处若有并列,把并列项一并带上 —— 否则「同为 90 却只有 B 进 TOP2、C/D 被无声丢掉」,
+    # 谁进谁出取决于行序,财务无法解释。宁可多出几行,也不做武断截断。
+    if n < len(ordered):
+        cutoff = ordered.loc[n - 1, value_col]
+        if pd.notna(cutoff):
+            keep = (ordered[value_col] <= cutoff) if ascending else (ordered[value_col] >= cutoff)
+            sorted_df = ordered[keep].reset_index(drop=True)
+        else:
+            sorted_df = ordered.head(n).reset_index(drop=True)
+    else:
+        sorted_df = ordered
     # 并列同名次(1,1,3 式):同值共享名次,而不是按行号硬编 1,2,3
     ranks = sorted_df[value_col].rank(method="min", ascending=ascending)
     sorted_df.insert(0, "排名", ranks.fillna(len(sorted_df)).astype(int))
@@ -1357,24 +1375,28 @@ SKILLS: dict[str, dict[str, Any]] = {
         "fn": skill_top_n_by,
         "desc": "按值取 TOP / BOTTOM N(ascending=true 为 BOTTOM)· 带身份列",
         "params": ["value_col", "n", "ascending", "filter", "sheet_name"],
+        "note": "口径:按指标排序取前/后 N;截断处若有并列,并列项一并列出(行数可能多于 N),名次为 1,1,3 式",
     },
     "group_stats": {
         "tool": "pandaseal",
         "fn": skill_group_stats,
         "desc": "按维度分组,对多个数字列算多个聚合(mean/max/min/count/sum/std)",
         "params": ["group_col", "value_cols", "aggs", "filter", "sheet_name"],
+        "note": "口径:按维度分组,对每个数值列分别算各聚合(mean/max/min/count…);各聚合独立计算,不做加权",
     },
     "describe": {
         "tool": "pandaseal",
         "fn": skill_describe,
         "desc": "整体描述统计 count/mean/std/min/max",
         "params": ["value_cols", "filter", "sheet_name"],
+        "note": "口径:整体描述统计(计数/均值/标准差/分位数),不分组,仅作数据概览",
     },
     "row_detail": {
         "tool": "pandaseal",
         "fn": skill_row_detail,
         "desc": "逐行明细 + 可选派生比率列 · 适合「展示每位员工目标完成率」",
         "params": ["value_cols", "compute", "sort_by", "ascending", "n", "filter", "sheet_name"],
+        "note": "口径:逐行明细,不做任何合并聚合;行数=原始数据行数",
     },
     "forecast_linreg": {
         "tool": "pandaseal+henumpy+helearn",
@@ -1382,6 +1404,7 @@ SKILLS: dict[str, dict[str, Any]] = {
         "desc": "时间序列预测 · pandas 清洗 → henumpy 加密数组 → helearn HE 线性回归 fit+predict",
         "params": ["value_col", "time_col", "group_col", "n_periods", "agg",
                    "iterations", "learning_rate", "filter", "sheet_name"],
+        "note": "口径:同态线性回归外推,**只拟合趋势项、不建模季节性/周期**。强季节性(旺淡季交替)或有转折点的场景,预测值仅供参考,不可直接作为经营目标;历史行的预测值留空",
     },
     # ---- 业务分析(第一梯队) ----
     "yoy_mom": {
@@ -1389,36 +1412,42 @@ SKILLS: dict[str, dict[str, Any]] = {
         "fn": skill_yoy_mom,
         "desc": "同比(YoY)/ 环比(MoM)增长分析 · 月度/年度增长额 + 增长率",
         "params": ["time_col", "value_col", "group_col", "mode", "agg", "filter", "sheet_name"],
+        "note": "口径:同比=去年同月、环比=上月;首期无对比值留空;增长额为金额、增长率为百分比",
     },
     "budget_variance": {
         "tool": "pandaseal",
         "fn": skill_budget_variance,
         "desc": "预算 vs 实际差异分析 · 差异额 + 差异率 + 超支/节约评价",
         "params": ["budget_col", "actual_col", "group_col", "favorable", "filter", "sheet_name"],
+        "note": "口径:差异额=实际-预算(金额),差异率=差异额÷预算;合计行差异率按加权(总差异÷总预算),非各行差异率的平均",
     },
     "rfm_segment": {
         "tool": "pandaseal",
         "fn": skill_rfm_segment,
         "desc": "RFM 客户分群 · 最近/频次/金额五分位打分 → 重要价值/挽留/流失等分群",
         "params": ["customer_col", "recency_col", "frequency_col", "monetary_col", "filter", "sheet_name"],
+        "note": "口径:R/F/M 各按五分位打 1-5 分(R 越近得分越高);分群由三项得分组合判定,同分同档",
     },
     "ar_aging": {
         "tool": "pandaseal",
         "fn": skill_ar_aging,
         "desc": "应收账款账龄分析 · 按逾期天数分桶(0-30/30-60/...)+ 逾期占比",
         "params": ["amount_col", "age_col", "group_col", "bins", "filter", "sheet_name"],
+        "note": "口径:按账龄分桶。账龄<起点(未到期/提前开票)入「未到期」桶、账龄缺失入「账龄未知」桶,均计入合计以与应收总账对平;逾期占比=(未到期与首个当期桶以外的桶)÷合计",
     },
     "pareto_abc": {
         "tool": "pandaseal",
         "fn": skill_pareto_abc,
         "desc": "帕累托(80/20)/ ABC 分类 · 按金额降序累计占比分 A/B/C 三类",
         "params": ["label_col", "value_col", "a_cut", "b_cut", "filter", "sheet_name"],
+        "note": "口径:按值降序算占比与累计占比,累计≤80%为A、≤95%为B、其余C;≤0 的值(退货冲减等)不参与占比与累计,单列「数据异常」置于表尾",
     },
     "pivot_summary": {
         "tool": "pandaseal",
         "fn": skill_pivot_summary,
         "desc": "多维交叉透视(行维 × 列维 → 聚合)· 如 大区×产品线 销售额",
         "params": ["row_col", "col_col", "value_col", "agg", "filter", "sheet_name"],
+        "note": "口径:行维×列维交叉聚合。加性口径(sum/count)缺失组合填 0,非加性(mean/min/max)缺失留空;合计列按原始行用同一聚合重算(mean→总体均值、min→总体最小),不是各列数值相加",
     },
     "inventory_turnover": {
         "tool": "pandaseal",

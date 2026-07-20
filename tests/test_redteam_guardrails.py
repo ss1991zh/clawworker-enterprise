@@ -355,3 +355,58 @@ def test_pivot_sum_unchanged_zero_fill_and_total():
     # 加性口径:缺失=0 合理,合计仍是求和
     assert d[d["大区"] == "华东"]["电源"].iloc[0] == 0
     assert d[d["大区"] == "华东"]["合计"].iloc[0] == 620000
+
+
+# ── 优化循环第12轮(补货P3):行级均分母/TOP-N并列/口径说明齐备 ──
+
+def test_row_ratio_mean_exposes_valid_row_count():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda c: c.copy()
+    # 华东5单,2单应收为0(比率NaN不进均值)→ 必须显性列出「有效行数」,否则均值×订单数对不上账
+    rows = [("华东", 90, 100), ("华东", 80, 100), ("华东", 70, 0),
+            ("华东", 60, 0), ("华东", 50, 100)]
+    df = pd.DataFrame(rows, columns=["大区", "回款", "应收"])
+    _, d, _ = skills.run_skill("row_ratio_then_group_mean", df[["回款", "应收"]].reset_index(drop=True),
+        {"num_col": "回款", "den_col": "应收", "group_col": "大区", "metric_name": "平均回款率"},
+        df[["大区"]].to_dict("records"), ["大区"])
+    r = d.iloc[0]
+    assert r["订单数"] == 5 and r["有效行数"] == 3
+    # 均值 × 有效行数 必须可对平
+    assert abs(r["平均回款率"] * r["有效行数"] - (0.9 + 0.8 + 0.5)) < 1e-9
+
+
+def test_row_ratio_no_noise_column_when_all_valid():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda c: c.copy()
+    df = pd.DataFrame([("华南", 40, 100), ("华南", 30, 100)], columns=["大区", "回款", "应收"])
+    _, d, _ = skills.run_skill("row_ratio_then_group_mean", df[["回款", "应收"]].reset_index(drop=True),
+        {"num_col": "回款", "den_col": "应收", "group_col": "大区"},
+        df[["大区"]].to_dict("records"), ["大区"])
+    assert "有效行数" not in d.columns   # 无剔除时不添噪声列
+
+
+def test_top_n_includes_boundary_ties():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda c: c.copy()
+    df = pd.DataFrame([("A", 100), ("B", 90), ("C", 90), ("D", 90), ("E", 50)],
+                      columns=["产品", "销售额"])
+    _, d, _ = skills.run_skill("top_n_by", df[["销售额"]].reset_index(drop=True),
+        {"value_col": "销售额", "n": 2}, df[["产品"]].to_dict("records"), ["产品"])
+    # 并列的 90 全部带上(不能只留 B 丢掉 C/D),且共享名次 2
+    assert set(d["产品"]) == {"A", "B", "C", "D"}
+    assert list(d[d["销售额"] == 90]["排名"]) == [2, 2, 2]
+
+
+def test_all_skills_have_caliber_note():
+    from client.tools.skills import SKILLS
+    missing = [k for k, v in SKILLS.items() if not (v.get("note") or "").strip()]
+    assert not missing, f"这些技能缺口径说明(渲染在表顶供财务核对): {missing}"
+
+
+def test_forecast_note_declares_no_seasonality():
+    from client.tools.skills import SKILLS
+    note = SKILLS["forecast_linreg"]["note"]
+    assert "季节" in note and "仅供参考" in note   # 线性外推的能力边界必须写明
