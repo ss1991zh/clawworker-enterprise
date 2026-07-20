@@ -169,9 +169,10 @@ def _infer_number_format(col_name: str) -> Optional[str]:
         return "0.00%"
     if any(k in name for k in ("率", "比例", "占比", "百分比", "涨幅", "降幅")):
         return "0.00%"
-    # 天数 / 账龄 / 周转
-    if "days" in lower or any(k in name for k in ("天数", "账龄", "周转")):
-        return "0.0"
+    # 天数 / 账龄 / 周转 —— 但「账龄未知」这类**账龄分桶列装的是金额**,不是天数,别误判
+    if not any(k in name for k in ("未知", "未到期")):
+        if "days" in lower or any(k in name for k in ("天数", "账龄", "周转")):
+            return "0.0"
     # 金额(财务/销售/HR 薪酬)—— 负数用会计惯例红字括号 (1,234.00)
     if any(k in lower for k in ("amount", "value", "price", "cost", "revenue", "profit", "sales", "budget")):
         return _MONEY_FMT

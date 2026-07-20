@@ -410,3 +410,32 @@ def test_forecast_note_declares_no_seasonality():
     from client.tools.skills import SKILLS
     note = SKILLS["forecast_linreg"]["note"]
     assert "季节" in note and "仅供参考" in note   # 线性外推的能力边界必须写明
+
+
+# ── 优化循环第13轮(补货:渲染层与新增列一致性)──
+
+def test_aging_unknown_bucket_is_money_not_days():
+    from client.webui.writer import _infer_number_format
+    # 「账龄未知」是账龄分桶列,装的是**金额**;不能因含"账龄"被判成天数格式 0.0
+    assert _infer_number_format("账龄未知") != "0.0"
+    assert _infer_number_format("未到期") != "0.0"
+    # 真正的天数列仍按天数渲染
+    assert _infer_number_format("应收账龄(天)") == "0.0"
+    assert _infer_number_format("周转天数") == "0.0"
+
+
+def test_skill_note_renders_at_sheet_top():
+    import pandas as pd, openpyxl
+    from client.tools import skills
+    from client.webui import writer
+    skills._decrypt = lambda c: c.copy()
+    df = pd.DataFrame([("A", 180000, 0), ("B", 50000, 45)], columns=["客户", "应收", "账龄"])
+    s, d, c = skills.run_skill("ar_aging", df[["应收", "账龄"]].reset_index(drop=True),
+        {"amount_col": "应收", "age_col": "账龄", "group_col": "客户"},
+        df[["客户"]].to_dict("records"), ["客户"])
+    p = writer.write_skill_results(
+        [{"sheet_name": s, "df": d, "note": skills.SKILLS["ar_aging"]["note"]}],
+        stem="note_top", staging=True)
+    ws = openpyxl.load_workbook(p)[s]
+    # 口径说明必须落在表顶第 1 行(财务据此核对口径)
+    assert "口径" in str(ws.cell(1, 1).value)
