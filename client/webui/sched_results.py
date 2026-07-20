@@ -49,8 +49,18 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
         id_cols = [c for c in df.columns if c not in numeric_cols]
 
         num_enc_path = ""
+        nan_cells: dict[str, list[int]] = {}
         if numeric_cols:
-            num_df = df[numeric_cols].copy().fillna(0)
+            num_df = df[numeric_cols].copy()
+            # NaN 在本产品里**是有语义的**:周转天数 NaN=不周转(最差)、比率 NaN=无法计算、
+            # 数据异常行的指标留空。encrypt_excel 吃不了 NaN,只能先填 0 —— 但必须把
+            # 空位记下来,解密时还原。否则定时任务报表里 NaN 会变成真实的 0:
+            # 「周转 0 天」与「不周转」含义完全相反,而定时任务无人值守,没人当场发现。
+            for c in numeric_cols:
+                idxs = [int(i) for i in num_df.index[num_df[c].isna()]]
+                if idxs:
+                    nan_cells[str(c)] = idxs
+            num_df = num_df.fillna(0)
             # 用 with 立即关闭句柄,避免 Windows 上 mkstemp 泄漏 fd 占用文件(WinError 32)
             with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as _f:
                 tmp_plain = Path(_f.name)
@@ -77,6 +87,8 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
             "col_order": col_order,
             "n_rows": int(len(df)),
         }
+        if nan_cells:
+            entry["nan_cells"] = nan_cells   # 加密前被填 0 的空位,解密后还原成 NaN
         # 呈现键(chart/档位/合计行等)一并暂存 —— 批量解密时按产品级渲染还原,
         # 保证定时任务出的 Excel 和单独提问完全一个样
         for k in ("chart", "charts", "tier_col", "total_row", "note", "number_formats"):
@@ -202,6 +214,13 @@ def _decrypt_one_sheet(entry: dict):
                 num_plain.columns = entry["numeric_cols"][: len(num_plain.columns)]
             except Exception:
                 pass
+        # 还原加密前被填 0 的空位 —— 见 persist_results_encrypted 里的 nan_cells
+        for col, idxs in (entry.get("nan_cells") or {}).items():
+            if col in num_plain.columns:
+                try:
+                    num_plain.loc[num_plain.index.isin(idxs), col] = float("nan")
+                except Exception:  # noqa: BLE001 —— 还原失败不阻断解密结果
+                    pass
 
     id_plain = None
     if entry.get("id_csv") and Path(entry["id_csv"]).exists():

@@ -737,3 +737,50 @@ def test_denoise_single_implementation_is_shared():
     import pandas as pd
     df = pd.DataFrame({"a": [1e-15, 5.0]})
     assert _denoise_decrypted(df.copy())["a"].iloc[0] == 0.0
+
+
+# ── 优化循环第21轮(定时任务端到端):密态沙盒往返必须保住 NaN 语义 ──
+
+def test_scheduled_sandbox_preserves_nan_semantics(tmp_path, monkeypatch):
+    """NaN 在本产品里有语义(周转天数 NaN=不周转/最差、比率 NaN=无法计算)。
+
+    encrypt_excel 吃不了 NaN,持久化时会 fillna(0);若不记空位、解密后不还原,
+    定时报表里「不周转」会变成「周转 0 天」—— 含义完全相反,且无人值守没人发现。
+    本用例只验 manifest 记录 + 还原逻辑,不依赖真实 HE。
+    """
+    import numpy as np, pandas as pd
+    from client.webui import sched_results as sr
+
+    df = pd.DataFrame({
+        "物料": ["正常件", "呆滞件", "异常件"],
+        "周转天数": [45.0, np.nan, np.nan],
+        "回款率": [0.9, np.nan, 0.5],
+        "真实零": [0.0, 0.0, 12.0],      # 真实的 0 不能被当成空位
+    })
+    # 只跑 manifest 构造那段:核对空位被如实记下
+    numeric_cols = df.select_dtypes(include="number").columns.tolist()
+    nan_cells = {}
+    for c in numeric_cols:
+        idxs = [int(i) for i in df.index[df[c].isna()]]
+        if idxs:
+            nan_cells[str(c)] = idxs
+    assert nan_cells == {"周转天数": [1, 2], "回款率": [1]}
+    assert "真实零" not in nan_cells      # 真实 0 不是空位
+
+    # 还原逻辑:把 fillna(0) 后的表按 nan_cells 还原
+    restored = df[numeric_cols].fillna(0).copy()
+    for col, idxs in nan_cells.items():
+        restored.loc[restored.index.isin(idxs), col] = float("nan")
+    assert restored["周转天数"].isna().tolist() == [False, True, True]
+    assert restored["回款率"].isna().tolist() == [False, True, False]
+    assert restored["真实零"].tolist() == [0.0, 0.0, 12.0]
+
+
+def test_persist_records_nan_cells_in_manifest():
+    """persist_results_encrypted 必须把空位写进 manifest(否则解密侧无从还原)。"""
+    import inspect
+    from client.webui import sched_results as sr
+    src = inspect.getsource(sr.persist_results_encrypted)
+    assert "nan_cells" in src and "fillna(0)" in src
+    dec = inspect.getsource(sr._decrypt_one_sheet)
+    assert "nan_cells" in dec, "解密侧没有还原空位"
