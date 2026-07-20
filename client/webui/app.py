@@ -803,12 +803,17 @@ def _smart_read(path: Path, suffix: str):
     header_row = 0
     if _is_bad(df):
         raw = pd.read_excel(path, sheet_name=best_name, header=None)
+        # 取前 10 行里**最像表头**的那行(字符串单元格最多),而不是"第一个凑够 2 个字符串"的。
+        # 两级表头(第一行是跨列合并的年份,合并后只剩 2 个非空)会骗过"≥2 就取"的判据 →
+        # 选中大标题行当表头,真表头行沦为数据行、列名变成 Unnamed:N,LLM 拿到一堆无意义字段。
+        # (CSV 分支本来就是按最多字符串挑的,这里对齐同一套判据。)
+        best_i, best_n = 0, -1
         for i in range(min(10, len(raw))):
             r = raw.iloc[i].tolist()
             s = sum(1 for v in r if isinstance(v, str) and v.strip())
-            if s >= 2:
-                header_row = i
-                break
+            if s >= 2 and s > best_n:
+                best_i, best_n = i, s
+        header_row = best_i
         if header_row > 0:
             df = pd.read_excel(path, sheet_name=best_name, header=header_row)
     return df, str(best_name), header_row, dropped

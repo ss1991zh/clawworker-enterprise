@@ -439,3 +439,39 @@ def test_skill_note_renders_at_sheet_top():
     ws = openpyxl.load_workbook(p)[s]
     # 口径说明必须落在表顶第 1 行(财务据此核对口径)
     assert "口径" in str(ws.cell(1, 1).value)
+
+
+# ── 优化循环第14轮(补货:摄取边界)两级表头不再选错表头行 ──
+
+def test_two_level_merged_header_picks_real_header_row(tmp_path):
+    import importlib, openpyxl
+    app_mod = importlib.import_module("client.webui.app")
+    # 第1行是跨列合并的年份(合并后只剩2个非空),第2行才是真表头。
+    # 旧实现「前10行第一个含≥2字符串的行」会选中年份行 → 列名变 Unnamed:N、真表头沦为数据行。
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.append([None, "2024年", None, "2025年", None])
+    ws.append(["大区", "收入", "成本", "收入", "成本"])
+    ws.append(["华东", 100, 60, 120, 70])
+    ws.merge_cells("B1:C1"); ws.merge_cells("D1:E1")
+    p = tmp_path / "twolevel.xlsx"; wb.save(p)
+
+    df, sheet, header_row, dropped = app_mod._smart_read(p, ".xlsx")
+    cols = [str(c) for c in df.columns]
+    assert header_row == 1, f"应选第2行作表头,实际 header_row={header_row}"
+    assert not any(c.startswith("Unnamed:") for c in cols), f"仍有 Unnamed 列: {cols}"
+    assert "大区" in cols and "收入" in cols
+    # 真表头行不能再作为数据行留在表里
+    assert "大区" not in df.iloc[:, 0].astype(str).tolist()
+
+
+def test_single_title_row_still_detected(tmp_path):
+    import importlib, openpyxl
+    app_mod = importlib.import_module("client.webui.app")
+    # 单个大标题行(只有1个非空)的老行为不能被破坏
+    wb = openpyxl.Workbook(); ws = wb.active
+    ws.append(["2024年度报表", None, None])
+    ws.append(["大区", "金额", "成本"])
+    ws.append(["华东", 100, 60])
+    p = tmp_path / "title.xlsx"; wb.save(p)
+    df, sheet, header_row, dropped = app_mod._smart_read(p, ".xlsx")
+    assert [str(c) for c in df.columns] == ["大区", "金额", "成本"]
