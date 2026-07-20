@@ -784,3 +784,61 @@ def test_persist_records_nan_cells_in_manifest():
     assert "nan_cells" in src and "fillna(0)" in src
     dec = inspect.getsource(sr._decrypt_one_sheet)
     assert "nan_cells" in dec, "解密侧没有还原空位"
+
+
+# ── 优化循环第23轮(规模端到端):分页对齐实体块 + 密文截断标注 ──
+
+def test_chart_pagination_aligns_to_entity_blocks_at_scale():
+    """200 实体 × 12 期:分页拆图不得把某个实体的时间序列拦腰切到两张图。"""
+    import re
+    import numpy as np, pandas as pd, openpyxl
+    from client.webui import writer
+    rows = [(f"门店{i:03d}", f"{m}月", 1000 + i * 12 + m)
+            for i in range(200) for m in range(1, 13)]
+    df = pd.DataFrame(rows, columns=["门店", "月份", "销售额"])
+    p = writer.write_skill_results(
+        [{"sheet_name": "S", "df": df,
+          "chart": {"type": "line", "x": "月份", "y": "销售额", "title": "月度"}}],
+        stem="scale_align_t", staging=True)
+    ws = openpyxl.load_workbook(p)["S"]
+    lens = []
+    for ch in ws._charts:
+        m = re.search(r"\$(\d+):\$?\w*\$?(\d+)", ch.series[0].val.numRef.f)
+        if m:
+            lens.append(int(m.group(2)) - int(m.group(1)) + 1)
+    assert lens, "没有生成图表"
+    # 每页行数必须是实体块大小(12 期)的整数倍 → 不劈开任何门店
+    assert all(L % 12 == 0 for L in lens), f"分页切断了实体块: {lens}"
+
+
+def test_plaintext_never_truncated(monkeypatch):
+    """明文版必须保留全量行(截断只发生在密文版)。"""
+    import pandas as pd, numpy as np, openpyxl
+    from client.webui import writer
+    monkeypatch.setattr(writer, "_ENC_ROW_LIMIT", 20)
+    df = pd.DataFrame({"实体": [f"E{i}" for i in range(50)],
+                       "金额": np.arange(50, dtype=float) * 100})
+    pp = writer.write_skill_results([{"sheet_name": "T", "df": df}], stem="tr_p_t", staging=True)
+    assert openpyxl.load_workbook(pp)["T"].max_row >= 51   # 表头 + 50 行
+
+
+@pytest.mark.real_backend
+def test_cipher_truncation_is_annotated(monkeypatch):
+    """密文版超行数上限要截断并**在表顶标注**(需真实 HE:密文导出要加密数值列)。"""
+    import os, pathlib as _pl
+    import pandas as pd, numpy as np, openpyxl
+    if os.environ.get("AGENT_BACKEND", "stub").lower() != "real":
+        pytest.skip("需 AGENT_BACKEND=real(密文导出要真实加密)")
+    from client.webui import writer
+    monkeypatch.setattr(writer, "_ENC_ROW_LIMIT", 20)
+    df = pd.DataFrame({"实体": [f"E{i}" for i in range(50)],
+                       "金额": np.arange(50, dtype=float) * 100})
+    d = _pl.Path(os.path.expanduser("~/.agent-system/ciphertexts"))
+    cand = sorted(d.glob("*_enc.xlsx")) if d.is_dir() else []
+    if not cand:
+        pytest.skip("本机无密文样本")
+    cp = writer.export_skill_results_encrypted(
+        [{"sheet_name": "T", "df": df}], cand[0], stem="tr_c_t", staging=True)
+    cw = openpyxl.load_workbook(cp)["T"]
+    text = " ".join(str(c.value) for r in cw.iter_rows() for c in r if c.value)
+    assert "截断" in text, "密文版截断了却没有标注"
