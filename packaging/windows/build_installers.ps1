@@ -1,4 +1,4 @@
-<#
+﻿<#
   把项目打成两个 Windows 安装包(管理端 + 用户端 Setup.exe)。
   在 Windows 上运行,前置:已装 Inno Setup 6+(https://jrsoftware.org/isdl.php)。
 

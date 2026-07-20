@@ -15,7 +15,9 @@
   #define RoleArg "client"
 #endif
 
-#define AppVersion "1.0"
+; 1.1:SPKI 公钥指纹信任(换网重签不再误报中间人)、登录页扫描内网、
+;      supervisor 角色接管(修点管理端图标无反应)、20+ 项口径/安全修复
+#define AppVersion "1.1"
 #define Pub "Clawworker"
 
 [Setup]
@@ -86,15 +88,27 @@ Filename: "certutil.exe"; Parameters: "-user -delstore Root ""Clawworker Enterpr
 Type: filesandordirs; Name: "{app}\.venv"
 
 [Code]
-{ 覆盖安装:先停掉安装目录下正在运行的服务进程(python/pythonw),避免文件被锁导致复制失败 }
+// 覆盖安装:先停掉与本安装目录相关的服务进程,否则文件被锁 → 复制失败/残留旧文件。
+// 注意:此处只能用 // 注释 —— Pascal 的花括号注释会被安装目录常量里的右花括号提前闭合。
+//
+// 两点讲究:
+// 1) 不能只按「可执行文件在安装目录下」匹配 —— 服务可能是用**别的 Python**(如系统
+//    Python311)启动的,其 exe 路径在安装目录之外,但它加载了安装目录下的 HE DLL,
+//    照样锁着文件。故同时按**命令行**是否引用安装目录来匹配。
+// 2) supervisor 会自动重拉子进程 —— 杀一遍可能被它救活,故连杀两轮。
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   R: Integer;
+  AppDir: String;
 begin
+  AppDir := ExpandConstant('{app}');
   Exec('powershell.exe',
-    '-NoProfile -Command "Get-Process python,pythonw -ErrorAction SilentlyContinue | ' +
-    'Where-Object { $_.Path -like ''' + ExpandConstant('{app}') + '\*'' } | ' +
-    'Stop-Process -Force -ErrorAction SilentlyContinue"',
+    '-NoProfile -Command "$p=''' + AppDir + '''; 1..2 | ForEach-Object { ' +
+    'Get-CimInstance Win32_Process | Where-Object { ' +
+    '($_.Name -eq ''python.exe'' -or $_.Name -eq ''pythonw.exe'') -and ' +
+    '($_.ExecutablePath -like ($p+''*'') -or $_.CommandLine -like (''*''+$p+''*'')) } | ' +
+    'ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; ' +
+    'Start-Sleep -Milliseconds 700 }"',
     '', SW_HIDE, ewWaitUntilTerminated, R);
   Result := '';
 end;
