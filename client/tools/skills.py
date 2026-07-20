@@ -1131,18 +1131,27 @@ def skill_pivot_summary(cdf, params, metadata_rows, metadata_columns):
         if c not in full.columns:
             raise ValueError(f"pivot_summary: 列「{c}」不存在")
 
+    # 缺失组合(该大区没卖该产品线)只在**加性**口径下才等于 0;mean/min/max 填 0 是造数
+    # ——会让"没有数据"显示成"均价 0 / 最低 0",财务会读成真卖了 0 元。非加性一律留空。
+    additive = agg in ("sum", "count", "size")
     piv = full.pivot_table(
         index=row_col, columns=col_col, values=value_col,
-        aggfunc=agg, observed=False, fill_value=0,
+        aggfunc=agg, observed=False, fill_value=(0 if additive else None),
     )
     piv = piv.reset_index()
-    # 行合计
     num_cols = [c for c in piv.columns if c != row_col]
     if col_col and num_cols:
-        piv["合计"] = piv[num_cols].sum(axis=1)
+        # 合计列必须与聚合口径一致:sum→求和、mean→总体均值、min/max→总体极值。
+        # **绝不能把各列的均值/极值再相加**(各列均值之和 > 任何单列均值,是无意义的数)。
+        # 直接对原始行按同一 agg 重算。
+        total_label = {"sum": "合计", "count": "合计", "size": "合计",
+                       "mean": "总体均值", "min": "总体最小", "max": "总体最大"}.get(agg, "合计")
+        piv[total_label] = piv[row_col].map(full.groupby(row_col)[value_col].agg(agg))
+    else:
+        total_label = None
 
     sheet = params.get("sheet_name") or f"{row_col}×{col_col or value_col}透视"
-    ycol = "合计" if "合计" in piv.columns else (num_cols[0] if num_cols else None)
+    ycol = total_label if (total_label and total_label in piv.columns) else (num_cols[0] if num_cols else None)
     chart = ({"type": "bar", "x": row_col, "y": ycol, "title": sheet} if ycol else None)
     return str(sheet)[:31], piv, chart
 

@@ -308,3 +308,50 @@ def test_single_row_true_decimal_ratio_still_percent():
     if not isinstance(c.value, (int, float)):
         c = ws.cell(3, 2)
     assert c.number_format == "0.00%" and abs(c.value - 1.6) < 1e-9
+
+
+# ── 优化循环第11轮(补货P3场景评审):透视表非加性聚合口径 ──
+
+def _pivot_frames():
+    import pandas as pd
+    from client.tools import skills
+    skills._decrypt = lambda cdf: cdf.copy()
+    rows = [("华东", "伺服", 300000), ("华东", "伺服", 200000), ("华东", "传感", 120000),
+            ("华北", "传感", 160000), ("华北", "电源", 140000)]   # 华东无电源/华北无伺服
+    df = pd.DataFrame(rows, columns=["大区", "产品线", "销售额"])
+    return skills, df[["销售额"]].reset_index(drop=True), df[["大区", "产品线"]].to_dict("records"), df
+
+
+def test_pivot_mean_total_is_overall_mean_not_sum_of_means():
+    skills, cdf, meta, df = _pivot_frames()
+    _, d, _ = skills.run_skill("pivot_summary", cdf,
+        {"row_col": "大区", "col_col": "产品线", "value_col": "销售额", "agg": "mean"},
+        meta, ["大区", "产品线"])
+    # 合计列改名「总体均值」,且=原始行整体均值(不是各列均值相加)
+    assert "总体均值" in d.columns and "合计" not in d.columns
+    east = d[d["大区"] == "华东"]["总体均值"].iloc[0]
+    assert abs(east - (300000 + 200000 + 120000) / 3) < 1e-6
+    # 各列均值之和(370000)是错的,必须不等于它
+    assert abs(east - 370000) > 1
+
+
+def test_pivot_nonadditive_missing_combo_blank_not_zero():
+    import pandas as pd
+    skills, cdf, meta, df = _pivot_frames()
+    _, d, _ = skills.run_skill("pivot_summary", cdf,
+        {"row_col": "大区", "col_col": "产品线", "value_col": "销售额", "agg": "min"},
+        meta, ["大区", "产品线"])
+    # 华东没有「电源」→ 留空,不能填 0(会被读成"最低卖了0元")
+    assert pd.isna(d[d["大区"] == "华东"]["电源"].iloc[0])
+    # 总体最小 = 该大区所有行的最小值
+    assert d[d["大区"] == "华东"]["总体最小"].iloc[0] == 120000
+
+
+def test_pivot_sum_unchanged_zero_fill_and_total():
+    skills, cdf, meta, df = _pivot_frames()
+    _, d, _ = skills.run_skill("pivot_summary", cdf,
+        {"row_col": "大区", "col_col": "产品线", "value_col": "销售额", "agg": "sum"},
+        meta, ["大区", "产品线"])
+    # 加性口径:缺失=0 合理,合计仍是求和
+    assert d[d["大区"] == "华东"]["电源"].iloc[0] == 0
+    assert d[d["大区"] == "华东"]["合计"].iloc[0] == 620000
