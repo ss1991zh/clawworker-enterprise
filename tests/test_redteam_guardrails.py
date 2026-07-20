@@ -267,3 +267,13 @@ def test_skill_prompt_forbids_string_match_on_encrypted_numeric():
     sp = pathlib.Path(__file__).resolve().parents[1] / "docs" / "llm_system_prompt.md"
     text = sp.read_text(encoding="utf-8")
     assert "数值范围" in text and "模糊匹配" in text
+
+
+# ── 优化循环 T1-2:降序表负值/异常不置顶(亏损行曾坐降序表首行) ──
+
+def test_codegen_prompt_forbids_hoisting_negatives_to_top():
+    from client.webui.codegen import CODEGEN_SYSTEM
+    # 要点:NaN 沉底(na_position=last)、禁止 na_position=first、禁止把异常行拼到表头
+    assert 'na_position="last"' in CODEGEN_SYSTEM
+    assert 'na_position="first"' in CODEGEN_SYSTEM   # 以「禁止」形式出现
+    assert "置顶" in CODEGEN_SYSTEM and "误导" in CODEGEN_SYSTEM
