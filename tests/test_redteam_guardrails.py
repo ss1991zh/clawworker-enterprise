@@ -571,3 +571,56 @@ def test_audit_chain_survives_concurrent_appends(tmp_path, monkeypatch):
     [t.join() for t in ths]
     r = audit.verify_chain("u")
     assert r["ok"] is True and r["total"] == 100
+
+
+# ── 优化循环第17轮(补货:并发与取消)取消状态不再留孤儿条目 ──
+
+class _FakeMsg:
+    def __init__(self, mid, status):
+        self.id, self.status = mid, status
+
+
+class _FakeSess:
+    def __init__(self, msgs):
+        self.messages = msgs
+
+
+def test_cancel_on_finished_message_is_noop(monkeypatch):
+    import importlib
+    app_mod = importlib.import_module("client.webui.app")
+    msgs = [_FakeMsg(f"m{i}", st) for i, st in enumerate(
+        ["done", "failed", "cancelled", "decrypted", "needs_cipher", "skipped"])]
+    monkeypatch.setattr(app_mod, "_sess_for_user", lambda sid: _FakeSess(msgs))
+    monkeypatch.setattr(app_mod, "_is_logged_in", lambda: True)
+    app_mod._cancelled_msgs.clear(); app_mod._decrypt_decisions.clear()
+    for m in msgs:
+        assert app_mod.api_messages_cancel("s", m.id).get("noop") is True
+    # 终态消息不登记取消状态 —— 否则没有 pipeline 线程会来回收,长跑进程里只增不减
+    assert len(app_mod._cancelled_msgs) == 0
+    assert len(app_mod._decrypt_decisions) == 0
+
+
+def test_cancel_on_running_message_is_recorded(monkeypatch):
+    import importlib
+    app_mod = importlib.import_module("client.webui.app")
+    monkeypatch.setattr(app_mod, "_sess_for_user",
+                        lambda sid: _FakeSess([_FakeMsg("r1", "running")]))
+    monkeypatch.setattr(app_mod, "_is_logged_in", lambda: True)
+    app_mod._cancelled_msgs.clear(); app_mod._decrypt_decisions.clear()
+    try:
+        r = app_mod.api_messages_cancel("s", "r1")
+        assert not r.get("noop")
+        assert "r1" in app_mod._cancelled_msgs and "r1" in app_mod._decrypt_decisions
+    finally:
+        app_mod._cancelled_msgs.clear(); app_mod._decrypt_decisions.clear()
+
+
+def test_pipeline_finally_clears_decrypt_decision_too():
+    import inspect, importlib
+    app_mod = importlib.import_module("client.webui.app")
+    src = inspect.getsource(app_mod._run_pipeline)
+    # 取消一个正在跑的分析时 cancel 端点会写 _decrypt_decisions;
+    # 若 pipeline 在走到解密门前就退出,必须由 finally 兜底清掉
+    tail = src[src.rindex("finally:"):]
+    assert "_cancelled_msgs.discard" in tail
+    assert "_decrypt_decisions.pop" in tail

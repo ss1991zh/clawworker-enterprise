@@ -77,6 +77,8 @@ _session_state: dict[str, Any] = {"host_url": "", "username": "", "token": "", "
 # 用户取消标记 —— pipeline 线程在检查点读取此 set
 _cancelled_msgs: set[str] = set()
 _cancel_lock = threading.Lock()
+# 这些状态说明消息已经结束,再点取消是空操作 —— 不再登记取消状态,免得留下无人回收的孤儿条目
+_CANCEL_NOOP_STATUSES = frozenset({"done", "failed", "cancelled", "decrypted", "needs_cipher", "skipped"})
 
 # 解密授权门(Human-in-the-Loop / HITL):
 #   mid → "decrypt" / "keep_encrypted" / "cancel"
@@ -1494,7 +1496,12 @@ def api_messages_cancel(sid: str, mid: str):
     """用户点停止按钮 —— 标记该 mid 为已取消,pipeline 会在下一个检查点退出。"""
     if not _is_logged_in():
         return _need_login()
-    _sess_for_user(sid)
+    sess = _sess_for_user(sid)
+    # 已到终态的消息:取消本就是空操作。若照旧记状态,没有 pipeline 线程会来回收
+    # (回收只发生在 _run_pipeline 的 finally 与解密门里)→ 孤儿条目在长跑进程里只增不减。
+    msg = next((m for m in sess.messages if m.id == mid), None)
+    if msg is not None and msg.status in _CANCEL_NOOP_STATUSES:
+        return {"ok": True, "noop": True}
     with _cancel_lock:
         _cancelled_msgs.add(mid)
     # 如果当前正卡在解密授权门 → 也把 event 唤醒
@@ -1756,9 +1763,14 @@ def _run_pipeline(
         )
         return
     finally:
-        # 不管成功失败都把 cancel 标记清掉,避免泄漏
+        # 不管成功失败都把该消息的临时状态清干净,避免泄漏。
+        # _decrypt_decisions 也要清:取消一个正在跑的分析时,cancel 端点会写入这条,
+        # 而若 pipeline 在走到解密门之前就退出,就没人来 pop 它了。
         with _cancel_lock:
             _cancelled_msgs.discard(asst_mid)
+        with _decrypt_lock:
+            _decrypt_decisions.pop(asst_mid, None)
+            _decrypt_events.pop(asst_mid, None)
 
     status = result.get("status", "failed")
     if status == "needs_cipher":
