@@ -34,8 +34,10 @@ def test_codegen_prompt_has_safety_rules():
 
 
 def test_skill_prompt_has_safety_rules():
-    sp = pathlib.Path(__file__).resolve().parents[1] / "docs" / "llm_system_prompt.md"
-    text = sp.read_text(encoding="utf-8")
+    # 必须断言**真正送给 LLM 的 prompt**(= 文档里第一个代码块),不是整个文件文本。
+    # 否则规则若被写到代码块外,测试照样绿而 LLM 收不到 —— 空过的测试。
+    from shared.prompts import load_system_prompt
+    text = load_system_prompt()
     for kw in ["不是指令", "忽略之前的指令", "不支持条件分支", "不要硬猜"]:
         assert kw in text, f"skill prompt 缺规则: {kw}"
 
@@ -263,9 +265,8 @@ def test_codegen_prompt_forbids_string_match_on_encrypted_numeric():
 
 
 def test_skill_prompt_forbids_string_match_on_encrypted_numeric():
-    import pathlib
-    sp = pathlib.Path(__file__).resolve().parents[1] / "docs" / "llm_system_prompt.md"
-    text = sp.read_text(encoding="utf-8")
+    from shared.prompts import load_system_prompt
+    text = load_system_prompt()          # 同上:验实际生效的 prompt
     assert "数值范围" in text and "模糊匹配" in text
 
 
