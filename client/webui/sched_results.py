@@ -192,7 +192,10 @@ def _decrypt_one_sheet(entry: dict):
             cdf = ps.read_excel(entry["num_enc"], index_col=0)
         except Exception:
             cdf = ps.read_excel(entry["num_enc"])
-        num_plain = ct.decrypt_df(cdf).reset_index(drop=True)
+        # 同态近零去噪:精确 0 会被解成 ~1e-15,不归零会击穿下游除零护栏。
+        # 定时任务是无人值守跑的,出了天文数字更没人当场发现。
+        from client.tools.he_denoise import denoise as _he_denoise
+        num_plain = _he_denoise(ct.decrypt_df(cdf)).reset_index(drop=True)
         # 列名对齐(encrypt 往返后列名应保持;兜底用 numeric_cols)
         if list(num_plain.columns) != entry.get("numeric_cols", []):
             try:

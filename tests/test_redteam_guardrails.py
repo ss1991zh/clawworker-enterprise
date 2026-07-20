@@ -668,3 +668,71 @@ def test_true_decimal_ratio_with_zero_unaffected():
     if not isinstance(c.value, (int, float)):
         c = ws.cell(3, 2)
     assert c.number_format == "0.00%"   # 真小数不受影响
+
+
+# ── 优化循环第19轮:同态去噪的**路径覆盖守门** ──
+# 背景:去噪最早只加在 skills._decrypt(第6轮),后来发现 codegen 沙盒(第18轮)、
+# 定时任务批量解密(第19轮)各有独立解密出口,补了三轮。本用例锁住"不再漏"。
+
+# 允许不去噪的解密点,每条必须写明理由。新增解密出口若无正当理由,本测试会失败。
+_DECRYPT_ALLOWLIST = {
+    # 解的是归一化后的回归输出,随后要反归一化;不是"本应为0的值",下游也无除法。
+    ("client/tools/skills.py", "ct.decrypt(pred_cipher)"),
+    # 整文件解密(密文文件→明文文件),不经过 DataFrame 数值路径。
+    ("client/tools/crypto.py", "ct.decrypt_excel(str(src), str(dst))"),
+    ("client/tools/crypto.py", "ct.decrypt_csv(str(src), str(dst))"),
+    ("client/tools/crypto.py", "ct.decrypt_json(str(src), str(dst))"),
+}
+
+# 这些模块的解密由更外层的公共出口统一去噪,内部实现行不必各自再套。
+_DENOISED_AT_ENTRY = {
+    # crypto.py 的私有 _real_decrypt/_stub_decrypt 全部经 CryptoToolkit.decrypt() 收口去噪
+    "client/tools/crypto.py",
+    # 沙盒解密统一经 _gated_decrypt → _denoise_decrypted 收口
+    "client/webui/codegen.py",
+}
+
+_STR_LIT = __import__("re").compile(r'"[^"]*"|\'[^\']*\'')
+
+
+def test_all_production_decrypt_paths_are_denoised():
+    """生产代码里每个 ct.decrypt* 出口,要么去噪,要么在允许清单里带理由豁免。"""
+    import pathlib, re
+    root = pathlib.Path(__file__).resolve().parents[1]
+    # he_ops/parity_* 是对拍/基准工具,不产出用户报表,不在范围内
+    targets = [p for p in (root / "client").rglob("*.py")
+               if "__pycache__" not in str(p) and "/parity" not in p.as_posix()
+               and not p.name.startswith("parity")]
+    pat = re.compile(r"\bct\.decrypt\w*\(")
+    offenders = []
+    for p in targets:
+        rel = p.relative_to(root).as_posix()
+        if rel in _DENOISED_AT_ENTRY:
+            continue
+        for i, line in enumerate(p.read_text(encoding="utf-8").splitlines(), 1):
+            s = line.strip()
+            if s.startswith("#"):
+                continue
+            # 剥掉字符串字面量再匹配 —— 否则给 LLM 的报错提示文案里的
+            # "先 df = ct.decrypt_df(cdf)" 会被误判成真实调用
+            if not pat.search(_STR_LIT.sub("", s)):
+                continue
+            if any(rel == a and frag in s for a, frag in _DECRYPT_ALLOWLIST):
+                continue
+            if "denoise" in s:      # 同一行已套去噪
+                continue
+            offenders.append(f"{rel}:{i}: {s}")
+    assert not offenders, (
+        "以下解密出口没有去噪(同态会把精确0解成1e-15,击穿除零护栏):\n  "
+        + "\n  ".join(offenders))
+
+
+def test_denoise_single_implementation_is_shared():
+    # 三条路径必须共用同一份实现,避免各写一份再各自漂移
+    from client.tools.he_denoise import denoise, HE_ZERO_EPS
+    from client.tools.skills import _denoise_he, _HE_ZERO_EPS
+    from client.webui.codegen import _denoise_decrypted
+    assert _denoise_he is denoise and _HE_ZERO_EPS == HE_ZERO_EPS
+    import pandas as pd
+    df = pd.DataFrame({"a": [1e-15, 5.0]})
+    assert _denoise_decrypted(df.copy())["a"].iloc[0] == 0.0

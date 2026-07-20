@@ -585,21 +585,8 @@ def _denoise_decrypted(obj):
     (`replace(0, nan)` / `np.where(x > 0, ...)`)统统失效 —— 1e-15 既不等于 0、
     又大于 0,比率会炸成 -5e19 这种天文数字并混进排名表。
     """
-    try:
-        import numpy as np
-        import pandas as pd
-        from client.tools.skills import _HE_ZERO_EPS, _denoise_he
-        if isinstance(obj, pd.DataFrame):
-            return _denoise_he(obj)
-        if isinstance(obj, pd.Series):
-            if pd.api.types.is_numeric_dtype(obj):
-                return obj.mask(obj.abs() < _HE_ZERO_EPS, 0.0)
-            return obj
-        if isinstance(obj, np.ndarray) and obj.dtype.kind == "f":
-            return np.where(np.abs(obj) < _HE_ZERO_EPS, 0.0, obj)
-    except Exception:  # noqa: BLE001 —— 去噪失败不能吞掉解密结果
-        pass
-    return obj
+    from client.tools.he_denoise import denoise
+    return denoise(obj)
 
 
 def _gated_decrypt(real_ct, name, args, kwargs, original_cdf=None, meta_df=None):

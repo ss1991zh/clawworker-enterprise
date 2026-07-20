@@ -91,20 +91,9 @@ def _merge_meta(decrypted_df, metadata_rows, metadata_columns):
     return decrypted_df.reset_index(drop=True)
 
 
-_HE_ZERO_EPS = 1e-6   # 同态噪声吸附阈值:|x|<该值视作 0(业务金额/计数/得分无这么小的真值)
-
-
-def _denoise_he(df):
-    """同态解密的数值列去噪:精确 0 会被 HE 解成 ~1e-15,非零值带 ~1e-13 抖动。
-    近零噪声若不归零,会击穿下游 `replace(0, NaN)` 除零护栏(零分母→1e-15→比率炸成
-    天文数字),也让本应是 0 的单元格显示成 1e-15。统一在解密边界把近零吸附回 0。"""
-    try:
-        num = df.select_dtypes(include="number")
-        if not num.empty:
-            df[num.columns] = num.mask(num.abs() < _HE_ZERO_EPS, 0.0)
-    except Exception:  # noqa: BLE001 —— 去噪失败不阻断解密结果
-        pass
-    return df
+# 同态去噪的唯一实现在 client.tools.he_denoise;此处保留旧名做向后兼容。
+from client.tools.he_denoise import HE_ZERO_EPS as _HE_ZERO_EPS  # noqa: E402
+from client.tools.he_denoise import denoise as _denoise_he  # noqa: E402
 
 
 def _decrypt(cdf):

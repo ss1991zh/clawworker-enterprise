@@ -220,9 +220,12 @@ class CryptoToolkit:
 
     # ----- 解密 -----
     def decrypt(self, ciphertext: Any) -> Any:
+        # 统一吸附同态近零噪声(精确 0 会被解成 ~1e-15,不归零会击穿下游除零护栏)。
+        # 这是工具层的公共解密出口,后续新代码走这里就自动带上,不必再各自打补丁。
+        from client.tools.he_denoise import denoise
         if self._is_real():
-            return _real_decrypt(ciphertext)
-        return _stub_decrypt(ciphertext)
+            return denoise(_real_decrypt(ciphertext))
+        return denoise(_stub_decrypt(ciphertext))
 
     def decrypt_file(self, src: Path, dst: Path) -> Path:
         if self._is_real():
