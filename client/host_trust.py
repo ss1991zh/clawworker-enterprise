@@ -21,6 +21,38 @@ from urllib.parse import urlparse, urlunparse
 _PIN_DIR = Path(os.path.expanduser("~/.agent-system/host-trust"))
 
 
+def _spki_of_pem(pem: bytes) -> Optional[str]:
+    """证书里**公钥**(SubjectPublicKeyInfo)的 SHA-256 指纹。
+
+    主机换网络后本机 IP 变,证书 SAN 要更新 → 必须重签,整证书指纹随之改变。
+    但主机重签时复用私钥,**公钥不变** —— 以 SPKI 判断"还是不是原来那台主机",
+    可以在合法重签时不误报中间人(否则演示途中换个 WiFi 就被红屏拦住)。
+    """
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import serialization
+        cert = x509.load_pem_x509_certificate(pem)
+        der = cert.public_key().public_bytes(
+            serialization.Encoding.DER,
+            serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
+    except Exception:  # noqa: BLE001 —— 解析不了就当拿不到 SPKI,由调用方按"变了"处理
+        return None
+
+
+def pinned_spki(host_url: str) -> Optional[str]:
+    p = _pin_file(host_url)
+    return _spki_of_pem(p.read_bytes()) if p.exists() else None
+
+
+def server_spki(host_url: str) -> Optional[str]:
+    try:
+        return _spki_of_pem(fetch_server_cert_pem(host_url))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 class HostCertChanged(Exception):
     """主机证书与已锁定的不一致(疑似轮换或中间人)——需人工核对后 repin。"""
     def __init__(self, host_url: str, pinned_fp: str, seen_fp: str):
@@ -101,11 +133,44 @@ def verify_for(host_url: str) -> str:
     return str(p)
 
 
+def heal_if_same_host(host_url: str) -> bool:
+    """TLS 校验失败时的自愈:若主机**公钥没变**(只是换网重签),续锁新证书并返回 True。
+
+    返回 True 表示"确认还是原来那台主机,已续锁,可以重试";
+    返回 False 表示公钥变了/拿不到 —— 交给上层按"疑似中间人"提示人工核对。
+    """
+    p_spki = pinned_spki(host_url)
+    if not p_spki:
+        return False
+    if server_spki(host_url) != p_spki:
+        return False
+    try:
+        _pin_file(host_url).write_bytes(fetch_server_cert_pem(host_url))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def check_cert_unchanged(host_url: str) -> None:
-    """主动核对主机当前证书是否与锁定一致;变了则抛 HostCertChanged。"""
+    """主动核对主机身份是否与锁定一致;换了主机才抛 HostCertChanged。
+
+    判据是**公钥(SPKI)**而不是整张证书:主机换网络后 IP 变、SAN 要更新 → 合法重签,
+    整证书指纹必变但公钥不变。此时自动把 pin 更新成新证书(身份没变,只是换了张皮),
+    不打断使用;只有**公钥也变了**才说明换了主机/有人中间人,才拦截并要人工核对。
+    """
     pinned = pinned_fingerprint(host_url)
     if pinned is None:
         return
     seen = server_fingerprint(host_url)
-    if seen and seen != pinned:
-        raise HostCertChanged(host_url, pinned, seen)
+    if not seen or seen == pinned:
+        return
+
+    p_spki, s_spki = pinned_spki(host_url), server_spki(host_url)
+    if p_spki and s_spki and p_spki == s_spki:
+        # 同一把私钥签出来的新证书 —— 合法重签,静默续锁
+        try:
+            _pin_file(host_url).write_bytes(fetch_server_cert_pem(host_url))
+        except Exception:  # noqa: BLE001 —— 刷新失败不升级为"疑似中间人"
+            pass
+        return
+    raise HostCertChanged(host_url, pinned, seen)

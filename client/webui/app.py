@@ -393,15 +393,27 @@ def login_submit(
             trust_env=False,
         )
     except (httpx.ConnectError, ssl.SSLError) as e:
-        # 证书校验失败 = 主机证书变了(重装/中间人)→ 给出双指纹,指向"重新信任"
-        seen = host_trust.server_fingerprint(host_url) or "?"
-        pinned = host_trust.pinned_fingerprint(host_url) or "?"
-        if seen != pinned:
-            return _flash_redirect("/login", ("error",
-                f"⚠ 主机证书已变更(可能主机重装了证书,或存在中间人)。"
-                f"已锁定指纹 {pinned[:23]}…,当前 {seen[:23]}…。"
-                f"确认是主机方变更后,打开 /host-trust 核对指纹并重新信任。"))
-        return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
+        # 先自愈:主机换网络会因 SAN 要含新 IP 而重签,整证书指纹必变但**公钥不变**。
+        # 公钥一致 = 还是那台主机的合法重签 → 续锁后重试一次,别把用户拦在门外。
+        if host_trust.heal_if_same_host(host_url):
+            try:
+                r = httpx.post(
+                    f"{host_url}/auth/login",
+                    json={"username": username, "password": password},
+                    timeout=15, verify=host_trust.verify_for(host_url), trust_env=False,
+                )
+            except (httpx.ConnectError, ssl.SSLError, httpx.HTTPError) as e2:
+                return _flash_redirect("/login", ("error", f"无法连接主机:{e2}"))
+        else:
+            # 证书校验失败且公钥也变了 = 换了主机/疑似中间人 → 给出双指纹,指向"重新信任"
+            seen = host_trust.server_fingerprint(host_url) or "?"
+            pinned = host_trust.pinned_fingerprint(host_url) or "?"
+            if seen != pinned:
+                return _flash_redirect("/login", ("error",
+                    f"⚠ 主机证书已变更且公钥也变了(可能换了主机,或存在中间人)。"
+                    f"已锁定指纹 {pinned[:23]}…,当前 {seen[:23]}…。"
+                    f"确认是主机方变更后,打开 /host-trust 核对指纹并重新信任。"))
+            return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
     except httpx.HTTPError as e:
         return _flash_redirect("/login", ("error", f"无法连接主机:{e}"))
     if r.status_code != 200:

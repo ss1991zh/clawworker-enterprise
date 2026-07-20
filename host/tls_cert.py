@@ -42,6 +42,34 @@ def _local_ipv4() -> list[str]:
     return sorted(ips)
 
 
+def _load_existing_key(key_path: Path):
+    """载入已有私钥;不存在/损坏返回 None(由调用方新生成)。"""
+    if not key_path.exists():
+        return None
+    try:
+        from cryptography.hazmat.primitives import serialization
+        return serialization.load_pem_private_key(key_path.read_bytes(), password=None)
+    except Exception:  # noqa: BLE001 —— 私钥损坏 → 当作没有,重新生成
+        return None
+
+
+def spki_fingerprint(cert_pem_path: Path = CERT_FILE) -> str:
+    """**公钥**指纹:SubjectPublicKeyInfo 的 SHA-256(大写冒号十六进制)。
+
+    与整证书指纹的区别:换 SAN/有效期重签,只要私钥没换,SPKI 就不变。
+    客户端据此判断"还是原来那台主机",从而在主机换网络重签后不误报中间人。
+    """
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    cert = x509.load_pem_x509_certificate(cert_pem_path.read_bytes())
+    der = cert.public_key().public_bytes(
+        serialization.Encoding.DER,
+        serialization.PublicFormat.SubjectPublicKeyInfo,
+    )
+    import hashlib
+    return ":".join(f"{b:02X}" for b in hashlib.sha256(der).digest())
+
+
 def fingerprint(cert_pem_path: Path = CERT_FILE) -> str:
     """证书指纹:DER 的 SHA-256,大写冒号十六进制(与浏览器/openssl 一致)。"""
     from cryptography import x509
@@ -73,7 +101,13 @@ def generate(cert_dir: Path = CERT_DIR) -> tuple[Path, Path, str]:
     import datetime as _dt
 
     cert_dir.mkdir(parents=True, exist_ok=True)
-    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    # **复用已有私钥**(有就用,没有才新生成)。
+    # 换网络会让本机 IP 变 → SAN 不覆盖 → 自动重签;若每次都换新私钥,公钥指纹随之改变,
+    # 客户端锁定的 SPKI 就失效,登录被"证书已变更(疑似中间人)"拦住 —— 演示途中最致命。
+    # 复用私钥后:重签只更新 SAN/有效期,**公钥不变 → 客户端信任不断**。
+    key = _load_existing_key(cert_dir / "host_key.pem")
+    if key is None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
 
     hostname = socket.gethostname() or "clawworker-host"
     # CN 用固定可识别串(现代 TLS 主机名匹配看 SAN 不看 CN)—— 便于卸载时按名删信任库
