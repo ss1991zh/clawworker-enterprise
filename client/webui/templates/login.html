@@ -25,9 +25,12 @@
 
       <form method="post" action="/login">
         <div class="field">
-          <label>主机地址</label>
-          <input type="text" name="host_url" value="{{ default_host }}" required
+          <label>主机地址
+            <button type="button" id="scanBtn" class="scan-btn">扫描内网</button>
+          </label>
+          <input type="text" id="hostInput" name="host_url" value="{{ default_host }}" required
                  placeholder="https://127.0.0.1:8443">
+          <div id="scanOut" class="scan-out"></div>
         </div>
         <div class="field">
           <label>用户名</label>
@@ -44,5 +47,70 @@
       <p class="login-foot">凭据 8 小时有效 · 密钥永不出本机</p>
     </div>
   </div>
+
+<script>
+(function () {
+  var btn = document.getElementById("scanBtn");
+  var out = document.getElementById("scanOut");
+  var input = document.getElementById("hostInput");
+  if (!btn) return;
+
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[c];
+    });
+  }
+
+  btn.addEventListener("click", function () {
+    btn.disabled = true;
+    btn.textContent = "扫描中…";
+    out.innerHTML = '<div class="scan-tip">正在扫描本机所在网段…</div>';
+
+    fetch("/api/host/scan", {method: "POST", credentials: "same-origin"})
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        var cs = d.candidates || [];
+        if (!cs.length) {
+          var msg = d.too_large
+            ? "本机所在网段过大,未扫描。请手动填写主机地址。"
+            : "未找到主机。确认主机端已启动、与本机在同一网段(访客 WiFi 常隔离设备互访)。";
+          out.innerHTML = '<div class="scan-tip">' + esc(msg) + "</div>";
+          return;
+        }
+        // 公钥与本地已锁定一致 = 就是之前信任过的那台,可直接用(攻击者伪造不出相同公钥)
+        var known = cs.filter(function (c) { return c.known; });
+        if (known.length === 1) {
+          input.value = known[0].url;
+          out.innerHTML = '<div class="scan-ok">✓ 已找到此前信任的主机 '
+            + esc(known[0].url) + "(公钥指纹一致,已自动填入)</div>";
+          return;
+        }
+        // 其余情况一律人工选 —— 首次连接必须核对指纹,不能因为"扫到了"就信任
+        var html = '<div class="scan-tip">找到 ' + cs.length
+          + " 台候选。<b>首次连接请对照管理端显示的公钥指纹核对</b>后再选:</div>";
+        cs.forEach(function (c) {
+          html += '<div class="scan-item" data-url="' + esc(c.url) + '">'
+            + '<span class="scan-url">' + esc(c.url) + "</span>"
+            + (c.known ? '<span class="scan-badge">已信任</span>' : "")
+            + '<span class="scan-fp">' + esc(c.spki.slice(0, 29)) + "…</span></div>";
+        });
+        out.innerHTML = html;
+        Array.prototype.forEach.call(out.querySelectorAll(".scan-item"), function (el) {
+          el.addEventListener("click", function () {
+            input.value = el.getAttribute("data-url");
+            out.innerHTML = '<div class="scan-ok">已选择 ' + esc(input.value) + "</div>";
+          });
+        });
+      })
+      .catch(function (e) {
+        out.innerHTML = '<div class="scan-tip">扫描失败:' + esc(e.message || e) + "</div>";
+      })
+      .finally(function () {
+        btn.disabled = false;
+        btn.textContent = "扫描内网";
+      });
+  });
+})();
+</script>
 </body>
 </html>

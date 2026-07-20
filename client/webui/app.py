@@ -141,7 +141,9 @@ app.mount("/static", StaticFiles(directory=str(_WEBUI_DIR / "static")), name="st
 _CSRF_TOKEN = secrets.token_urlsafe(32)
 _ALLOWED_HOST_NAMES = {"127.0.0.1", "localhost", "[::1]", "::1"}
 # 表单登录/重新信任(尚无 session,可能登录被证书变更阻断)靠 Host+Origin 兜底
-_CSRF_EXEMPT_PATHS = {"/login", "/logout", "/host-trust/repin"}
+# /api/host/scan 在**登录页**上使用(此时还没有 session、页面也拿不到 CSRF token),
+# 故豁免 token;但它仍受 Host 头与 Origin 校验保护,且只读不改状态。
+_CSRF_EXEMPT_PATHS = {"/login", "/logout", "/host-trust/repin", "/api/host/scan"}
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
 
 
@@ -446,6 +448,21 @@ def api_host_trust():
     seen = host_trust.server_fingerprint(host_url)
     return {"host_url": host_url, "pinned": pinned, "server": seen,
             "match": bool(pinned and seen and pinned == seen)}
+
+
+@app.post("/api/host/scan")
+def api_host_scan():
+    """扫描内网找主机 —— 登录页用,免去手输 IP(主机 IP 会随网络变化)。
+
+    **不做信任决策**:只返回候选和各自公钥指纹(SPKI)。known=true 表示公钥与本地
+    已锁定的一致(可安全直连);首次配置时必须由人对照管理端指纹核对后再选。
+    刻意不要求登录 —— 登录页正是需要它的地方。
+    """
+    from client import host_scan
+    try:
+        return host_scan.scan()
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(500, f"扫描失败:{type(e).__name__}: {e}")
 
 
 @app.post("/api/host/repin")

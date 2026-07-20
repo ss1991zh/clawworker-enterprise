@@ -1468,3 +1468,33 @@ body.login-body {
 }
 .cw-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
+
+/* ── 登录页「扫描内网」:免手输主机 IP ── */
+.field label { display: flex; align-items: center; justify-content: space-between; }
+.scan-btn {
+  border: 1px solid var(--line, #d0d5dd); background: transparent;
+  color: var(--muted, #667085); border-radius: 6px;
+  padding: 2px 10px; font-size: 12px; cursor: pointer; line-height: 1.6;
+}
+.scan-btn:hover:not(:disabled) { border-color: #2563eb; color: #2563eb; }
+.scan-btn:disabled { opacity: .55; cursor: default; }
+.scan-out { margin-top: 6px; }
+.scan-tip, .scan-ok { font-size: 12px; line-height: 1.6; }
+.scan-tip { color: var(--muted, #667085); }
+.scan-ok { color: #067647; }
+.scan-item {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  padding: 6px 8px; margin-top: 4px; cursor: pointer;
+  border: 1px solid var(--line, #d0d5dd); border-radius: 6px; font-size: 12px;
+}
+.scan-item:hover { border-color: #2563eb; background: rgba(37, 99, 235, .04); }
+.scan-url { font-weight: 600; }
+.scan-badge {
+  background: #ecfdf3; color: #067647; border-radius: 4px;
+  padding: 1px 6px; font-size: 11px;
+}
+/* 指纹要能被逐字核对 —— 等宽字体,允许换行 */
+.scan-fp {
+  font-family: ui-monospace, Consolas, monospace; color: var(--muted, #667085);
+  font-size: 11px; word-break: break-all;
+}
