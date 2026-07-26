@@ -33,6 +33,32 @@ if (-not (Test-Path $heLibs)) {
     Write-Warning "请把 4 个 HE 库目录(crypto_toolkit-64_dev/henumpy-dev/pandaseal-dev/helearn-dev,含 win64 DLL)放进去后重跑。"
 }
 
+# 离线 wheel 包完整性硬闸:目标机用 --no-index 纯离线装,漏一个包就装不起来
+# (真实事故:漏了 cryptography → 目标机生成不了证书、服务起不来、点图标无反应)。
+# 打包前用 pip 离线解析核对一遍,缺件直接中止,绝不产出装完用不了的安装包。
+$wheels = Join-Path $Here "wheels"
+$reqs   = Join-Path $Here "requirements.txt"
+if ((Test-Path $wheels) -and (Test-Path $reqs)) {
+    $py = $null
+    foreach ($c in @("$PSScriptRoot\..\..\.venv\Scripts\python.exe", "python", "py")) {
+        if ((Test-Path $c) -or (Get-Command $c -ErrorAction SilentlyContinue)) { $py = $c; break }
+    }
+    if ($py) {
+        Write-Host "==== 校验离线 wheel 包完整性 ====" -ForegroundColor Cyan
+        $tmp = Join-Path $env:TEMP ("cw_wheelcheck_" + [Guid]::NewGuid().ToString("N"))
+        & $py -m pip install --dry-run --no-index --find-links $wheels -r $reqs --target $tmp 2>&1 | Out-Null
+        $ok = ($LASTEXITCODE -eq 0)
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        if (-not $ok) {
+            throw "离线 wheel 包无法满足 requirements.txt —— 目标机装完会缺依赖、程序起不来。" +
+                  "请先补齐缺失的 wheel(如 pip download <pkg> --dest wheels)再打包。"
+        }
+        Write-Host "wheel 包完整(可离线满足全部 requirements)。" -ForegroundColor Green
+    } else {
+        Write-Warning "未找到 python,跳过 wheel 完整性校验(强烈建议在有 python 的机器上打包)。"
+    }
+}
+
 foreach ($role in @("admin", "client")) {
     Write-Host "==== 编译 $role 安装包 ====" -ForegroundColor Cyan
     & $iscc "/DMyRole=$role" $Iss

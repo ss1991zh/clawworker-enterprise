@@ -15,9 +15,11 @@
   #define RoleArg "client"
 #endif
 
+; 1.2:修致命打包缺陷 —— 离线 wheel 包漏了 cryptography(+cffi/pycparser),
+;      导致目标机装完生成不了 TLS 证书、服务起不来、点图标无反应。已补齐并全量离线自检。
 ; 1.1:SPKI 公钥指纹信任(换网重签不再误报中间人)、登录页扫描内网、
-;      supervisor 角色接管(修点管理端图标无反应)、20+ 项口径/安全修复
-#define AppVersion "1.1"
+;      supervisor 角色接管、证书信任步骤改可见、20+ 项口径/安全修复
+#define AppVersion "1.2"
 #define Pub "Clawworker"
 
 [Setup]
