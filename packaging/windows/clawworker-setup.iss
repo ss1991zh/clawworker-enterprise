@@ -58,6 +58,7 @@ Source: "clawworker_launch.py";      DestDir: "{app}\packaging\windows"
 Source: "clawworker.ico";            DestDir: "{app}\packaging\windows"
 Source: "requirements.txt";          DestDir: "{app}\packaging\windows"
 Source: "install.ps1";               DestDir: "{app}\packaging\windows"
+Source: "trust_cert.ps1";            DestDir: "{app}\packaging\windows"
 ; ---- HE 库(含 win64 DLL,装包前放进 he_libs\)----
 ; 密钥/证书/字典类文件绝不打进安装包(skf / user_authorization / dictf / evk / sk.bin)
 Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Excludes: "skf,*user_authorization*,dictf*,evk*,sk.bin"; Flags: recursesubdirs createallsubdirs
@@ -69,12 +70,20 @@ Source: "wheels\*";                  DestDir: "{app}\packaging\windows\wheels"; 
 ; 桌面 + 开始菜单图标:启动器(无窗口的 pythonw)+ 角色参数 + 自带图标
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\windows\clawworker_launch.py"" {#RoleArg}"; WorkingDir: "{app}"; IconFilename: "{app}\packaging\windows\clawworker.ico"
 Name: "{group}\{#AppName}";       Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\windows\clawworker_launch.py"" {#RoleArg}"; WorkingDir: "{app}"; IconFilename: "{app}\packaging\windows\clawworker.ico"
+; 开始菜单里放一个「修复证书信任」—— 万一自动导入没成(用户点了否/没看到框),随时可重跑
+Name: "{group}\修复证书信任(浏览器警告)"; Filename: "powershell.exe"; Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\packaging\windows\trust_cert.ps1"""; WorkingDir: "{app}"; IconFilename: "{app}\packaging\windows\clawworker.ico"
 
 [Run]
 ; 安装后建 venv + 装依赖 + 装 HE 库(需目标机已装 Python 3.11+;不重复建快捷方式)
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\packaging\windows\install.ps1"" -Role {#RoleArg} -NoShortcut"; \
   StatusMsg: "正在安装依赖与密态库(可能需要几分钟)..."; Flags: runhidden waituntilterminated
+; 证书信任:**不加 runhidden** —— 导入受信任根会弹一次 Windows 确认框,必须让用户看得见、
+; 点得到『是』(旧版把这步埋进隐藏窗口 → 用户点不了 → 浏览器一直报"连接不安全")。
+; trust_cert.ps1 会先弹说明框告知"接下来请点是",再触发系统确认框,最后弹结果。
+Filename: "powershell.exe"; \
+  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\packaging\windows\trust_cert.ps1"""; \
+  StatusMsg: "导入本机证书到信任库(会弹一次确认框,请点『是』)..."; Flags: waituntilterminated
 ; 安装完成后可选:立即启动并打开界面
 Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\windows\clawworker_launch.py"" {#RoleArg}"; \
   Description: "立即启动 {#AppName}"; Flags: postinstall nowait skipifsilent

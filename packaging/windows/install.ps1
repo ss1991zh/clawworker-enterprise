@@ -107,35 +107,17 @@ if (Test-Path $HeLibs) {
     Write-Warning "未找到 $HeLibs —— 请把 4 个 HE 库源码目录放进去后重跑(否则密态功能无法初始化)。"
 }
 
-# ---- 4.5 生成 TLS 证书并导入信任库(此后浏览器访问 https://localhost 不再弹警告)----
-# 证书覆盖 localhost + 本机 IP;叶子证书(非 CA)导入当前用户受信任根,只信这一张。
-# 注意:Windows 出于安全,导入"受信任根"会弹**一次**确认框(是你在授权信任本机证书)——
-#       这是正常且必要的,点『是』即可;此后不再有任何浏览器证书警告。
-Write-Host "生成 TLS 证书并导入信任库..." -ForegroundColor Yellow
-Write-Host "  ↳ 接下来 Windows 会弹一次『是否安装此证书』确认框,请点『是』(仅此一次)。" -ForegroundColor Cyan
+# ---- 4.5 只**生成** TLS 证书;导入信任库交给单独的可见步骤 trust_cert.ps1。----
+# 关键:本脚本被 Inno 以 runhidden 调用,而导入受信任根必然弹一次 Windows 确认框
+# (授权信任本机证书,无法绕过)。放在隐藏窗口里,用户看不到确认框 → 点不了『是』→
+# 浏览器一直报"连接不安全"(这正是先前版本的问题)。故这里只保证证书存在,
+# 导入由 iss 的可见 [Run] 步骤 + 开始菜单『修复证书信任』完成。
+Write-Host "生成 TLS 证书..." -ForegroundColor Yellow
 try {
-    $certPem = & $Py -c "from host import tls_cert; print(tls_cert.ensure_cert()[0])" 2>$null
-    $certPem = ($certPem | Select-Object -Last 1).Trim()
-    if ($certPem -and (Test-Path $certPem)) {
-        $crt = Join-Path $env:TEMP "clawworker_tls.crt"
-        Copy-Item $certPem $crt -Force
-        try {
-            Import-Certificate -FilePath $crt -CertStoreLocation Cert:\CurrentUser\Root -ErrorAction Stop | Out-Null
-            Write-Host "TLS 证书已导入受信任根(浏览器访问 https://localhost 不再警告)。" -ForegroundColor Green
-        } catch {
-            # 用户拒绝确认框 / 非交互环境 → 退回 certutil 再试;仍失败则仅提示(不阻断安装)
-            & certutil -user -addstore -f Root "$crt" | Out-Null
-            if ($LASTEXITCODE -eq 0) {
-                Write-Host "TLS 证书已导入受信任根。" -ForegroundColor Green
-            } else {
-                Write-Warning "证书未导入信任库(浏览器首次访问会有一次自签警告,点『高级→继续』即可,不影响功能)。"
-            }
-        }
-    } else {
-        Write-Warning "未能生成 TLS 证书(服务仍可 HTTPS,浏览器首次会有自签警告)。"
-    }
+    & $Py -c "from host import tls_cert; tls_cert.ensure_cert()" 2>$null | Out-Null
+    Write-Host "TLS 证书已就位。" -ForegroundColor Green
 } catch {
-    Write-Warning "TLS 证书处理跳过:$_"
+    Write-Warning "TLS 证书生成跳过:$_"
 }
 
 # ---- 5. 桌面图标 ----
