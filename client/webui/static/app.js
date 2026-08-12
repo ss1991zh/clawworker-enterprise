@@ -1224,11 +1224,34 @@ async function renderDatabaseTab() {
   });
   execute.addEventListener('click',async()=>{
     execute.disabled=true; execute.textContent='提取中…'; $("dbResult").innerHTML='';
-    try { const r=await api("POST","/api/data/query/execute",{data_source_id:src.value,sql:sql.value,operation:'query'});
+    let taskId=''; let cancelled=false;
+    try {
+      const created=await api("POST","/api/data/query/execute",{data_source_id:src.value,sql:sql.value,operation:'query'});
+      taskId=created.task_id;
+      $("dbResult").innerHTML=`<div class="db-result-head"><strong id="dbTaskStatus">查询已进入队列</strong><span id="dbTaskElapsed">0.0 秒</span></div><div class="db-preview"><div>管理端正在受控执行；可以留在此页面查看进度，也可以主动取消。</div></div><button class="btn-danger" id="dbCancelQuery">取消查询</button>`;
+      $("dbCancelQuery")?.addEventListener('click',async()=>{
+        cancelled=true; const btn=$("dbCancelQuery"); if(btn){btn.disabled=true;btn.textContent='正在取消…';}
+        try{await api("DELETE",`/api/data/query/tasks/${encodeURIComponent(taskId)}`);}catch(e){toast(`取消请求失败：${e.message}`);}
+      });
+      let status=created;
+      while(!['success','failed','cancelled','timeout','denied'].includes(status.status)){
+        await new Promise(resolve=>setTimeout(resolve,500));
+        status=await api("GET",`/api/data/query/tasks/${encodeURIComponent(taskId)}`);
+        const labels={queued:'等待执行',running:'正在查询',success:'查询完成',failed:'查询失败',cancelled:'已取消',timeout:'已超时',denied:'已拒绝'};
+        if($("dbTaskStatus")) $("dbTaskStatus").textContent=labels[status.status]||status.status;
+        if($("dbTaskElapsed")) $("dbTaskElapsed").textContent=`${(status.elapsed_ms/1000).toFixed(1)} 秒`;
+      }
+      if(status.status!=='success'){
+        const labels={cancelled:'查询已取消',timeout:'查询已超过管理员设置的时间限制',denied:'查询被安全限制拒绝',failed:'查询执行失败'};
+        throw new Error(`${labels[status.status]||'查询未完成'}${status.error?'：'+status.error:''}`);
+      }
+      if($("dbTaskStatus")) $("dbTaskStatus").textContent='查询完成，正在本地加密…';
+      if($("dbCancelQuery")) $("dbCancelQuery").disabled=true;
+      const r=await api("POST",`/api/data/query/tasks/${encodeURIComponent(taskId)}/result`);
       const enc=r.encrypted||{}; state.pendingCipher={name:enc.name,path:enc.path,uploading:false}; renderAttachChips();
       $("dbResult").innerHTML=`<div class="db-result-head"><strong>已提取并自动加密 ${r.row_count} 行</strong><span>耗时 ${r.duration_ms} ms</span></div><div class="db-preview"><strong>已加入当前会话附件</strong><div>密文文件：${esc(enc.name||'')} · 加密字段：${(enc.encrypted_columns||[]).map(esc).join('、')||'无数值字段'} · 明文标识字段：${(enc.plaintext_columns||[]).map(esc).join('、')||'无'}</div></div><button class="btn-primary" id="dbContinue">返回会话并分析</button>`;
       $("dbContinue")?.addEventListener('click',()=>{closeModal(); $("input")?.focus();}); loadFiles();
-    } catch(e){$("dbResult").innerHTML=`<div class="alert-box">提取失败：${esc(e.message)}</div>`;}
+    } catch(e){$("dbResult").innerHTML=`<div class="alert-box">${cancelled?'查询已取消':`提取失败：${esc(e.message)}`}</div>`;}
     finally {execute.disabled=false; execute.textContent='提取数据';}
   });
   await loadCatalog();

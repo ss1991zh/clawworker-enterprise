@@ -577,10 +577,27 @@ async def api_data_query_execute(request: Request):
     if not _is_logged_in():
         return _need_login()
     payload = await request.json()
-    result = _host_api("POST", "/data/query/execute", json_body=payload, timeout=300.0)
+    return _host_api("POST", "/data/query/tasks", json_body=payload)
+
+
+@app.get("/api/data/query/tasks/{task_id}")
+def api_data_query_task(task_id: str):
+    return _host_api("GET", f"/data/query/tasks/{quote(task_id, safe='')}")
+
+
+@app.delete("/api/data/query/tasks/{task_id}")
+def api_data_query_cancel(task_id: str):
+    return _host_api("DELETE", f"/data/query/tasks/{quote(task_id, safe='')}")
+
+
+@app.post("/api/data/query/tasks/{task_id}/result")
+def api_data_query_result(task_id: str):
+    result = _host_api(
+        "POST", f"/data/query/tasks/{quote(task_id, safe='')}/result", timeout=300.0,
+    )
     if not isinstance(result, dict):
         raise HTTPException(502, "管理端返回的查询结果格式无效")
-    return _encrypt_database_result(result, payload)
+    return _encrypt_database_result(result, {"data_source_id": result.get("data_source_id", "db")})
 
 
 def _encrypt_database_result(result: dict, payload: dict) -> dict:
@@ -601,6 +618,11 @@ def _encrypt_database_result(result: dict, payload: dict) -> dict:
         tmp_path = Path(tmp.name)
     try:
         frame.to_excel(tmp_path, index=False)
+        max_result_bytes = int(result.get("max_result_bytes", 0) or 0)
+        if max_result_bytes and tmp_path.stat().st_size > max_result_bytes:
+            raise ValueError(
+                f"本地 Excel 文件超过管理员设置的 {max_result_bytes // 1048576} MB 限制"
+            )
         encrypted = _ingest_plaintext_path(
             tmp_path, f"数据库提取_{source_id}_{stamp}.xlsx",
             dst_stem=f"db_{source_id}_{stamp}",

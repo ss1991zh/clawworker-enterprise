@@ -727,7 +727,8 @@ def build_admin_router(
         username: str = Form(...), password: str = Form(...),
         ssl_mode: str = Form("prefer"), ca_path: str = Form(""),
         connect_timeout_seconds: int = Form(8), query_timeout_seconds: int = Form(60),
-        max_rows: int = Form(10000),
+        max_rows: int = Form(10000), max_result_mb: int = Form(50),
+        max_concurrent_queries: int = Form(1), max_queries_per_minute: int = Form(20),
     ):
         if not data_source_store:
             return _flash_redirect("/admin/data-sources", ("error", "数据源模块未初始化"))
@@ -738,6 +739,9 @@ def build_admin_router(
                 ssl_mode=ssl_mode, ca_path=ca_path,
                 connect_timeout_seconds=connect_timeout_seconds,
                 query_timeout_seconds=query_timeout_seconds, max_rows=max_rows,
+                max_result_bytes=max_result_mb * 1024 * 1024,
+                max_concurrent_queries=max_concurrent_queries,
+                max_queries_per_minute=max_queries_per_minute,
             )
         except ValueError as exc:
             return _flash_redirect("/admin/data-sources", ("error", str(exc)))
@@ -766,7 +770,8 @@ def build_admin_router(
         username: str = Form(...), password: str = Form(""),
         ssl_mode: str = Form("prefer"), ca_path: str = Form(""),
         connect_timeout_seconds: int = Form(8), query_timeout_seconds: int = Form(60),
-        max_rows: int = Form(10000),
+        max_rows: int = Form(10000), max_result_mb: int = Form(50),
+        max_concurrent_queries: int = Form(1), max_queries_per_minute: int = Form(20),
     ):
         try:
             source = data_source_store.update(
@@ -775,6 +780,9 @@ def build_admin_router(
                 ssl_mode=ssl_mode, ca_path=ca_path,
                 connect_timeout_seconds=connect_timeout_seconds,
                 query_timeout_seconds=query_timeout_seconds, max_rows=max_rows,
+                max_result_bytes=max_result_mb * 1024 * 1024,
+                max_concurrent_queries=max_concurrent_queries,
+                max_queries_per_minute=max_queries_per_minute,
             )
         except ValueError as exc:
             return _flash_redirect(

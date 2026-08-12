@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,7 @@ from host.data_sources import DataSourceStore
 from host.db_connectors import ConnectorRegistry
 from host.data_access import DataAccessStore
 from host.query_gateway import QueryDenied, QueryGateway
+from host.query_tasks import QueryControlDenied, QueryTaskManager
 
 
 # ---------------------------------------------------------------------------
@@ -57,6 +59,9 @@ data_source_store = DataSourceStore()
 connector_registry = ConnectorRegistry()
 data_access_store = DataAccessStore(data_source_store.db_path)
 query_gateway = QueryGateway(data_source_store, data_access_store, connector_registry)
+query_task_manager = QueryTaskManager(
+    query_gateway, data_source_store, data_access_store,
+)
 
 from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
 from host.login_throttle import LoginThrottle
@@ -357,17 +362,64 @@ def preview_data_query(req: DataQueryRequest, sess=Depends(get_current_session))
             "max_rows": plan.max_rows}
 
 
-@app.post("/data/query/execute")
-def execute_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+def _create_query_task(req: DataQueryRequest, username: str):
     try:
-        return query_gateway.execute(
-            username=sess.username, data_source_id=req.data_source_id,
+        return query_task_manager.create(
+            username=username, data_source_id=req.data_source_id,
             sql=req.sql, operation=req.operation,
         )
     except QueryDenied as exc:
         raise HTTPException(403, str(exc)) from exc
-    except RuntimeError as exc:
-        raise HTTPException(502, str(exc)) from exc
+    except QueryControlDenied as exc:
+        status = 429 if exc.code in ("concurrency_limit", "rate_limit") else 400
+        raise HTTPException(status, str(exc)) from exc
+
+
+@app.post("/data/query/tasks")
+def create_data_query_task(req: DataQueryRequest, sess=Depends(get_current_session)):
+    return _create_query_task(req, sess.username)
+
+
+@app.get("/data/query/tasks/{task_id}")
+def get_data_query_task(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.get(task_id, sess.username)
+    except QueryControlDenied as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.delete("/data/query/tasks/{task_id}")
+def cancel_data_query_task(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.cancel(task_id, sess.username)
+    except QueryControlDenied as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/data/query/tasks/{task_id}/result")
+def consume_data_query_result(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.consume_result(task_id, sess.username)
+    except QueryControlDenied as exc:
+        status = 404 if exc.code == "task_not_found" else 409
+        raise HTTPException(status, str(exc)) from exc
+
+
+@app.post("/data/query/execute")
+def execute_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+    """兼容 1.6.0 用户端：同步等待受控任务，不绕过任何执行限制。"""
+    task = _create_query_task(req, sess.username)
+    task_id = task["task_id"]
+    while task["status"] not in {"success", "failed", "cancelled", "timeout", "denied"}:
+        time.sleep(0.1)
+        task = query_task_manager.get(task_id, sess.username)
+    if task["status"] == "success":
+        return query_task_manager.consume_result(task_id, sess.username)
+    status_codes = {"cancelled": 409, "timeout": 504, "denied": 413, "failed": 502}
+    raise HTTPException(
+        status_codes.get(task["status"], 502),
+        task.get("error") or "数据库查询未完成",
+    )
 
 
 # ----- 登录 -----

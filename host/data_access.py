@@ -444,6 +444,12 @@ class DataAccessStore:
             denied = conn.execute(
                 "SELECT COUNT(*) FROM query_audits WHERE status='denied'"
             ).fetchone()[0]
+            cancelled = conn.execute(
+                "SELECT COUNT(*) FROM query_audits WHERE status='cancelled'"
+            ).fetchone()[0]
+            timeout = conn.execute(
+                "SELECT COUNT(*) FROM query_audits WHERE status='timeout'"
+            ).fetchone()[0]
             rows = conn.execute(
                 "SELECT COALESCE(SUM(row_count),0) FROM query_audits WHERE operation IN ('query','analyze','export') AND status='success'"
             ).fetchone()[0]
@@ -451,4 +457,5 @@ class DataAccessStore:
                 "SELECT COUNT(DISTINCT username) FROM query_audits"
             ).fetchone()[0]
         return {"total": int(total), "success": int(success), "denied": int(denied),
+                "cancelled": int(cancelled), "timeout": int(timeout),
                 "rows": int(rows), "users": int(users)}

@@ -60,6 +60,9 @@
           <div class="field"><label>连接超时（秒）</label><input type="number" name="connect_timeout_seconds" value="8" min="1" max="120"></div>
           <div class="field"><label>查询超时（秒）</label><input type="number" name="query_timeout_seconds" value="60" min="1" max="3600"></div>
           <div class="field"><label>单次最大返回行数</label><input type="number" name="max_rows" value="10000" min="1" max="1000000"></div>
+          <div class="field"><label>单次最大结果（MB）</label><input type="number" name="max_result_mb" value="50" min="1" max="1024"></div>
+          <div class="field"><label>每用户并发查询数</label><input type="number" name="max_concurrent_queries" value="1" min="1" max="20"></div>
+          <div class="field"><label>每用户每分钟查询数</label><input type="number" name="max_queries_per_minute" value="20" min="1" max="600"></div>
         </div>
         <div style="margin-top:20px;"><button class="btn btn-primary" type="submit">保存数据源</button></div>
       </form>
