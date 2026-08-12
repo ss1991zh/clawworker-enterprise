@@ -1,4 +1,4 @@
-﻿; Clawworker Windows 安装包定义(Inno Setup 6+)
+; Clawworker Windows 安装包定义(Inno Setup 6+)
 ; 用 build_installers.ps1 编译两次,分别产出 管理端 / 用户端 两个 Setup.exe。
 ; 手动编译单个:  iscc /DMyRole=admin  clawworker-setup.iss
 ;                 iscc /DMyRole=client clawworker-setup.iss
@@ -15,6 +15,7 @@
   #define RoleArg "client"
 #endif
 
+; 1.6.0:数据库授权后免逐次审批；未授权结构隐藏且后端拒绝；管理端新增使用记录；用户端结果先本地加密再分析。
 ; 1.5.0:管理端新增远程企业数据库、结构目录、表/字段权限、安全只读查询与审计；用户端新增授权数据提取入口。
 ; 1.4.2:本机就绪探测强制直连 loopback，避免系统代理劫持 127.0.0.1 后误报超时。
 ; 1.4.1:修复慢机器 HTTP 就绪探测误判、重复拉起和用户端日志路径。
@@ -30,7 +31,7 @@
 ;      导致目标机装完生成不了 TLS 证书、服务起不来、点图标无反应。已补齐并全量离线自检。
 ; 1.1:SPKI 公钥指纹信任(换网重签不再误报中间人)、登录页扫描内网、
 ;      supervisor 角色接管、证书信任步骤改可见、20+ 项口径/安全修复
-#define AppVersion "1.5.0"
+#define AppVersion "1.6.0"
 #define Pub "Clawworker"
 
 [Setup]
@@ -143,3 +144,4 @@ begin
     '', SW_HIDE, ewWaitUntilTerminated, R);
   Result := '';
 end;
+

@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -434,41 +435,7 @@ def build_admin_router(
         except ValueError as e:
             result = ("error", str(e))
         except Exception as e:
-            result = ("error…5333 tokens truncated…  ("success", "用户组及其组权限已删除"))
-
-    @router.post("/data-permissions/groups/{group_id}/members")
-    def data_group_member_add(request: Request, group_id: str,
-                              username: str = Form(...)):
-        if username not in user_manager._accounts:
-            return _flash_redirect("/admin/data-permissions", ("error", "用户不存在"))
-        try:
-            data_access_store.add_group_member(group_id, username)
-        except ValueError as exc:
-            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
-        return _flash_redirect("/admin/data-permissions",
-                               ("success", f"已将「{username}」加入用户组"))
-
-    @router.post("/data-permissions/groups/{group_id}/members/{username}/remove")
-    def data_group_member_remove(request: Request, group_id: str, username: str):
-        data_access_store.remove_group_member(group_id, username)
-        return _flash_redirect("/admin/data-permissions",
-                               ("success", f"已将「{username}」移出用户组"))
-
-    @router.post("/data-permissions")
-    def data_permission_grant(
-        request: Request, subject: str = Form(...), data_source_id: str = Form(...),
-        schema_name: str = Form(...), table_name: str = Form(...),
-        allowed_columns: str = Form(...), operations: list[str] = Form(...),
-        max_rows: int = Form(10000), row_filter_sql: str = Form(""),
-        masked_columns: str = Form(""),
-    ):
-        try:
-            catalog = [c for c in data_source_store.list_catalog(data_source_id)
-                       if c.schema_name == schema_name and c.table_name == table_name]
-            if not catalog:
-                raise ValueError("表不在已同步的结构目录中；请先到数据源页面同步结构")
-            actual = {c.column_name.lower() for c in catalog}
-            columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
+            resul…5810 tokens truncated…         columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
             if "*" not in columns and any(c.lower() not in actual for c in columns):
                 raise ValueError("授权字段中包含结构目录不存在的字段")
             masks = {}
@@ -524,6 +491,40 @@ def build_admin_router(
         except ValueError as exc:
             return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
         return _flash_redirect("/admin/data-permissions", ("success", "组权限已撤销并立即生效"))
+
+    # ============================================================
+    # 数据使用记录（只记录访问元数据，不保存查询结果正文）
+    # ============================================================
+
+    @router.get("/data-usage", response_class=HTMLResponse)
+    def data_usage_list(request: Request, username: str = "", data_source_id: str = "",
+                        operation: str = "", status: str = ""):
+        sources = data_source_store.list_all() if data_source_store else []
+        source_names = {source.id: source.name for source in sources}
+        audits = []
+        if data_access_store:
+            for row in data_access_store.list_audits(
+                500, username=username.strip(), data_source_id=data_source_id.strip(),
+                operation=operation.strip(), status=status.strip(),
+            ):
+                item = dict(row)
+                item["source_name"] = source_names.get(item["data_source_id"],
+                                                       item["data_source_id"] or "全部授权目录")
+                try:
+                    item["tables"] = json.loads(item.pop("tables_json"))
+                    item["columns"] = json.loads(item.pop("columns_json"))
+                except (ValueError, TypeError):
+                    item["tables"], item["columns"] = [], []
+                audits.append(item)
+        return templates.TemplateResponse(
+            request, "data_usage.html",
+            {"active": "data_usage", "audits": audits, "sources": sources,
+             "users": sorted(user_manager._accounts.keys()),
+             "summary": data_access_store.audit_summary() if data_access_store else {},
+             "filters": {"username": username, "data_source_id": data_source_id,
+                         "operation": operation, "status": status},
+             "messages": _pop_messages(request)},
+        )
 
     # ============================================================
     # 会话

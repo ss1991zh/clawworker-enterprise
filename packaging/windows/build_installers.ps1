@@ -1,4 +1,4 @@
-﻿<#
+<#
   把项目打成两个 Windows 安装包(管理端 + 用户端 Setup.exe)。
   在 Windows 上运行,前置:已装 Inno Setup 6+(https://jrsoftware.org/isdl.php)。
 
@@ -6,8 +6,8 @@
       powershell -ExecutionPolicy Bypass -File packaging\windows\build_installers.ps1
 
   产物:packaging\windows\dist\
-      Clawworker-admin-Setup-1.5.0.exe   ← 装在管理端机器
-      Clawworker-client-Setup-1.5.0.exe  ← 装在每台用户机器
+      Clawworker-admin-Setup-1.6.0.exe   ← 装在管理端机器
+      Clawworker-client-Setup-1.6.0.exe  ← 装在每台用户机器
 #>
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
@@ -109,3 +109,4 @@ Write-Host ""
 Write-Host "==== 完成 ====" -ForegroundColor Green
 Write-Host "安装包在: $(Join-Path $Here 'dist')"
 Get-ChildItem (Join-Path $Here "dist") -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)" }
+

@@ -121,7 +121,7 @@ AGENT_BACKEND=real uvicorn client.webui:app --host 127.0.0.1 --port 8444
 
 ### 远程企业数据库模式
 
-管理端可统一连接一个或多个远程 MySQL / PostgreSQL / SQL Server，并按用户授予表、字段和操作权限。数据库凭据只在管理端使用 Windows DPAPI 加密保存，不下发到用户端；查询结果由管理端在内存中短暂转发且默认不落盘，大模型始终只接收授权结构与用户意图，不接收数据行。完整边界与接口见下方数据库访问文档。
+管理端可统一连接一个或多个远程 MySQL / PostgreSQL / SQL Server，并按用户或用户组授予表、字段和操作权限。授权后无需逐次审批，未授权的数据源、表和字段不展示且由后端强制拒绝；管理端记录使用人、范围、行数、耗时和结果状态，但不保存结果正文。数据库凭据只在管理端使用 Windows DPAPI 加密保存，不下发到用户端；查询结果抵达用户电脑后先在本地加密，再进入受控数据分析流程，大模型不接收明文数据行。完整边界与接口见下方数据库访问文档。
 
 测试:`pytest`(stub 后端)· `AGENT_BACKEND=real pytest`(真实加密)
 
@@ -139,3 +139,4 @@ AGENT_BACKEND=real uvicorn client.webui:app --host 127.0.0.1 --port 8444
 ## License
 
 应用层代码 MIT。同态加密工具链(crypto_toolkit / pandaseal / henumpy / helearn)及内置技能文档另有授权,见各自 LICENSE。
+

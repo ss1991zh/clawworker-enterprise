@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -15,6 +16,22 @@ from host import secret_store
 
 
 OPERATIONS = ("browse", "query", "analyze", "export")
+
+
+def redact_audit_sql(sql_text: str) -> str:
+    """审计保留 SQL 结构，但不长期保存条件中的业务字面值。"""
+    text = (sql_text or "")[:20000]
+    # SQL 字符串常量（支持单引号用两个单引号转义）。双引号可能是标识符，不处理。
+    text = re.sub(r"'(?:''|[^'])*'", "'***'", text)
+    # 数值常量脱敏；保留 LIMIT/TOP 的行数值便于管理员判断提取规模。
+    text = re.sub(
+        r"(?<![\w.])(\d+(?:\.\d+)?)(?![\w.])",
+        lambda match: match.group(1)
+        if re.search(r"(?:LIMIT|TOP)\s*$", text[max(0, match.start()-16):match.start()], re.I)
+        else "?",
+        text,
+    )
+    return text
 
 
 def _now() -> str:
@@ -396,16 +413,43 @@ class DataAccessStore:
                    (id,request_id,username,data_source_id,operation,sql_text,tables_json,
                     columns_json,status,row_count,duration_ms,error_code,created_at)
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (audit_id, request_id, username, data_source_id, operation, sql_text[:20000],
+                (audit_id, request_id, username, data_source_id, operation,
+                 redact_audit_sql(sql_text),
                  json.dumps(tables, ensure_ascii=False), json.dumps(columns, ensure_ascii=False),
                  status, int(row_count), int(duration_ms), error_code[:100], _now()),
             )
         return audit_id
 
-    def list_audits(self, limit: int = 200) -> list[dict]:
+    def list_audits(self, limit: int = 200, *, username: str = "",
+                    data_source_id: str = "", operation: str = "",
+                    status: str = "") -> list[dict]:
+        sql, params = "SELECT * FROM query_audits WHERE 1=1", []
+        for column, value in (("username", username), ("data_source_id", data_source_id),
+                              ("operation", operation), ("status", status)):
+            if value:
+                sql += f" AND {column}=?"
+                params.append(value)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(min(max(limit, 1), 1000))
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM query_audits ORDER BY created_at DESC LIMIT ?", (min(max(limit, 1), 1000),)
-            ).fetchall()
+            rows = conn.execute(sql, params).fetchall()
         return [dict(row) for row in rows]
+
+    def audit_summary(self) -> dict:
+        with self._connect() as conn:
+            total = conn.execute("SELECT COUNT(*) FROM query_audits").fetchone()[0]
+            success = conn.execute(
+                "SELECT COUNT(*) FROM query_audits WHERE status='success'"
+            ).fetchone()[0]
+            denied = conn.execute(
+                "SELECT COUNT(*) FROM query_audits WHERE status='denied'"
+            ).fetchone()[0]
+            rows = conn.execute(
+                "SELECT COALESCE(SUM(row_count),0) FROM query_audits WHERE operation IN ('query','analyze','export') AND status='success'"
+            ).fetchone()[0]
+            users = conn.execute(
+                "SELECT COUNT(DISTINCT username) FROM query_audits"
+            ).fetchone()[0]
+        return {"total": int(total), "success": int(success), "denied": int(denied),
+                "rows": int(rows), "users": int(users)}
 

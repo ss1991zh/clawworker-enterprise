@@ -7,6 +7,7 @@ from host.nl_query import (
     build_schema_prompt,
     generate_candidate,
 )
+from client.webui.pipeline import looks_like_analysis
 
 
 CATALOG = [{
@@ -90,4 +91,16 @@ def test_prompt_does_not_include_catalog_fields_outside_explicit_contract():
     )
     for secret in ("db.internal", "reader", "do-not-leak", "region", "999"):
         assert secret not in user
+
+
+def test_natural_query_prompt_explicitly_forbids_execution_and_data_claims():
+    system, _ = build_schema_prompt(
+        engine="mysql", source_name="ERP", intent="查订单", catalog=CATALOG,
+    )
+    assert "不执行查询" in system
+    assert "不声称已经查到结果" in system
+
+
+def test_database_query_result_is_routed_to_encrypted_data_analysis_not_web_chat():
+    assert looks_like_analysis("分析数据库查询结果并汇总金额")
 

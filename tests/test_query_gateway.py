@@ -64,6 +64,32 @@ def test_no_permission_is_default_deny(tmp_path):
     assert err.value.code == "no_source_permission"
 
 
+def test_browse_only_permission_cannot_query(tmp_path):
+    gateway, source, access = setup_gateway(tmp_path)
+    access.grant(
+        username="bob", data_source_id=source.id, schema_name="erp",
+        table_name="orders", allowed_columns=["id"], operations=["browse"],
+    )
+    browse = access.list_for_user("bob", source.id)
+    assert browse and browse[0].permits("browse")
+    assert not browse[0].permits("query")
+    with pytest.raises(QueryDenied) as err:
+        gateway.plan(username="bob", data_source_id=source.id,
+                     sql="SELECT id FROM orders", operation="query")
+    assert err.value.code == "no_source_permission"
+
+
+def test_ungranted_column_is_neither_visible_to_query_scope_nor_usable(tmp_path):
+    gateway, source, access = setup_gateway(tmp_path)
+    policy = access.list_for_user("alice", source.id)[0]
+    assert policy.permits_column("id")
+    assert not policy.permits_column("secret_note")
+    with pytest.raises(QueryDenied) as err:
+        gateway.plan(username="alice", data_source_id=source.id,
+                     sql="SELECT secret_note FROM orders")
+    assert err.value.code == "column_denied"
+
+
 def test_revocation_takes_effect_immediately(tmp_path):
     gateway, source, access = setup_gateway(tmp_path)
     policy = access.list_for_user("alice")[0]
