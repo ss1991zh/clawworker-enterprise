@@ -1,17 +1,21 @@
 """
-主机 HTTP 服务(FastAPI)。
+主机 FastAPI 应用。
 
 提供两类端点:
 - /auth/login           账号密码登录,返回 session token
 - /llm/chat             调用 LLM 代理(需 session token,按用户绑定的 LLM 配置路由)
 
-启动:
-    uvicorn host.server:app --host 0.0.0.0 --port 8443
+生产启动:
+    python -m host.gateway
+
+gateway 在同一进程中提供本机 HTTP :8442 与局域网 HTTPS :8443。
 """
 
 from __future__ import annotations
 
 import os
+import secrets
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -31,6 +35,11 @@ from host.llm_configs import (
 )
 from host.llm_proxy import LLMProvider, make_provider
 from host.user_manager import UserManager
+from host.data_sources import DataSourceStore
+from host.db_connectors import ConnectorRegistry
+from host.data_access import DataAccessStore
+from host.query_gateway import QueryDenied, QueryGateway
+from host.query_tasks import QueryControlDenied, QueryTaskManager
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +55,13 @@ dispatcher = Dispatcher()
 llm_config_store = LLMConfigStore()
 provider_manager = ProviderManager(llm_config_store)
 call_stats = CallStatStore()
+data_source_store = DataSourceStore()
+connector_registry = ConnectorRegistry()
+data_access_store = DataAccessStore(data_source_store.db_path)
+query_gateway = QueryGateway(data_source_store, data_access_store, connector_registry)
+query_task_manager = QueryTaskManager(
+    query_gateway, data_source_store, data_access_store,
+)
 
 from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
 from host.login_throttle import LoginThrottle
@@ -109,13 +125,18 @@ app.include_router(
         llm_config_store=llm_config_store,
         provider_manager=provider_manager,
         call_stats=call_stats,
+        data_source_store=data_source_store,
+        connector_registry=connector_registry,
+        data_access_store=data_access_store,
+        query_gateway=query_gateway,
         admin_auth=admin_auth,
         login_throttle=_login_throttle,
     )
 )
 
 
-# 根路径 → 管理后台(裸访问 :8443 时不再 404;登录闸门交给下面中间件)
+# 根路径 → 管理后台（本机 :8442 或局域网 :8443 裸访问时不再 404；
+# 登录闸门交给下面中间件）
 @app.get("/")
 def _root():
     from fastapi.responses import RedirectResponse
@@ -155,6 +176,250 @@ def get_current_session(authorization: str = Header(...)):
     if not sess:
         raise HTTPException(401, "session 无效或已过期")
     return sess
+
+
+# ----- 企业数据访问网关（用户端只见授权目录，不见连接凭据）-----
+
+
+@app.get("/data/sources")
+def list_authorized_data_sources(sess=Depends(get_current_session)):
+    policies = data_access_store.list_for_user(sess.username)
+    # 数据源列表本身也是目录信息；没有 browse 权限时不在用户端展示。
+    allowed_ids = {p.data_source_id for p in policies if p.permits("browse")}
+    result = []
+    for source in data_source_store.list_all():
+        if source.enabled and source.id in allowed_ids:
+            result.append({
+                "id": source.id, "name": source.name, "engine": source.engine,
+                "catalog_synced_at": source.catalog_synced_at,
+                "operations": sorted({op for p in policies if p.data_source_id == source.id
+                                      for op in p.operations}),
+            })
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username, data_source_id="",
+        operation="browse", sql_text="", tables=[], columns=[], status="success",
+    )
+    return result
+
+
+@app.get("/data/sources/{source_id}/catalog")
+def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
+    # “可使用”与“可看见”分别由操作权限控制。目录接口只暴露显式授予
+    # browse 的表和字段；即使用户猜到未展示的名称，查询网关仍会再次校验。
+    policies = [
+        policy for policy in data_access_store.list_for_user(sess.username, source_id)
+        if policy.permits("browse")
+    ]
+    if not policies:
+        data_access_store.record_audit(
+            request_id=secrets.token_hex(10), username=sess.username,
+            data_source_id=source_id, operation="browse", sql_text="",
+            tables=[], columns=[], status="denied", error_code="no_source_permission",
+        )
+        raise HTTPException(403, "没有此数据源的访问权限")
+    catalog = data_source_store.list_catalog(source_id)
+    out = []
+    keys = sorted({(p.schema_name.lower(), p.table_name.lower()) for p in policies})
+    for schema_key, table_key in keys:
+        matches = [p for p in policies if p.schema_name.lower() == schema_key
+                   and p.table_name.lower() == table_key]
+        columns = [c for c in catalog if c.schema_name.lower() == schema_key
+                   and c.table_name.lower() == table_key
+                   and any(p.permits_column(c.column_name) for p in matches)]
+        out.append({
+            "schema": matches[0].schema_name, "table": matches[0].table_name,
+            "columns": [{
+                "name": c.column_name, "type": c.data_type,
+                "nullable": c.nullable, "comment": c.comment,
+                "mask": query_gateway._effective_mask([matches], c.column_name),
+            } for c in columns],
+            "operations": sorted({op for p in matches for op in p.operations}),
+            "max_rows": max(p.max_rows for p in matches),
+            "row_restricted": bool(matches) and all(p.row_filter_sql.strip() for p in matches),
+        })
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username,
+        data_source_id=source_id, operation="browse", sql_text="",
+        tables=[f"{item['schema']}.{item['table']}" for item in out],
+        columns=sorted({column["name"] for item in out for column in item["columns"]}),
+        status="success",
+    )
+    return out
+
+
+def _authorized_catalog_rows(username: str, source_id: str,
+                             operation: str = "query") -> list[dict]:
+    """供自然语言规划复用授权目录；不包含数据库凭据、行策略正文或数据行。"""
+    policies = [policy for policy in data_access_store.list_for_user(username, source_id)
+                if policy.permits(operation)]
+    if not policies:
+        return []
+    catalog = data_source_store.list_catalog(source_id)
+    rows = []
+    for schema_key, table_key in sorted({
+        (p.schema_name.lower(), p.table_name.lower()) for p in policies
+    }):
+        matches = [p for p in policies if p.schema_name.lower() == schema_key
+                   and p.table_name.lower() == table_key]
+        columns = [c for c in catalog if c.schema_name.lower() == schema_key
+                   and c.table_name.lower() == table_key
+                   and any(p.permits_column(c.column_name) for p in matches)]
+        rows.append({
+            "schema": matches[0].schema_name, "table": matches[0].table_name,
+            "columns": [{"name": c.column_name, "type": c.data_type,
+                         "mask": query_gateway._effective_mask([matches], c.column_name)}
+                        for c in columns],
+        })
+    return rows
+
+
+class DataQueryRequest(BaseModel):
+    data_source_id: str
+    sql: str
+    operation: str = "query"
+
+
+class NaturalDataQueryRequest(BaseModel):
+    data_source_id: str
+    intent: str
+    operation: str = "query"
+
+
+@app.post("/data/query/plan")
+def plan_natural_data_query(req: NaturalDataQueryRequest,
+                            sess=Depends(get_current_session)):
+    from host.nl_query import NaturalQueryError, generate_candidate
+
+    source = data_source_store.get(req.data_source_id)
+    if not source or not source.enabled:
+        raise HTTPException(404, "数据源不存在或已停用")
+    catalog = _authorized_catalog_rows(sess.username, source.id, req.operation)
+    if not catalog:
+        raise HTTPException(403, "没有此数据源的访问权限")
+    provider, cfg = _resolve_user_provider(sess.username)
+    request_id = secrets.token_hex(10)
+    try:
+        candidate = generate_candidate(
+            provider, engine=source.engine, source_name=source.name,
+            intent=req.intent, catalog=catalog,
+        )
+        preview = query_gateway.preview(
+            username=sess.username, data_source_id=source.id,
+            sql=candidate.sql, operation=req.operation,
+        )
+    except NaturalQueryError as exc:
+        data_access_store.record_audit(
+            request_id=request_id, username=sess.username, data_source_id=source.id,
+            operation="plan", sql_text="", tables=[], columns=[], status="failed",
+            error_code="natural_query_error",
+        )
+        raise HTTPException(422, str(exc)) from exc
+    except QueryDenied as exc:
+        data_access_store.record_audit(
+            request_id=request_id, username=sess.username, data_source_id=source.id,
+            operation="plan", sql_text=candidate.sql if 'candidate' in locals() else "",
+            tables=[], columns=[], status="denied", error_code=exc.code,
+        )
+        raise HTTPException(422, f"候选查询未通过安全检查：{exc}") from exc
+    usage = getattr(provider, "last_usage", {}) or {}
+    pt, ct = int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)
+    cost = usage.get("cost_usd")
+    if cost is None:
+        cost = estimate_cost(cfg.model_name, pt, ct)
+    call_stats.record(config=cfg, username=sess.username, prompt_tokens=pt,
+                      completion_tokens=ct, success=True, cost_usd=float(cost))
+    data_access_store.record_audit(
+        request_id=request_id, username=sess.username, data_source_id=source.id,
+        operation="plan", sql_text=preview.sql, tables=list(preview.tables),
+        columns=list(preview.columns), status="success",
+    )
+    return {"sql": candidate.sql, "preview_sql": preview.sql,
+            "explanation": candidate.explanation,
+            "tables": preview.tables, "columns": preview.columns,
+            "max_rows": preview.max_rows, "requires_confirmation": True}
+
+
+@app.post("/data/query/preview")
+def preview_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+    try:
+        plan = query_gateway.preview(
+            username=sess.username, data_source_id=req.data_source_id,
+            sql=req.sql, operation=req.operation,
+        )
+    except QueryDenied as exc:
+        data_access_store.record_audit(
+            request_id=secrets.token_hex(10), username=sess.username,
+            data_source_id=req.data_source_id, operation="preview", sql_text=req.sql,
+            tables=[], columns=[], status="denied", error_code=exc.code,
+        )
+        raise HTTPException(403, str(exc)) from exc
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username,
+        data_source_id=req.data_source_id, operation="preview", sql_text=plan.sql,
+        tables=list(plan.tables), columns=list(plan.columns), status="success",
+    )
+    return {"sql": plan.sql, "tables": plan.tables, "columns": plan.columns,
+            "max_rows": plan.max_rows}
+
+
+def _create_query_task(req: DataQueryRequest, username: str):
+    try:
+        return query_task_manager.create(
+            username=username, data_source_id=req.data_source_id,
+            sql=req.sql, operation=req.operation,
+        )
+    except QueryDenied as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except QueryControlDenied as exc:
+        status = 429 if exc.code in ("concurrency_limit", "rate_limit") else 400
+        raise HTTPException(status, str(exc)) from exc
+
+
+@app.post("/data/query/tasks")
+def create_data_query_task(req: DataQueryRequest, sess=Depends(get_current_session)):
+    return _create_query_task(req, sess.username)
+
+
+@app.get("/data/query/tasks/{task_id}")
+def get_data_query_task(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.get(task_id, sess.username)
+    except QueryControlDenied as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.delete("/data/query/tasks/{task_id}")
+def cancel_data_query_task(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.cancel(task_id, sess.username)
+    except QueryControlDenied as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/data/query/tasks/{task_id}/result")
+def consume_data_query_result(task_id: str, sess=Depends(get_current_session)):
+    try:
+        return query_task_manager.consume_result(task_id, sess.username)
+    except QueryControlDenied as exc:
+        status = 404 if exc.code == "task_not_found" else 409
+        raise HTTPException(status, str(exc)) from exc
+
+
+@app.post("/data/query/execute")
+def execute_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+    """兼容 1.6.0 用户端：同步等待受控任务，不绕过任何执行限制。"""
+    task = _create_query_task(req, sess.username)
+    task_id = task["task_id"]
+    while task["status"] not in {"success", "failed", "cancelled", "timeout", "denied"}:
+        time.sleep(0.1)
+        task = query_task_manager.get(task_id, sess.username)
+    if task["status"] == "success":
+        return query_task_manager.consume_result(task_id, sess.username)
+    status_codes = {"cancelled": 409, "timeout": 504, "denied": 413, "failed": 502}
+    raise HTTPException(
+        status_codes.get(task["status"], 502),
+        task.get("error") or "数据库查询未完成",
+    )
 
 
 # ----- 登录 -----
@@ -457,3 +722,4 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     dispatcher.complete(task_id, resp.model_dump())
     return {**resp.model_dump(),
             "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+

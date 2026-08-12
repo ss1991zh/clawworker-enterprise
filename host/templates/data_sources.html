@@ -1,0 +1,77 @@
+{% extends "base.html" %}
+{% block title %}企业数据源 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">企业数据源</h1>
+  <p class="page-subtitle">数据库凭据只保存在管理端并由 Windows 加密保护；用户端不会得到地址、账号或密码。当前阶段只建立连接和同步结构，查询权限将在下一阶段启用。</p>
+
+  <div class="alert info">
+    建议为 Clawworker 创建独立的<strong>只读数据库账号</strong>，并在数据库防火墙中只允许管理端 IP 访问。正式环境优先启用数据库 TLS。
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>已配置数据源</h3></div>
+    <div class="panel-body compact">
+      {% if sources %}
+      <table class="table">
+        <thead><tr><th>名称</th><th>类型 / 地址</th><th>数据库</th><th>连接</th><th>结构目录</th><th>状态</th><th>操作</th></tr></thead>
+        <tbody>
+        {% for s in sources %}
+          <tr>
+            <td><strong>{{ s.name }}</strong><div class="muted mono">{{ s.username }}</div></td>
+            <td><span class="pill muted">{{ {'mysql':'MySQL','postgresql':'PostgreSQL','sqlserver':'SQL Server'}[s.engine] }}</span><div class="mono muted">{{ s.host }}:{{ s.port }}</div></td>
+            <td class="mono">{{ s.database_name }}<div class="muted">TLS：{{ s.ssl_mode }}</div></td>
+            <td>
+              {% if s.last_test_status == 'ok' %}<span class="pill active">正常</span>
+              {% elif s.last_test_status == 'failed' %}<span class="pill disabled">失败</span>
+              {% else %}<span class="pill warning">未测试</span>{% endif %}
+              {% if s.last_test_message %}<div class="ds-detail" title="{{ s.last_test_message }}">{{ s.last_test_message }}</div>{% endif %}
+            </td>
+            <td>{{ s.catalog.tables }} 张表 / {{ s.catalog.columns }} 个字段<div class="muted">{{ s.catalog_synced_at or '尚未同步' }}</div></td>
+            <td>{% if s.enabled %}<span class="pill active">已启用</span>{% else %}<span class="pill disabled">已停用</span>{% endif %}</td>
+            <td class="actions">
+              <form method="post" action="/admin/data-sources/{{ s.id }}/test"><button class="btn btn-secondary btn-sm">测试</button></form>
+              <form method="post" action="/admin/data-sources/{{ s.id }}/sync"><button class="btn btn-secondary btn-sm">同步结构</button></form>
+              <a class="btn btn-secondary btn-sm" href="/admin/data-sources/{{ s.id }}/edit">编辑</a>
+              <form method="post" action="/admin/data-sources/{{ s.id }}/toggle"><button class="btn btn-secondary btn-sm">{{ '停用' if s.enabled else '启用' }}</button></form>
+              <form method="post" action="/admin/data-sources/{{ s.id }}/delete" onsubmit="return confirm('删除本地数据源配置和结构目录？不会删除远程数据库。');"><button class="btn btn-danger btn-sm">删除</button></form>
+            </td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<div class="empty">尚未添加远程数据库。请使用下方表单创建第一个企业数据源。</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header"><h3>新增远程数据库</h3></div>
+    <div class="panel-body">
+      <form method="post" action="/admin/data-sources" autocomplete="off">
+        <div class="form-grid">
+          <div class="field"><label>数据源名称</label><input type="text" name="name" required maxlength="80" placeholder="例如：ERP 生产库"></div>
+          <div class="field"><label>数据库类型</label><select name="engine" id="ds-engine"><option value="mysql">MySQL</option><option value="postgresql">PostgreSQL</option><option value="sqlserver">SQL Server</option></select></div>
+          <div class="field"><label>主机地址</label><input type="text" name="host" required placeholder="数据库服务器 IP 或域名"></div>
+          <div class="field"><label>端口</label><input type="number" name="port" id="ds-port" value="3306" min="1" max="65535" required></div>
+          <div class="field"><label>数据库名称</label><input type="text" name="database_name" required></div>
+          <div class="field"><label>只读用户名</label><input type="text" name="username" required autocomplete="off"></div>
+          <div class="field"><label>数据库密码</label><input type="password" name="password" required autocomplete="new-password"></div>
+          <div class="field"><label>TLS 模式</label><select name="ssl_mode"><option value="prefer">优先 TLS</option><option value="require">强制 TLS</option><option value="verify_ca">验证 CA</option><option value="verify_identity">验证 CA 与主机名</option><option value="disable">不使用 TLS（仅限受控内网）</option></select></div>
+          <div class="field"><label>CA 证书路径（可选）</label><input type="text" name="ca_path" placeholder="管理端机器上的证书绝对路径"></div>
+          <div class="field"><label>连接超时（秒）</label><input type="number" name="connect_timeout_seconds" value="8" min="1" max="120"></div>
+          <div class="field"><label>查询超时（秒）</label><input type="number" name="query_timeout_seconds" value="60" min="1" max="3600"></div>
+          <div class="field"><label>单次最大返回行数</label><input type="number" name="max_rows" value="10000" min="1" max="1000000"></div>
+          <div class="field"><label>单次最大结果（MB）</label><input type="number" name="max_result_mb" value="50" min="1" max="1024"></div>
+          <div class="field"><label>每用户并发查询数</label><input type="number" name="max_concurrent_queries" value="1" min="1" max="20"></div>
+          <div class="field"><label>每用户每分钟查询数</label><input type="number" name="max_queries_per_minute" value="20" min="1" max="600"></div>
+        </div>
+        <div style="margin-top:20px;"><button class="btn btn-primary" type="submit">保存数据源</button></div>
+      </form>
+    </div>
+  </div>
+  <script>
+    (() => { const e=document.getElementById('ds-engine'), p=document.getElementById('ds-port');
+      const ports={mysql:3306,postgresql:5432,sqlserver:1433};
+      e.addEventListener('change',()=>{p.value=ports[e.value]||'';}); })();
+  </script>
+{% endblock %}
+

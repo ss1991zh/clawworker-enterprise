@@ -254,6 +254,7 @@ form input[type="text"],
 form input[type="password"],
 form input[type="email"],
 form input[type="number"],
+form input[type="url"],
 form select {
   width: 100%;
   padding: 10px 12px;
@@ -276,6 +277,13 @@ form select:focus {
   gap: 16px;
 }
 .form-grid .field { margin-bottom: 0; }
+.muted { color: var(--text-muted); font-size: 12px; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.actions form { display: inline; margin: 0; }
+.ds-detail { max-width: 230px; margin-top: 5px; color: var(--text-muted); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ds-columns { max-width: 340px; white-space: normal; word-break: break-word; }
+.check-row { display: flex; flex-wrap: wrap; gap: 18px; }
+.check-row label { display: inline-flex; align-items: center; gap: 6px; margin: 0; color: var(--text); }
 
 /* ---------- 按钮 ---------- */
 .btn {
@@ -606,3 +614,23 @@ form select:focus {
 /* 邮件设置:授权码获取提示 */
 .smtp-hint { margin-top: 8px; font-size: 12px; line-height: 1.6; color: var(--text-muted);
   background: var(--pill-bg); border-radius: 8px; padding: 8px 12px; }
+
+/* 数据权限：用户组、成员、行级与脱敏策略 */
+.permission-group-create { margin-bottom: 14px; }
+.permission-group-create input { min-width: 220px; }
+.permission-groups { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 12px; }
+.permission-group-card { border: 1px solid var(--border); border-radius: 10px; padding: 14px; background: var(--surface); }
+.group-members { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; margin: 10px 0; }
+.group-members form { display: inline; }
+.member-pill { border: 0; cursor: pointer; }
+.group-actions { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+.group-actions select { min-width: 130px; }
+.policy-rule { max-width: 260px; overflow-wrap: anywhere; font-size: 12px; }
+.compact-empty { padding: 12px 0 0; }
+.usage-filters { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.usage-filters select { min-width:145px; }
+.usage-table-wrap { overflow-x:auto; }
+.usage-table { min-width:1050px; }
+.usage-scope { max-width:260px; overflow-wrap:anywhere; }
+.usage-sql { max-width:420px; max-height:86px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+

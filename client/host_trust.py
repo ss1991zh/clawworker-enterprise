@@ -19,6 +19,7 @@ from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
 _PIN_DIR = Path(os.path.expanduser("~/.agent-system/host-trust"))
+LAN_HOST_PORT = int(os.environ.get("CLAWWORKER_HOST_LAN_PORT", "8443"))
 
 
 def _spki_of_pem(pem: bytes) -> Optional[str]:
@@ -66,6 +67,20 @@ def to_https(host_url: str) -> str:
     """把 host_url 规整为 https(主机端已启 TLS)。"""
     u = urlparse(host_url if "://" in host_url else "https://" + host_url)
     return urlunparse(u._replace(scheme="https"))
+
+
+def to_lan_https(host_url: str, port: int = LAN_HOST_PORT) -> str:
+    """规整为客户端跨机器访问管理主机的固定 HTTPS 入口。
+
+    8442 只供管理主机本机浏览器使用，不能被用户端保存或回填。这里同时迁移
+    旧的 ``http://...:8442`` / ``http://...:8443`` 配置，并去掉误填的路径、
+    查询参数，统一得到 ``https://<管理主机>:8443``。
+    """
+    u = urlparse(host_url if "://" in host_url else "https://" + host_url)
+    host = u.hostname or "127.0.0.1"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return urlunparse(("https", f"{host}:{int(port)}", "", "", "", ""))
 
 
 def _hostport(host_url: str) -> tuple[str, int]:

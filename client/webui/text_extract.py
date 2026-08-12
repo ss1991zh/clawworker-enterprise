@@ -69,17 +69,94 @@ def _read_docx(p: Path) -> str:
     doc = Document(str(p))
     parts: list[str] = []
     for para in doc.paragraphs:
-        text = para.text
+        text = _docx_paragraph_text(para)
         if text:
             parts.append(text)
-    # 表格也提一下
+    # 表格也提一下；cell.text 同样会漏公式编辑器对象，逐段读取。
     for table in doc.tables:
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells]
+            cells = [
+                "\n".join(
+                    text for text in (_docx_paragraph_text(para) for para in cell.paragraphs)
+                    if text
+                ).strip()
+                for cell in row.cells
+            ]
             cells = [c for c in cells if c]
             if cells:
                 parts.append(" | ".join(cells))
     return "\n".join(parts)
+
+
+def _local_name(element) -> str:
+    return str(getattr(element, "tag", "")).rsplit("}", 1)[-1]
+
+
+def _first_child(element, name: str):
+    return next((child for child in element if _local_name(child) == name), None)
+
+
+def _omml_to_linear(element) -> str:
+    """把 Word 公式编辑器的常见 OMML 结构转成可供分析模型读取的线性公式。"""
+    name = _local_name(element)
+    if name == "t":
+        return element.text or ""
+    if name.endswith("Pr") or name in {"ctrlPr", "rPr"}:
+        return ""
+
+    def child_text(child_name: str) -> str:
+        child = _first_child(element, child_name)
+        return _omml_to_linear(child).strip() if child is not None else ""
+
+    if name == "f":
+        numerator, denominator = child_text("num"), child_text("den")
+        return f"({numerator})/({denominator})"
+    if name == "sSup":
+        return f"({child_text('e')})^({child_text('sup')})"
+    if name == "sSub":
+        return f"({child_text('e')})_({child_text('sub')})"
+    if name == "sSubSup":
+        return f"({child_text('e')})_({child_text('sub')})^({child_text('sup')})"
+    if name == "rad":
+        degree, body = child_text("deg"), child_text("e")
+        return f"root[{degree}]({body})" if degree else f"sqrt({body})"
+    if name == "d":
+        body = child_text("e") or "".join(_omml_to_linear(c) for c in element)
+        return f"({body})"
+    if name == "nary":
+        body, sub, sup = child_text("e"), child_text("sub"), child_text("sup")
+        op = "Σ"
+        for node in element.iter():
+            if _local_name(node) == "chr":
+                for key, value in getattr(node, "attrib", {}).items():
+                    if str(key).endswith("}val") and value:
+                        op = value
+                        break
+        limits = f"_({sub})" if sub else ""
+        limits += f"^({sup})" if sup else ""
+        return f"{op}{limits}({body})"
+    if name == "eqArr":
+        return " ; ".join(
+            part for part in (_omml_to_linear(c).strip() for c in element) if part
+        )
+    return "".join(_omml_to_linear(child) for child in element)
+
+
+def _docx_paragraph_text(para) -> str:
+    """保留普通段落文字，并补出 python-docx 默认遗漏的公式编辑器内容。"""
+    plain = (para.text or "").strip()
+    formulas: list[str] = []
+    for node in para._p.iter():
+        if _local_name(node) != "oMath":
+            continue
+        formula = re.sub(r"\s+", " ", _omml_to_linear(node)).strip()
+        if formula and formula not in formulas:
+            formulas.append(formula)
+    missing = [formula for formula in formulas if formula not in plain]
+    if missing:
+        formula_text = "；".join(missing)
+        return f"{plain} [公式: {formula_text}]".strip()
+    return plain
 
 
 def _read_pdf(p: Path) -> str:

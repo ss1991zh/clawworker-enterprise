@@ -9,3 +9,6 @@ dist/
 # 离线包构建产物(大文件,不进仓库)
 wheels/
 python-*-amd64.exe
+# 微软离线运行环境体积较大（WebView2 超过 GitHub 单文件上限），由打包机按 README 准备。
+db_drivers/
+webview2/

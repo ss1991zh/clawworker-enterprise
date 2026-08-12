@@ -10,9 +10,8 @@
       # 单机一体(两个图标都建):
       powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -Role both
 
-  前置:① 已装 Python 3.11+(勾选 Add to PATH);
-        ② 把你的 4 个 HE 库源码目录(crypto_toolkit-64_dev / henumpy-dev /
-           pandaseal-dev / helearn-dev,内含 win64 DLL)放进 packaging\windows\he_libs\。
+  EXE 安装包已内置 Python 3.11、全部 wheel 与 4 个 HE 库,目标机无需预装 Python
+  或联网。直接运行本脚本时,仍需确保 packaging\windows 下具备这些离线资源。
 #>
 param(
     [ValidateSet("admin", "client", "both")]
@@ -32,8 +31,12 @@ $Py      = Join-Path $Venv "Scripts\python.exe"
 $Launch  = Join-Path $Here "clawworker_launch.py"
 $Icon    = Join-Path $Here "clawworker.ico"
 $HeLibs  = Join-Path $Here "he_libs"
-$Wheels   = Join-Path $Here "wheels"                    # 离线 wheel 目录(离线包会带上)
+$Wheels  = Join-Path $Here "wheels"                    # 离线 wheel 目录(离线包会带上)
 $PyBundle = Join-Path $Here "python-3.11.9-amd64.exe"   # 随包 Python 安装器(离线包会带上)
+$DesktopRequirements = Join-Path $Here "requirements-desktop.txt"
+$WebView2Installer = Join-Path $Here "webview2\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
+$SqlServerOdbcInstaller = Join-Path $Here "db_drivers\msodbcsql18-x64.msi"
+$VcRedistInstaller = Join-Path $Here "db_drivers\vc_redist.x64.exe"
 
 Write-Host "==== Clawworker 安装 ($Role) ====" -ForegroundColor Cyan
 Write-Host "项目根: $Project"
@@ -45,7 +48,10 @@ if (Test-Path $Wheels) {
     Write-Host "离线模式:使用随包 wheels 安装依赖(无需联网)" -ForegroundColor Yellow
 }
 
-# ---- 1. 找系统 Python(真正验证可运行)----
+# ---- 1. 固定 Python 3.11 运行时。----
+# 离线 wheel 是 cp311/win_amd64 集合,不能因为目标机已有 Python 3.12/3.13 就误用它。
+# 优先复用可运行的 3.11;没有就静默安装随包 3.11。只有在没有离线包的源码安装模式下,
+# 才允许回退到其他 3.11+ 版本并联网解析依赖。
 function Test-PyCmd($exe, $verArg) {
     try {
         if ($verArg) { & $exe $verArg --version *> $null } else { & $exe --version *> $null }
@@ -54,24 +60,23 @@ function Test-PyCmd($exe, $verArg) {
 }
 $pyExe = $null; $pyArg = $null
 if (Get-Command py -ErrorAction SilentlyContinue) {
-    foreach ($v in @("-3.11", "-3.12", "-3.13", "-3")) {
-        if (Test-PyCmd "py" $v) { $pyExe = "py"; $pyArg = $v; break }
-    }
+    if (Test-PyCmd "py" "-3.11") { $pyExe = "py"; $pyArg = "-3.11" }
 }
-if (-not $pyExe -and (Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) {
-    $pyExe = "python"
-}
-# 没找到系统 Python 但随包带了安装器 → 静默装(仅当前用户,免管理员),再探测。
+
+# 没找到 Python 3.11 但随包带了安装器 → 静默装(仅当前用户,免管理员),再探测。
 if (-not $pyExe -and (Test-Path $PyBundle)) {
     Write-Host "未检测到 Python,正在安装随包 Python 3.11(静默,可能需一两分钟)..." -ForegroundColor Yellow
-    Start-Process -FilePath $PyBundle -Wait -ArgumentList `
-        "/quiet","InstallAllUsers=0","PrependPath=1","Include_pip=1","Include_launcher=1","Include_test=0","Include_doc=0"
+    $pyInstall = Start-Process -FilePath $PyBundle -Wait -PassThru -ArgumentList `
+        "/quiet","InstallAllUsers=0","PrependPath=0","AssociateFiles=0","Shortcuts=0",`
+        "Include_pip=1","Include_launcher=1","Include_test=0","Include_doc=0"
+    if ($pyInstall.ExitCode -ne 0) {
+        throw "随包 Python 3.11 安装失败(退出码 $($pyInstall.ExitCode))。"
+    }
     $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
     if (Get-Command py -ErrorAction SilentlyContinue) {
-        foreach ($v in @("-3.11", "-3")) { if (Test-PyCmd "py" $v) { $pyExe = "py"; $pyArg = $v; break } }
+        if (Test-PyCmd "py" "-3.11") { $pyExe = "py"; $pyArg = "-3.11" }
     }
-    if (-not $pyExe -and (Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) { $pyExe = "python" }
-    # PATH 可能尚未刷新 → 直接查随包 Python 的已知安装路径(per-user)
+    # launcher/PATH 可能尚未刷新 → 直接查随包 Python 的已知安装路径(per-user)
     if (-not $pyExe) {
         foreach ($cand in @(
             (Join-Path $env:LOCALAPPDATA "Programs\Python\Python311\python.exe"),
@@ -80,7 +85,20 @@ if (-not $pyExe -and (Test-Path $PyBundle)) {
         }
     }
 }
-if (-not $pyExe) { throw "未找到可用的 Python 3.11+(且无随包安装器)。请手动安装 Python 3.11 并勾选 Add to PATH。" }
+
+# 仅源码/联网安装模式允许使用其他 Python 3.11+。
+if (-not $pyExe -and -not (Test-Path $Wheels)) {
+    if ((Get-Command python -ErrorAction SilentlyContinue) -and (Test-PyCmd "python" $null)) {
+        $pyExe = "python"
+    } elseif (Get-Command py -ErrorAction SilentlyContinue) {
+        foreach ($v in @("-3.13", "-3.12", "-3")) {
+            if (Test-PyCmd "py" $v) { $pyExe = "py"; $pyArg = $v; break }
+        }
+    }
+}
+if (-not $pyExe) {
+    throw "未找到可用的 Python 3.11,且随包 Python 安装失败或离线资源不完整。"
+}
 Write-Host "使用 Python: $pyExe $pyArg"
 
 # ---- 2. 建 venv(PS 自动处理含空格/中文的路径)----
@@ -90,34 +108,138 @@ if (-not (Test-Path $Py)) {
     if (-not (Test-Path $Py)) { throw "创建 venv 失败:$Venv" }
 }
 & $Py -m pip install --upgrade pip @PipArgs --quiet
+if ($LASTEXITCODE -ne 0) { throw "初始化 pip 失败(退出码 $LASTEXITCODE)。" }
 
 # ---- 3. 装依赖 ----
 Write-Host "安装依赖(requirements.txt)..." -ForegroundColor Yellow
 & $Py -m pip install -r (Join-Path $Here "requirements.txt") @PipArgs --quiet
+if ($LASTEXITCODE -ne 0) { throw "Python 依赖安装失败(退出码 $LASTEXITCODE)。" }
+
+# 仅用户端安装原生桌面窗口依赖；管理端仍使用浏览器，不引入 pywebview/pythonnet。
+if ($Role -eq "client" -or $Role -eq "both") {
+    if (-not (Test-Path $DesktopRequirements)) {
+        throw "缺少用户端桌面依赖清单:$DesktopRequirements"
+    }
+    Write-Host "安装用户端桌面窗口依赖..." -ForegroundColor Yellow
+    & $Py -m pip install -r $DesktopRequirements @PipArgs --quiet
+    if ($LASTEXITCODE -ne 0) { throw "用户端桌面窗口依赖安装失败(退出码 $LASTEXITCODE)。" }
+}
 
 # ---- 4. 装 4 个 HE 库 ----
 $libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev")
 if (Test-Path $HeLibs) {
     foreach ($l in $libs) {
         $d = Join-Path $HeLibs $l
-        if (Test-Path $d) { Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow; & $Py -m pip install -e $d @PipArgs --quiet }
-        else { Write-Warning "缺少 HE 库目录: $d" }
+        if (-not (Test-Path $d)) { throw "缺少 HE 库目录: $d" }
+        Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow
+        & $Py -m pip install -e $d @PipArgs --quiet
+        if ($LASTEXITCODE -ne 0) { throw "HE 库 $l 安装失败(退出码 $LASTEXITCODE)。" }
     }
 } else {
-    Write-Warning "未找到 $HeLibs —— 请把 4 个 HE 库源码目录放进去后重跑(否则密态功能无法初始化)。"
+    throw "未找到 $HeLibs,无法安装密态运行环境。"
 }
 
-# ---- 4.5 只**生成** TLS 证书;导入信任库交给单独的可见步骤 trust_cert.ps1。----
-# 关键:本脚本被 Inno 以 runhidden 调用,而导入受信任根必然弹一次 Windows 确认框
-# (授权信任本机证书,无法绕过)。放在隐藏窗口里,用户看不到确认框 → 点不了『是』→
-# 浏览器一直报"连接不安全"(这正是先前版本的问题)。故这里只保证证书存在,
-# 导入由 iss 的可见 [Run] 步骤 + 开始菜单『修复证书信任』完成。
-Write-Host "生成 TLS 证书..." -ForegroundColor Yellow
-try {
-    & $Py -c "from host import tls_cert; tls_cert.ensure_cert()" 2>$null | Out-Null
-    Write-Host "TLS 证书已就位。" -ForegroundColor Green
-} catch {
-    Write-Warning "TLS 证书生成跳过:$_"
+# 安装后冒烟检查:基础 Web/TLS 依赖与当前角色入口必须能导入,否则拒绝带病完成。
+if ($Role -eq "admin" -or $Role -eq "both") {
+    & $Py -c "import fastapi, uvicorn, cryptography, pymysql, psycopg, pyodbc, sqlglot; import host.gateway"
+    if ($LASTEXITCODE -ne 0) { throw "管理端运行环境自检失败。" }
+}
+if ($Role -eq "client" -or $Role -eq "both") {
+    & $Py -c "import fastapi, uvicorn, cryptography; import client.webui"
+    if ($LASTEXITCODE -ne 0) { throw "用户端运行环境自检失败。" }
+}
+
+# ---- 4.4 管理端 SQL Server ODBC 运行环境。----
+# pyodbc 只是 Python 绑定，真正连接 SQL Server 还需要微软 ODBC Driver 18。
+# 管理端安装包内置微软签名 MSI；已有驱动则跳过，避免重复安装。
+if ($Role -eq "admin" -or $Role -eq "both") {
+    $odbcReady = $false
+    try {
+        $drivers = (& $Py -c "import pyodbc; print('\n'.join(pyodbc.drivers()))") -join "`n"
+        $odbcReady = $drivers -match "ODBC Driver 18 for SQL Server"
+    } catch {}
+    if (-not $odbcReady) {
+        if (-not (Test-Path $SqlServerOdbcInstaller)) {
+            throw "未检测到 Microsoft ODBC Driver 18，且离线安装器缺失:$SqlServerOdbcInstaller"
+        }
+        if (-not (Test-Path $VcRedistInstaller)) {
+            throw "SQL Server ODBC Driver 18 所需的 Microsoft VC++ 运行库安装器缺失:$VcRedistInstaller"
+        }
+        Write-Host "安装 Microsoft VC++ 运行库..." -ForegroundColor Yellow
+        $vcInstall = Start-Process -FilePath $VcRedistInstaller -Wait -PassThru -ArgumentList `
+            "/install","/quiet","/norestart"
+        if ($vcInstall.ExitCode -notin @(0, 1638, 3010)) {
+            throw "Microsoft VC++ 运行库安装失败(退出码 $($vcInstall.ExitCode))。"
+        }
+        Write-Host "安装 SQL Server ODBC Driver 18..." -ForegroundColor Yellow
+        $odbcInstall = Start-Process -FilePath "msiexec.exe" -Wait -PassThru -ArgumentList `
+            "/i",$SqlServerOdbcInstaller,"/qn","IACCEPTMSODBCSQLLICENSETERMS=YES","ADDLOCAL=ALL"
+        if ($odbcInstall.ExitCode -ne 0 -and $odbcInstall.ExitCode -ne 3010) {
+            throw "SQL Server ODBC Driver 18 安装失败(退出码 $($odbcInstall.ExitCode))。"
+        }
+        $drivers = (& $Py -c "import pyodbc; print('\n'.join(pyodbc.drivers()))") -join "`n"
+        $odbcReady = $drivers -match "ODBC Driver 18 for SQL Server"
+        if (-not $odbcReady) { throw "ODBC 安装完成后仍未检测到 ODBC Driver 18 for SQL Server。" }
+    }
+    Write-Host "SQL Server ODBC Driver 18 已就位。" -ForegroundColor Green
+}
+
+# ---- 4.25 用户端 WebView2 离线运行环境。----
+# 微软官方检测口径:以下 per-machine/per-user 注册表 pv 只要有一个大于 0.0.0.0 即已安装。
+function Get-WebView2Version {
+    $clientId = "{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+    $keys = @(
+        "HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\$clientId",
+        "HKCU:\Software\Microsoft\EdgeUpdate\Clients\$clientId",
+        "HKLM:\SOFTWARE\Microsoft\EdgeUpdate\Clients\$clientId"
+    )
+    foreach ($key in $keys) {
+        try {
+            $version = (Get-ItemProperty -LiteralPath $key -Name "pv" -ErrorAction Stop).pv
+            if ($version -and $version -ne "0.0.0.0") { return [string]$version }
+        } catch {}
+    }
+    return $null
+}
+
+if ($Role -eq "client" -or $Role -eq "both") {
+    $webView2Version = Get-WebView2Version
+    if (-not $webView2Version) {
+        if (-not (Test-Path $WebView2Installer)) {
+            throw "未检测到 WebView2 Runtime，且离线安装器缺失:$WebView2Installer"
+        }
+        Write-Host "安装用户端桌面窗口运行环境 WebView2..." -ForegroundColor Yellow
+        $webView2Install = Start-Process -FilePath $WebView2Installer -Wait -PassThru -ArgumentList `
+            "/silent","/install"
+        if ($webView2Install.ExitCode -ne 0) {
+            throw "WebView2 Runtime 安装失败(退出码 $($webView2Install.ExitCode))。"
+        }
+        $webView2Version = Get-WebView2Version
+        if (-not $webView2Version) {
+            throw "WebView2 Runtime 安装完成后仍未检测到有效版本。"
+        }
+    }
+    Write-Host "WebView2 Runtime 已就位: $webView2Version" -ForegroundColor Green
+    # 不只检查包是否存在，实际初始化 WinForms + WebView2；挡住 pythonnet/.NET/Runtime
+    # 任一环节缺失导致的“安装成功但点图标无反应”。
+    & $Py -c "import importlib; gl=importlib.import_module('webview.guilib'); gui=gl.initialize('edgechromium'); assert gui.renderer == 'edgechromium', gui.renderer"
+    if ($LASTEXITCODE -ne 0) {
+        throw "用户端桌面窗口自检失败(WebView2 渲染器未能初始化)。"
+    }
+}
+
+# ---- 4.5 仅管理主机生成局域网 TLS 证书。----
+# 本机 Admin(:8442)与用户端(:8444)均走 loopback HTTP,不再向 Windows Root
+# 证书库导入每机自签证书。局域网 Host(:8443)仍强制 HTTPS;gateway 启动时也会
+# fail-closed 再次校验证书,失败就明确退出,不会静默降级 HTTP。
+if ($Role -eq "admin" -or $Role -eq "both") {
+    Write-Host "生成局域网 HTTPS 证书..." -ForegroundColor Yellow
+    try {
+        & $Py -c "from host import tls_cert; tls_cert.ensure_cert()" 2>$null | Out-Null
+        Write-Host "局域网 HTTPS 证书已就位。" -ForegroundColor Green
+    } catch {
+        throw "局域网 HTTPS 证书生成失败:$_"
+    }
 }
 
 # ---- 5. 桌面图标 ----

@@ -69,9 +69,11 @@ def _probe(ip: str) -> Optional[dict]:
     """端口通就取证书,返回 {ip, url, spki, cn};不是本产品/取不到证书返回 None。"""
     if not _port_open(ip):
         return None
-    url = f"https://{ip}:{HOST_PORT}"
     try:
         from client import host_trust
+        # 扫描是跨机器连接,只能回填局域网 HTTPS 入口;绝不能暴露本机管理
+        # HTTP :8442 给其他电脑。
+        url = host_trust.to_lan_https(ip, port=HOST_PORT)
         pem = host_trust.fetch_server_cert_pem(url)
         spki = host_trust._spki_of_pem(pem)
         if not spki:
@@ -126,8 +128,13 @@ def scan(network: Optional[str] = None) -> dict:
                     found.append(r)
 
     known = known_spkis()
+    local_ips = set(local_ipv4())
     for c in found:
         c["known"] = c["spki"] in known
+        # 同一台电脑同时装了管理端和用户端时，扫描也会发现自己。
+        # 不能直接排除（单机部署仍需要它），但必须让界面明确标出，避免
+        # 多管理端环境中把“本机旧管理端”误当成用户想连接的远端管理端。
+        c["local"] = c["ip"] in local_ips
     # 已认识的排前面
     found.sort(key=lambda c: (not c["known"], c["ip"]))
     return {"networks": nets, "candidates": found, "too_large": too_large}

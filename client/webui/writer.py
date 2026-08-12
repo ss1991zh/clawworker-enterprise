@@ -163,6 +163,9 @@ def _infer_number_format(col_name: str) -> Optional[str]:
     """按列名推断 Excel 数字格式 —— 覆盖销售/财务/库存/HR/客户常见指标。"""
     name = str(col_name)
     lower = name.lower()
+    # 库存周转率的单位是“次/期间”，不是百分比；不能因中文带“率”就渲染成 500%。
+    if "库存周转率" in name or "inventory turnover" in lower:
+        return "0.00"
     # 百分比 —— 注意:「同比增长/环比增长」是**绝对增长额(元)**不是比率,
     # 只有带「率」或明确「涨幅/降幅/占比」的才是百分比(下面金额段会接住增长额)
     if any(k in lower for k in ("rate", "ratio", "percentage", "pct")):

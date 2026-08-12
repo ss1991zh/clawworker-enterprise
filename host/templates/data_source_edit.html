@@ -1,0 +1,32 @@
+{% extends "base.html" %}
+{% block title %}编辑 {{ source.name }} · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">编辑数据源</h1>
+  <p class="page-subtitle">{{ source.name }} · 密码留空表示保留原密码；连接参数变化后需要重新测试并同步结构。</p>
+  <div class="panel"><div class="panel-header"><h3>连接配置</h3></div><div class="panel-body">
+    <form method="post" action="/admin/data-sources/{{ source.id }}/update" autocomplete="off">
+      <div class="form-grid">
+        <div class="field"><label>数据源名称</label><input type="text" name="name" value="{{ source.name }}" required maxlength="80"></div>
+        <div class="field"><label>数据库类型</label><select name="engine"><option value="mysql" {% if source.engine=='mysql' %}selected{% endif %}>MySQL</option><option value="postgresql" {% if source.engine=='postgresql' %}selected{% endif %}>PostgreSQL</option><option value="sqlserver" {% if source.engine=='sqlserver' %}selected{% endif %}>SQL Server</option></select></div>
+        <div class="field"><label>主机地址</label><input type="text" name="host" value="{{ source.host }}" required></div>
+        <div class="field"><label>端口</label><input type="number" name="port" value="{{ source.port }}" min="1" max="65535" required></div>
+        <div class="field"><label>数据库名称</label><input type="text" name="database_name" value="{{ source.database_name }}" required></div>
+        <div class="field"><label>只读用户名</label><input type="text" name="username" value="{{ source.username }}" required autocomplete="off"></div>
+        <div class="field"><label>新密码（留空不改）</label><input type="password" name="password" autocomplete="new-password"></div>
+        <div class="field"><label>TLS 模式</label><select name="ssl_mode">{% for value,label in [('prefer','优先 TLS'),('require','强制 TLS'),('verify_ca','验证 CA'),('verify_identity','验证 CA 与主机名'),('disable','不使用 TLS')] %}<option value="{{ value }}" {% if source.ssl_mode==value %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></div>
+        <div class="field"><label>CA 证书路径</label><input type="text" name="ca_path" value="{{ source.ca_path }}"></div>
+        <div class="field"><label>连接超时（秒）</label><input type="number" name="connect_timeout_seconds" value="{{ source.connect_timeout_seconds }}" min="1" max="120"></div>
+        <div class="field"><label>查询超时（秒）</label><input type="number" name="query_timeout_seconds" value="{{ source.query_timeout_seconds }}" min="1" max="3600"></div>
+        <div class="field"><label>单次最大返回行数</label><input type="number" name="max_rows" value="{{ source.max_rows }}" min="1" max="1000000"></div>
+        <div class="field"><label>单次最大结果（MB）</label><input type="number" name="max_result_mb" value="{{ source.max_result_bytes // 1048576 }}" min="1" max="1024"></div>
+        <div class="field"><label>每用户并发查询数</label><input type="number" name="max_concurrent_queries" value="{{ source.max_concurrent_queries }}" min="1" max="20"></div>
+        <div class="field"><label>每用户每分钟查询数</label><input type="number" name="max_queries_per_minute" value="{{ source.max_queries_per_minute }}" min="1" max="600"></div>
+      </div>
+      <div style="margin-top:20px;"><button class="btn btn-primary" type="submit">保存修改</button><a class="btn btn-secondary" href="/admin/data-sources" style="margin-left:8px;">返回</a></div>
+    </form>
+  </div></div>
+  <div class="panel"><div class="panel-header"><h3>本地结构目录</h3></div><div class="panel-body">
+    当前保存 {{ catalog.schemas }} 个架构、{{ catalog.tables }} 张表/视图、{{ catalog.columns }} 个字段。同步时间：{{ source.catalog_synced_at or '尚未同步' }}。
+  </div></div>
+{% endblock %}
+

@@ -28,7 +28,9 @@
   </div>
   {% for s in snap.services %}
   <div class="kpi-card">
-    <div class="label">{{ s.label }} · :{{ s.port }}</div>
+    <div class="label">{{ s.label }} ·
+      {% if s.lan_port %}:{{ s.local_port }} HTTP + :{{ s.lan_port }} HTTPS{% else %}:{{ s.port }} HTTP{% endif %}
+    </div>
     <div class="value" id="kpi-svc-{{ s.key }}">
       {% if s.healthy %}<span class="ok">健康</span>{% else %}<span class="bad">不可达</span>{% endif %}
     </div>
@@ -51,7 +53,9 @@
         {% for s in snap.services %}
         <tr data-key="{{ s.key }}">
           <td>{{ s.label }}</td>
-          <td class="mono">{{ s.port }}</td>
+          <td class="mono">
+            {% if s.lan_port %}:{{ s.local_port }} HTTP / :{{ s.lan_port }} HTTPS{% else %}:{{ s.port }} HTTP{% endif %}
+          </td>
           <td class="c-status">
             {% if s.healthy %}<span class="pill active">健康</span>{% else %}<span class="pill disabled">不可达</span>{% endif %}
           </td>
@@ -102,7 +106,8 @@
       <strong>工作原理:</strong>开机自启只负责在登录时拉起 <code>supervisor.py</code> 一个守护进程;
       由守护进程负责启动、健康探测、崩溃后退避重启<strong>本机所承担的服务</strong>——
       这套自愈逻辑三平台一致。
-      <br><strong>部署边界:</strong>本机(控制面)只托管 <code>Host :8443</code>;
+      <br><strong>部署边界:</strong>本机(控制面)托管
+      <code>Host 本机 HTTP :8442 + 局域网 HTTPS :8443</code>;
       数据面 <code>Client :8444</code> 运行在<strong>各终端用户机器</strong>上,由那台机器自己的守护托管
       (终端机部署时设 <code>CLAWWORKER_MANAGED_SERVICES=client</code>),不在本机管理范围内。
       {% if snap.platform == 'darwin' %}

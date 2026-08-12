@@ -13,6 +13,9 @@
       <a href="/admin/" class="{% if active=='dashboard' %}active{% endif %}">概览</a>
       <a href="/admin/users" class="{% if active=='users' %}active{% endif %}">用户</a>
       <a href="/admin/llm" class="{% if active=='llm' %}active{% endif %}">LLM 配置</a>
+      <a href="/admin/data-sources" class="{% if active=='data_sources' %}active{% endif %}">数据源</a>
+      <a href="/admin/data-permissions" class="{% if active=='data_permissions' %}active{% endif %}">数据权限</a>
+      <a href="/admin/data-usage" class="{% if active=='data_usage' %}active{% endif %}">数据使用记录</a>
       <a href="/admin/sessions" class="{% if active=='sessions' %}active{% endif %}">会话</a>
       <a href="/admin/ops" class="{% if active=='ops' %}active{% endif %}">运维</a>
       <a href="/admin/account" class="{% if active=='account' %}active{% endif %}">管理员</a>
@@ -44,10 +47,11 @@
     {% endif %}
     {% block content %}{% endblock %}
     <div class="footer">
-      Clawworker Enterprise · MVP · 主机 <code>127.0.0.1:8443</code> ·
+      Clawworker Enterprise · MVP · 本机管理 <code>127.0.0.1:8442</code> ·
       <a href="/docs" target="_blank">Swagger API 文档</a>
     </div>
   </main>
   <script src="/admin/static/admin.js?v={{ asset_ver('admin.js') }}"></script>
 </body>
 </html>
+

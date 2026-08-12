@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -77,6 +78,10 @@ def build_admin_router(
     llm_config_store: LLMConfigStore,
     provider_manager: ProviderManager,
     call_stats: CallStatStore,
+    data_source_store=None,
+    connector_registry=None,
+    data_access_store=None,
+    query_gateway=None,
     admin_auth=None,
     login_throttle=None,
 ) -> APIRouter:
@@ -119,12 +124,10 @@ def build_admin_router(
             login_throttle.record_success(tkey)
         token = admin_auth.login()
         resp = RedirectResponse("/admin/", status_code=303)
-        # 主机走 HTTPS(TLS 证书存在即启用)→ cookie 加 Secure,禁止明文回传
-        try:
-            from host import tls_cert
-            secure = tls_cert.current_fingerprint() is not None
-        except Exception:  # noqa: BLE001
-            secure = False
+        # 同一应用有两个入口:本机 HTTP :8442 与局域网 HTTPS :8443。
+        # Secure 必须按**本次请求协议**设置;若仅因磁盘上存在 TLS 证书就设 True,
+        # 本机 HTTP 登录成功后浏览器不会回传 cookie,表现为无限跳回登录页。
+        secure = request.url.scheme == "https"
         resp.set_cookie(ADMIN_COOKIE, token, max_age=SESSION_TTL,
                         httponly=True, samesite="lax", secure=secure)
         return resp
@@ -432,271 +435,96 @@ def build_admin_router(
         except ValueError as e:
             result = ("error", str(e))
         except Exception as e:
-            result = ("error", f"创建失败:{e}")
-        finally:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
-        return _flash_redirect("/admin/users", result) if result else \
-            RedirectResponse("/admin/users", status_code=303)
-
-    @router.get("/users/{username}/edit", response_class=HTMLResponse)
-    def user_edit_form(request: Request, username: str):
-        acct = user_manager._accounts.get(username)
-        if not acct:
-            return _flash_redirect("/admin/users",
-                                   ("error", f"用户 {username} 不存在"))
-        configs = llm_config_store.list_all()
-        cfg = llm_config_store.get(acct.llm_config_id) if acct.llm_config_id else None
-        return templates.TemplateResponse(
-            request, "user_edit.html",
-            {
-                "active": "users",
-                "user": {
-                    "username": username,
-                    "status": acct.status,
-                    "auth_id": acct.auth_id,
-                    "created_at": acct.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-                    "llm_config_id": acct.llm_config_id or "",
-                    "llm_config_name": cfg.name if cfg else "",
-                },
-                "llm_configs": configs,
-                "messages": _pop_messages(request),
-            },
-        )
-
-    @router.post("/users/{username}/password")
-    def user_update_password(request: Request, username: str, password: str = Form(...)):
-        try:
-            user_manager.update_password(username, password)
-            return _flash_redirect(
-                "/admin/users",
-                ("success", f"已更新「{username}」的密码;该用户所有现有 session 已注销"),
-            )
-        except ValueError as e:
-            return _flash_redirect("/admin/users", ("error", str(e)))
-
-    @router.post("/users/{username}/llm_config")
-    def user_set_llm_config(
-        request: Request,
-        username: str,
-        llm_config_id: str = Form(""),
-    ):
-        cfg_id: Optional[str] = llm_config_id.strip() or None
-        if cfg_id and not llm_config_store.get(cfg_id):
-            return _flash_redirect("/admin/users",
-                                   ("error", f"LLM 配置 id={cfg_id} 不存在"))
-        try:
-            user_manager.set_llm_config(username, cfg_id)
-        except ValueError as e:
-            return _flash_redirect("/admin/users", ("error", str(e)))
-        msg = (
-            f"已为用户「{username}」绑定 LLM 配置「{llm_config_store.get(cfg_id).name}」"
-            if cfg_id else f"已清空用户「{username}」的 LLM 配置(稍后补选)"
-        )
-        return _flash_redirect("/admin/users", ("success", msg))
-
-    @router.post("/users/{username}/disable")
-    def user_disable(request: Request, username: str):
-        user_manager.disable(username)
-        return _flash_redirect("/admin/users", ("success", f"用户「{username}」已禁用"))
-
-    @router.post("/users/{username}/enable")
-    def user_enable(request: Request, username: str):
-        user_manager.enable(username)
-        return _flash_redirect("/admin/users", ("success", f"用户「{username}」已启用"))
-
-    @router.post("/users/{username}/delete")
-    def user_delete(request: Request, username: str):
-        user_manager.delete_account(username)
-        auth_manager.delete(username)
+            resul…5963 tokens truncated…         columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
+            if "*" not in columns and any(c.lower() not in actual for c in columns):
+                raise ValueError("授权字段中包含结构目录不存在的字段")
+            masks = {}
+            for item in (part.strip() for part in masked_columns.split(",")):
+                if not item:
+                    continue
+                if ":" not in item:
+                    raise ValueError("脱敏配置格式应为 字段:策略，多个用逗号分隔")
+                column, strategy = item.split(":", 1)
+                masks[column.strip()] = strategy.strip()
+            if query_gateway:
+                query_gateway.validate_row_filter(
+                    data_source_id=data_source_id, row_filter_sql=row_filter_sql,
+                    catalog_columns=actual,
+                )
+            if subject.startswith("user:"):
+                username = subject.removeprefix("user:")
+                if username not in user_manager._accounts:
+                    raise ValueError("用户不存在")
+                policy = data_access_store.grant(
+                    username=username, data_source_id=data_source_id, schema_name=schema_name,
+                    table_name=table_name, allowed_columns=columns, operations=operations,
+                    max_rows=max_rows, row_filter_sql=row_filter_sql, masked_columns=masks,
+                )
+            elif subject.startswith("group:"):
+                policy = data_access_store.grant_group(
+                    group_id=subject.removeprefix("group:"), data_source_id=data_source_id,
+                    schema_name=schema_name, table_name=table_name, allowed_columns=columns,
+                    operations=operations, max_rows=max_rows,
+                    row_filter_sql=row_filter_sql, masked_columns=masks,
+                )
+            else:
+                raise ValueError("授权对象无效")
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
         return _flash_redirect(
-            "/admin/users",
-            ("success", f"已删除用户「{username}」· 证书已释放,可重新分配"),
+            "/admin/data-permissions",
+            ("success", f"已授权「{policy.username}」访问 {policy.schema_name}.{policy.table_name}"),
         )
 
-    # 向后兼容
-    @router.get("/authorizations", response_class=HTMLResponse)
-    def auth_list_compat(request: Request):
-        return RedirectResponse("/admin/users", status_code=301)
+    @router.post("/data-permissions/{policy_id}/revoke")
+    def data_permission_revoke(request: Request, policy_id: str):
+        try:
+            data_access_store.revoke(policy_id)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions", ("success", "权限已撤销并立即生效"))
 
-    @router.get("/accounts", response_class=HTMLResponse)
-    def account_list_compat(request: Request):
-        return RedirectResponse("/admin/users", status_code=301)
+    @router.post("/data-permissions/group-policies/{policy_id}/revoke")
+    def data_group_permission_revoke(request: Request, policy_id: str):
+        try:
+            data_access_store.revoke_group_policy(policy_id)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions", ("success", "组权限已撤销并立即生效"))
 
     # ============================================================
-    # LLM 配置(多配置 CRUD,统计放概览)
+    # 数据使用记录（只记录访问元数据，不保存查询结果正文）
     # ============================================================
 
-    @router.get("/llm", response_class=HTMLResponse)
-    def llm_view(request: Request):
-        configs_raw = llm_config_store.list_all()
-        configs = []
-        for c in configs_raw:
-            preset = PROVIDER_PRESETS.get(c.provider_type, {})
-            configs.append({
-                "id": c.id,
-                "name": c.name,
-                "provider_type": c.provider_type,
-                "provider_label": preset.get("label", c.provider_type),
-                "model_name": c.model_name,
-                "base_url": c.base_url or preset.get("base_url", "—"),
-                "api_key_masked": c.masked_key(),
-                "enabled": c.enabled,
-                "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-                # 是否就绪:Provider 缓存能 init(防御性,避免一次失败 init 卡住整个页面)
-                "ready": _safe_ready(provider_manager, c.id),
-            })
-
-        # 供前端 JS:provider 切换时自动填默认 base_url + 默认模型列表
-        provider_options = [
-            {"id": pid, "label": p["label"], "base_url": p["base_url"], "kind": p["kind"]}
-            for pid, p in PROVIDER_PRESETS.items()
-        ]
-        fallback_models_json = {pid: FALLBACK_MODELS.get(pid, []) for pid in PROVIDER_PRESETS}
-
+    @router.get("/data-usage", response_class=HTMLResponse)
+    def data_usage_list(request: Request, username: str = "", data_source_id: str = "",
+                        operation: str = "", status: str = ""):
+        sources = data_source_store.list_all() if data_source_store else []
+        source_names = {source.id: source.name for source in sources}
+        audits = []
+        if data_access_store:
+            for row in data_access_store.list_audits(
+                500, username=username.strip(), data_source_id=data_source_id.strip(),
+                operation=operation.strip(), status=status.strip(),
+            ):
+                item = dict(row)
+                item["source_name"] = source_names.get(item["data_source_id"],
+                                                       item["data_source_id"] or "全部授权目录")
+                try:
+                    item["tables"] = json.loads(item.pop("tables_json"))
+                    item["columns"] = json.loads(item.pop("columns_json"))
+                except (ValueError, TypeError):
+                    item["tables"], item["columns"] = [], []
+                audits.append(item)
         return templates.TemplateResponse(
-            request,
-            "llm.html",
-            {
-                "active": "llm",
-                "configs": configs,
-                "provider_options": provider_options,
-                "fallback_models_json": fallback_models_json,
-                "messages": _pop_messages(request),
-            },
+            request, "data_usage.html",
+            {"active": "data_usage", "audits": audits, "sources": sources,
+             "users": sorted(user_manager._accounts.keys()),
+             "summary": data_access_store.audit_summary() if data_access_store else {},
+             "filters": {"username": username, "data_source_id": data_source_id,
+                         "operation": operation, "status": status},
+             "messages": _pop_messages(request)},
         )
-
-    @router.post("/llm")
-    async def llm_create(
-        request: Request,
-        name: str = Form(...),
-        provider_type: str = Form(...),
-        model_name: str = Form(...),
-        api_key: str = Form(""),
-        base_url: str = Form(""),
-    ):
-        try:
-            cfg = llm_config_store.create(
-                name=name.strip(),
-                provider_type=provider_type.strip(),
-                model_name=model_name.strip(),
-                api_key=api_key.strip(),
-                base_url=base_url.strip(),
-            )
-            provider_manager.invalidate(cfg.id)
-        except ValueError as e:
-            return _flash_redirect("/admin/llm", ("error", str(e)))
-        return _flash_redirect("/admin/llm",
-                               ("success", f"已创建 LLM 配置「{cfg.name}」(id={cfg.id})"))
-
-    @router.get("/llm/{config_id}/edit", response_class=HTMLResponse)
-    def llm_edit_form(request: Request, config_id: str):
-        c = llm_config_store.get(config_id)
-        if not c:
-            return _flash_redirect("/admin/llm", ("error", "配置不存在"))
-        preset = PROVIDER_PRESETS.get(c.provider_type, {})
-        return templates.TemplateResponse(
-            request, "llm_edit.html",
-            {
-                "active": "llm",
-                "cfg": {
-                    "id": c.id,
-                    "name": c.name,
-                    "provider_type": c.provider_type,
-                    "provider_label": preset.get("label", c.provider_type),
-                    "model_name": c.model_name,
-                    "base_url": c.base_url or preset.get("base_url", "—"),
-                    "api_key_masked": c.masked_key(),
-                    "enabled": c.enabled,
-                    "created_at": c.created_at.strftime("%Y-%m-%d %H:%M:%S"),
-                },
-                "messages": _pop_messages(request),
-            },
-        )
-
-    @router.post("/llm/{config_id}/update")
-    async def llm_update(
-        request: Request,
-        config_id: str,
-        name: str = Form(...),
-    ):
-        # 只允许改"配置名"。厂商 / 模型 / API Key / Base URL 一旦保存即锁定 ——
-        # 它们决定了「概览」里按配置/模型聚合的调用统计,中途改会让历史统计口径错乱;
-        # 如需换模型,请新建一份配置(旧统计仍归属旧配置)。
-        if not name.strip():
-            return _flash_redirect(f"/admin/llm/{config_id}/edit", ("error", "配置名不能为空"))
-        try:
-            cfg = llm_config_store.update(config_id, name=name.strip())
-        except ValueError as e:
-            return _flash_redirect(f"/admin/llm/{config_id}/edit", ("error", str(e)))
-        return _flash_redirect("/admin/llm",
-                               ("success", f"已更新配置名为「{cfg.name}」"))
-
-    @router.post("/llm/{config_id}/toggle")
-    def llm_toggle(request: Request, config_id: str):
-        cfg = llm_config_store.get(config_id)
-        if not cfg:
-            return _flash_redirect("/admin/llm", ("error", "配置不存在"))
-        new_enabled = not cfg.enabled
-        llm_config_store.update(config_id, enabled=new_enabled)
-        provider_manager.invalidate(config_id)
-        verb = "启用" if new_enabled else "禁用"
-        return _flash_redirect("/admin/llm",
-                               ("success", f"已{verb}「{cfg.name}」"))
-
-    @router.post("/llm/{config_id}/delete")
-    def llm_delete(request: Request, config_id: str):
-        cfg = llm_config_store.get(config_id)
-        if not cfg:
-            return _flash_redirect("/admin/llm", ("error", "配置不存在"))
-        # 把所有指向它的用户解绑
-        for acct in user_manager._accounts.values():
-            if acct.llm_config_id == config_id:
-                acct.llm_config_id = None
-        llm_config_store.delete(config_id)
-        provider_manager.invalidate(config_id)
-        return _flash_redirect(
-            "/admin/llm",
-            ("success", f"已删除「{cfg.name}」· 引用该配置的用户已自动解绑(请重新选)"),
-        )
-
-    @router.post("/llm/discover")
-    async def llm_discover(
-        request: Request,
-        provider_type: str = Form(...),
-        api_key: str = Form(""),
-        base_url: str = Form(""),
-        config_id: str = Form(""),
-    ):
-        """AJAX:根据 api_key 拉取可用模型列表。
-
-        修改已有配置时,前端 api_key 是空(不显示明文)。这时如果带了
-        config_id,就用 store 里存的真实 key 去探测。
-        """
-        effective_key = api_key.strip()
-        used_stored = False
-        if not effective_key and config_id:
-            cfg = llm_config_store.get(config_id.strip())
-            if cfg and cfg.api_key:
-                effective_key = cfg.api_key
-                used_stored = True
-                # base_url 也补一下(用户没改的话用 store 里的)
-                if not base_url.strip():
-                    base_url = cfg.base_url or ""
-
-        models, source = discover_models(
-            provider_type.strip(),
-            effective_key,
-            base_url.strip(),
-        )
-        return JSONResponse({
-            "models": models,
-            "source": source,
-            "count": len(models),
-            "used_stored_key": used_stored,
-        })
 
     # ============================================================
     # 会话
@@ -1021,3 +849,4 @@ def _safe_ready(provider_manager: ProviderManager, config_id: str) -> bool:
 def _peek_license_days() -> int:
     """简化:固定返回(SDK 不暴露 API)。"""
     return 213
+

@@ -52,9 +52,53 @@ def test_supervisor_merges_desired_on_startup_and_adopts_in_loop():
     import inspect
     import supervisor as sup
     src = inspect.getsource(sup.main)
-    # 撞上单例锁时要把本进程角色并进期望集合(否则该角色永远没人管)
-    guard = src[:src.index("signal.signal")]
-    assert "add_desired" in guard, "单例退出前没有把角色并进期望集合"
+    handoff = inspect.getsource(sup._handoff_or_replace_existing)
+    # 撞上兼容单例时要把本进程角色并进期望集合(否则该角色永远没人管)
+    assert "add_desired" in handoff, "兼容单例退出前没有把角色并进期望集合"
+    # 撞上旧协议时必须替换,不能把请求交给不认识新角色/端口的旧进程。
+    assert "terminate_incompatible_supervisor" in handoff
     # 主循环要读期望集合并接管
     loop = src[src.index("while _running"):]
     assert "read_desired" in loop, "主循环没有接管新角色"
+
+
+def test_compatible_supervisor_receives_role_request(monkeypatch):
+    import supervisor as sup
+
+    monkeypatch.setattr(sm, "supervisor_running", lambda require_compatible=False: (True, 1234))
+    monkeypatch.setattr(sm, "supervisor_state_compatible", lambda: True)
+    merged = []
+    monkeypatch.setattr(sm, "add_desired", lambda want: merged.extend(want) or sorted(want))
+
+    assert sup._handoff_or_replace_existing(["host"]) is True
+    assert merged == ["host"]
+
+
+def test_incompatible_supervisor_is_replaced(monkeypatch):
+    import supervisor as sup
+
+    stopped = []
+    reset = []
+    monkeypatch.setattr(sm, "supervisor_running", lambda require_compatible=False: (True, 9744))
+    monkeypatch.setattr(sm, "supervisor_state_compatible", lambda: False)
+    monkeypatch.setattr(
+        sm,
+        "terminate_incompatible_supervisor",
+        lambda pid: stopped.append(pid) or True,
+    )
+    monkeypatch.setattr(sm, "set_desired", lambda want: reset.extend(want) or sorted(want))
+
+    assert sup._handoff_or_replace_existing(["host"]) is False
+    assert stopped == [9744]
+    assert reset == ["host"]
+
+
+def test_incompatible_supervisor_stop_failure_is_explicit(monkeypatch):
+    import supervisor as sup
+
+    monkeypatch.setattr(sm, "supervisor_running", lambda require_compatible=False: (True, 9744))
+    monkeypatch.setattr(sm, "supervisor_state_compatible", lambda: False)
+    monkeypatch.setattr(sm, "terminate_incompatible_supervisor", lambda pid: False)
+
+    with pytest.raises(RuntimeError, match="无法终止旧 supervisor"):
+        sup._handoff_or_replace_existing(["host"])

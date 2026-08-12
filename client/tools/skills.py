@@ -1167,14 +1167,15 @@ def skill_pivot_summary(cdf, params, metadata_rows, metadata_columns):
 
 def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
     """
-    库存周转天数 DIO = 平均库存 ÷ 期间销货成本 × 天数;并按天数分呆滞/正常档位。
+    库存周转率 = 期间销货成本 ÷ 平均库存;
+    库存周转天数 DIO = 天数 ÷ 库存周转率;并按天数分呆滞/正常档位。
     params:
       item_col  : 物料/SKU(meta 列)
       stock_col : 库存(金额或数量,encrypted)—— 作为"平均库存"
       cogs_col  : 销货成本 / 出库(encrypted)
       days?     : 期间天数(默认 365)
       slow_days?: 呆滞阈值(默认 90);正常 ≤ warn_days,warn_days?默认 60
-    输出:物料 库存 销货成本 周转天数 库存状态(正常/关注/呆滞)
+    输出:物料 库存 销货成本 库存周转率 周转天数 库存状态(正常/关注/呆滞)
     """
     import pandas as pd
     import numpy as np
@@ -1194,7 +1195,8 @@ def skill_inventory_turnover(cdf, params, metadata_rows, metadata_columns):
             raise ValueError(f"inventory_turnover: 列「{c}」不存在")
 
     g = full.groupby(item, as_index=False).agg(**{stock: (stock, "mean"), cogs: (cogs, "sum")})
-    g["周转天数"] = _inf_to_nan(g[stock] * days / g[cogs].replace(0, np.nan))
+    g["库存周转率"] = _inf_to_nan(g[cogs] / g[stock].replace(0, np.nan))
+    g["周转天数"] = _inf_to_nan(days / g["库存周转率"].replace(0, np.nan))
 
     def _tier(row):
         s, c, d = row[stock], row[cogs], row["周转天数"]
@@ -1441,9 +1443,9 @@ SKILLS: dict[str, dict[str, Any]] = {
     "inventory_turnover": {
         "tool": "pandaseal",
         "fn": skill_inventory_turnover,
-        "desc": "库存周转天数(DIO=平均库存÷销货成本×天数)+ 正常/关注/呆滞档位",
+        "desc": "库存周转率(销货成本÷平均库存)+ 周转天数(DIO)+ 正常/关注/呆滞档位",
         "params": ["item_col", "stock_col", "cogs_col", "days", "warn_days", "slow_days", "filter", "sheet_name"],
-        "note": "口径:周转天数 = 平均库存 ÷ 期间销货成本 × 天数;无销货成本的物料判为呆滞",
+        "note": "口径:库存周转率 = 期间销货成本 ÷ 平均库存;周转天数 = 天数 ÷ 库存周转率;无销货成本的物料判为呆滞",
     },
     "hr_grade": {
         "tool": "pandaseal",

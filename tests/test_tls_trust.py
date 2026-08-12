@@ -5,8 +5,11 @@ import ssl
 from pathlib import Path
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from host import tls_cert
+from host import gateway, tls_cert
+from host.admin_ui import build_admin_router
 from client import host_trust
 
 
@@ -27,10 +30,68 @@ def test_cert_san_covers_localhost(tmp_path):
     assert tls_cert._cert_covers_current_ips(cert)   # SAN 含本机 IP
 
 
+def test_gateway_builds_loopback_http_and_lan_https(tmp_path):
+    local_server, lan_server = gateway.build_servers(tmp_path)
+
+    assert local_server.config.host == "127.0.0.1"
+    assert local_server.config.port == 8442
+    assert local_server.config.lifespan == "off"
+    assert local_server.config.ssl_keyfile is None
+    assert local_server.config.ssl_certfile is None
+
+    assert lan_server.config.host == "0.0.0.0"
+    assert lan_server.config.port == 8443
+    assert lan_server.config.lifespan == "on"
+    assert Path(lan_server.config.ssl_keyfile).exists()
+    assert Path(lan_server.config.ssl_certfile).exists()
+
+
+def test_admin_cookie_secure_flag_follows_request_scheme():
+    class _Auth:
+        def verify_login(self, username, password):
+            return True
+
+        def login(self):
+            return "test-token"
+
+    app = FastAPI()
+    app.include_router(build_admin_router(
+        auth_manager=None,
+        user_manager=None,
+        dispatcher=None,
+        llm_config_store=None,
+        provider_manager=None,
+        call_stats=None,
+        admin_auth=_Auth(),
+    ))
+
+    with TestClient(app, base_url="http://127.0.0.1:8442") as client:
+        response = client.post(
+            "/admin/login",
+            data={"username": "admin", "password": "ok"},
+            follow_redirects=False,
+        )
+        assert "secure" not in response.headers["set-cookie"].lower()
+
+    with TestClient(app, base_url="https://host.example:8443") as client:
+        response = client.post(
+            "/admin/login",
+            data={"username": "admin", "password": "ok"},
+            follow_redirects=False,
+        )
+        assert "secure" in response.headers["set-cookie"].lower()
+
+
 def test_to_https():
     assert host_trust.to_https("http://192.168.1.5:8443") == "https://192.168.1.5:8443"
     assert host_trust.to_https("192.168.1.5:8443") == "https://192.168.1.5:8443"
     assert host_trust.to_https("https://h:8443") == "https://h:8443"
+
+
+def test_client_host_url_is_forced_to_lan_https_port():
+    assert host_trust.to_lan_https("http://192.168.1.5:8442") == "https://192.168.1.5:8443"
+    assert host_trust.to_lan_https("http://192.168.1.5:8443/admin") == "https://192.168.1.5:8443"
+    assert host_trust.to_lan_https("192.168.1.5") == "https://192.168.1.5:8443"
 
 
 def test_tofu_pin_and_mismatch(tmp_path, monkeypatch):

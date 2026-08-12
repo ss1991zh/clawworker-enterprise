@@ -212,7 +212,8 @@ _KNOWLEDGE_Q_MARKERS = (
 # "对这份数据操作"的强标记 —— 出现则即便像知识问题也按分析处理(在数据上算)。
 _DATA_OP_MARKERS = (
     "这份", "这个表", "这张表", "这些数据", "表里", "数据中", "数据里",
-    "上传", "附件", "文件里", "文件中", "每个人", "每位", "每人", "各位",
+    "查询结果", "数据库结果", "上传", "附件", "文件里", "文件中",
+    "每个人", "每位", "每人", "各位",
     "top", "排名", "排行", "导出", "出表", "生成excel", "生成 excel",
 )
 
@@ -441,893 +442,7 @@ def call_llm_for_freechat(
             "history": history or [],
             "web_search": bool(web_search),
         },
-        timeout=timeout,
-        should_cancel=should_cancel,
-    )
-    if r.status_code == 401:
-        raise PermissionError("登录已过期")
-    r.raise_for_status()
-    body = r.json()
-    _usage_add(body.get("usage"))
-    return body.get("text", "") or "(LLM 返回空文本)"
-
-
-def call_llm_for_plan_repair(
-    host_url: str, token: str, system_prompt: str, original_query: str, schema: dict,
-    prev_plan: ComputationPlan, warnings: list[str],
-    history: Optional[list[dict]] = None,
-    should_cancel: Optional[Callable[[], bool]] = None,
-    timeout: float = 1800.0,
-) -> tuple[ComputationPlan, str]:
-    """
-    LLM 回环修正 —— validator 检出的 warning 反馈给 LLM,要它带着上下文重出 plan。
-    场景:LLM 漏写 compute / 用了校验表里没的指标名 / num_col 字段对不上 等。
-    """
-    warn_lines = "\n".join(
-        f"  · {w[len('warn:'):].strip()}"
-        for w in warnings if w.startswith("warn:")
-    )
-    prev_plan_json = json.dumps(prev_plan.model_dump(), ensure_ascii=False, indent=2)
-    user_msg = (
-        f"用户原问题:\n{original_query}\n\n"
-        f"你刚才生成的 plan(未通过业务校验):\n"
-        f"```json\n{prev_plan_json}\n```\n\n"
-        f"**校验未修复项**:\n{warn_lines}\n\n"
-        f"数据 schema:\n{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
-        f"请按 system prompt 的「派生指标识别铁律」**完整重写一份 plan**,务必:\n"
-        f"  1. sheet_name / value_cols / sort_by 里出现的 X率 / X比例 / X占比 / X差 / X贡献\n"
-        f"     **必须在 compute 里有同名条目**(可用 op:div / sub / add / mul / formula)\n"
-        f"  2. ratio_by_group 必须有有效 num_col / den_col,字段严格取自 schema\n"
-        f"  3. 字段名直接复用 schema(含括号、单位都不要省)\n"
-        f"  4. 若 schema 缺关键字段,**改用 describe 兜底 + summary 说明缺什么**,别瞎编公式\n"
-        f"只输出 <computation_plan>...</computation_plan> + <summary>...</summary> 两段,不要解释。"
-    )
-    r = _post_cancellable(
-        f"{host_url}/llm/chat",
-        headers={"Authorization": f"Bearer {token}"},
-        json_body={
-            "system": system_prompt, "user": user_msg,
-            "history": history or [],
-        },
-        timeout=timeout,
-        should_cancel=should_cancel,
-    )
-    if r.status_code == 401:
-        raise PermissionError("登录已过期")
-    r.raise_for_status()
-    body = r.json()
-    _usage_add(body.get("usage"))
-    if "computation_plan" in body and "summary" in body:
-        plan = ComputationPlan.model_validate(body["computation_plan"])
-        return plan, body["summary"]
-    raise ValueError(f"repair LLM 返回未知格式: {list(body.keys())[:5]}")
-
-
-def call_llm_for_codegen(
-    host_url: str, token: str, system: str, user: str,
-    history: Optional[list[dict]] = None,
-    should_cancel: Optional[Callable[[], bool]] = None,
-    timeout: float = 1800.0,
-    web_search: bool = False,
-) -> str:
-    """调 host /llm/freechat 拿原始文本(含 ```python``` 代码块 + summary)。web_search 可选联网。"""
-    r = _post_cancellable(
-        f"{host_url}/llm/freechat",
-        headers={"Authorization": f"Bearer {token}"},
-        json_body={"system": system, "user": user, "history": history or [],
-                   "web_search": bool(web_search)},
-        timeout=timeout,
-        should_cancel=should_cancel,
-    )
-    if r.status_code == 401:
-        raise PermissionError("登录已过期")
-    r.raise_for_status()
-    body = r.json()
-    _usage_add(body.get("usage"))
-    return body.get("text", "") or ""
-
-
-def call_llm_for_plan(
-    host_url: str, token: str, system_prompt: str, user_query: str, schema: dict,
-    history: Optional[list[dict]] = None,
-    should_cancel: Optional[Callable[[], bool]] = None,
-    timeout: float = 1800.0,
-) -> tuple[ComputationPlan, str]:
-    """调 host /llm/chat,返回 (plan, summary)。"""
-    user_msg = (
-        f"用户问题:\n{user_query}\n\n"
-        f"数据 schema(只有字段名,没有明文数据):\n"
-        f"{json.dumps(schema, ensure_ascii=False, indent=2)}\n\n"
-        f"请按 system prompt 输出 computation_plan + summary。"
-    )
-    r = _post_cancellable(
-        f"{host_url}/llm/chat",
-        headers={"Authorization": f"Bearer {token}"},
-        json_body={
-            "system": system_prompt, "user": user_msg,
-            "history": history or [],
-        },
-        timeout=timeout,
-        should_cancel=should_cancel,
-    )
-    if r.status_code == 401:
-        raise PermissionError("登录已过期")
-    r.raise_for_status()
-    body = r.json()
-    _usage_add(body.get("usage"))
-    # 老 /llm/chat 已经返回 parse 过的 {computation_plan, summary},但我们 parse_llm_text
-    # 在 host 端可能拒掉新格式;直接再 parse 一次也能兼容
-    if "computation_plan" in body and "summary" in body:
-        plan = ComputationPlan.model_validate(body["computation_plan"])
-        return plan, body["summary"]
-    raise ValueError(f"主机返回未知格式: {list(body.keys())[:5]}")
-
-
-# ----------------------------------------------------------------------------
-# 加载密文 → CipherDataFrame
-# ----------------------------------------------------------------------------
-
-def _report_init_failed_to_host(host_url: str, token: str, log) -> None:
-    """把授权初始化失败上报主机(best-effort,失败不影响给用户的报错)。"""
-    try:
-        import httpx
-        from client import host_trust
-        httpx.post(f"{host_url}/client/report-init-failed",
-                   headers={"Authorization": f"Bearer {token}"},
-                   timeout=8, verify=host_trust.verify_for(host_url), trust_env=False)
-        log("think", "已通知主机端:本机授权初始化失败")
-    except Exception:  # noqa: BLE001
-        log("think", "上报主机授权失效未成功(不影响本次报错提示)")
-
-
-def load_cipher_df(cipher_path: Path):
-    """ps.read_excel(index_col=0) / ps.read_csv 加载密文文件。"""
-    Runtime.get().ensure_all_initialized()
-    import pandaseal as ps  # noqa: F401(初始化副作用)
-
-    suffix = cipher_path.suffix.lower()
-    if suffix == ".csv":
-        return ps.read_csv(str(cipher_path))
-    if suffix in (".xlsx", ".xls"):
-        try:
-            return ps.read_excel(str(cipher_path), index_col=0)
-        except Exception:
-            return ps.read_excel(str(cipher_path))
-    if suffix == ".json":
-        return ps.read_json(str(cipher_path))
-    raise ValueError(f"pandaseal 不支持文件类型: {suffix}")
-
-
-# ----------------------------------------------------------------------------
-# 加载 metadata + schema sidecar
-# ----------------------------------------------------------------------------
-
-def load_metadata(cipher_path: Path) -> tuple[list[dict], list[str]]:
-    """从 cipher 旁挂 *.meta.csv 加载 metadata_rows + metadata_columns。"""
-    meta_p = cipher_path.with_suffix(cipher_path.suffix + ".meta.csv")
-    if not meta_p.exists():
-        return [], []
-    try:
-        import pandas as pd
-        df = pd.read_csv(meta_p)
-        return df.to_dict("records"), list(df.columns)
-    except Exception:
-        return [], []
-
-
-def load_schema(cipher_path: Path) -> dict:
-    """从 cipher 旁挂 *.schema.json 加载 schema 推断。"""
-    schema_p = cipher_path.with_suffix(cipher_path.suffix + ".schema.json")
-    if not schema_p.exists():
-        return {}
-    try:
-        return json.loads(schema_p.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-# ----------------------------------------------------------------------------
-# 主入口:跑一次完整分析
-# ----------------------------------------------------------------------------
-
-
-def _fold_text_attachments(user_query: str, atts: Optional[list[dict]]) -> str:
-    """把 text_attachments 折到 user_query 前面 —— LLM 看到时已经合并好。"""
-    if not atts:
-        return user_query
-    parts: list[str] = []
-    for a in atts:
-        nm = a.get("name") or "attachment"
-        content = (a.get("content") or "").strip()
-        if not content:
-            continue
-        parts.append(f"[附件文件 · {nm}]\n{content}")
-    parts.append("[用户问题]")
-    parts.append(user_query)
-    return "\n\n".join(parts)
-
-
-# ---------------------------------------------------------------------------
-# 定时任务代码固化缓存 —— 首次运行成功后固化生成代码,之后每次到点复用同一份,
-# 保证同一任务每次运行的输出结构完全一致(不再"每次现写、次次不同")。
-# 任务问题或数据 schema(列名)变化 → 签名失配 → 自动重新生成。
-# ---------------------------------------------------------------------------
-
-_CODEGEN_CACHE_DIR = Path.home() / ".agent-system" / "scheduler" / "codegen_cache"
-
-
-def _codegen_cache_sig(effective_query: str, schema: dict) -> str:
-    import hashlib
-    cols = ",".join(sorted(
-        str(c.get("name", "")) for c in (schema or {}).get("columns", [])
-    ))
-    return hashlib.sha256(f"{effective_query}|{cols}".encode("utf-8")).hexdigest()[:16]
-
-
-def _codegen_cache_load(cache_key: str, sig: str) -> Optional[dict]:
-    """命中返回 {code, summary, lazy_waived};签名失配或无缓存返回 None。"""
-    import json
-    f = _CODEGEN_CACHE_DIR / f"{cache_key}.json"
-    try:
-        if not f.exists():
-            return None
-        data = json.loads(f.read_text(encoding="utf-8"))
-        if data.get("sig") != sig or not data.get("code"):
-            return None
-        return {"code": data["code"], "summary": data.get("summary") or "",
-                "lazy_waived": bool(data.get("lazy_waived"))}
-    except Exception:
-        return None
-
-
-def _codegen_cache_save(cache_key: str, sig: str, code: str, summary: str,
-                        lazy_waived: bool = False) -> None:
-    import json
-    try:
-        _CODEGEN_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        (_CODEGEN_CACHE_DIR / f"{cache_key}.json").write_text(
-            json.dumps({"sig": sig, "code": code, "summary": summary,
-                        "lazy_waived": lazy_waived},
-                       ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-    except Exception:
-        pass
-
-
-def _codegen_cache_delete(cache_key: str) -> None:
-    try:
-        (_CODEGEN_CACHE_DIR / f"{cache_key}.json").unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-# ---------------------------------------------------------------------------
-# LLM 偷懒检测 —— 用户要全量,生成代码却 head()/sample() 截断
-# ---------------------------------------------------------------------------
-
-_FULL_QUERY_PAT = re.compile(r"所有|全部|每个|每位|每人|全员|全体|逐[行条]|明细|\d{2,}\s*[个条人位]")
-_TRUNCATION_PAT = re.compile(
-    r"\.head\s*\(|\.tail\s*\(|\.sample\s*\(|\.nlargest\s*\(|\.nsmallest\s*\("
-    r"|\.iloc\s*\[\s*\d*\s*:\s*\d+"          # .iloc[:20] / .iloc[0:20]
-    r"|\.loc\s*\[\s*:\s*\d+"                  # .loc[:20]
-    r"|\[\s*:\s*\d{1,3}\s*\]"                 # full[:20] 裸切片
-)
-_TOPN_QUERY_PAT = re.compile(r"top|前\s*\d+|最[高低大小].{0,3}\d+|排名前|倒数", re.IGNORECASE)
-
-
-def _detect_lazy_truncation(query: str, code: str) -> bool:
-    """用户要全量(且没要 TOP-N)而代码里有截断 → 判定偷懒。"""
-    if not _FULL_QUERY_PAT.search(query or ""):
-        return False
-    if _TOPN_QUERY_PAT.search(query or ""):
-        return False
-    return bool(_TRUNCATION_PAT.search(code or ""))
-
-
-# 按行序计算的窗口/时序函数 —— 未排序就调用会算出"数值全错但不报错"的结果
-_WINDOW_FUNC_PAT = re.compile(
-    r"\.(?:diff|shift|pct_change|cumsum|cumprod|cummax|cummin|rolling|expanding|ewm)\s*\(|"
-    r"window\.(?:diff|lag|rolling_mean|rolling|pct_change|cumsum)\s*\(|"
-    r"\bnp\.(?:diff|gradient|cumsum|cumprod|ediff1d)\s*\("        # numpy 函数形式
-)
-_SORT_PAT = re.compile(r"\.sort_values\s*\(|\.sort_index\s*\(|\.sort\s*\(|"
-                       r"window\.[A-Za-z_]+\([^)]*sort")
-
-
-def _detect_unsorted_window_risk(code: str) -> bool:
-    """
-    代码用了按行序计算的窗口函数(环比/移动平均/累计…)但在**该调用之前没有排序**
-    → 高风险:结果可能数值全错却不报错。返回 True 表示需回喂 LLM 修正 + 禁止固化缓存。
-
-    顺序敏感:只认"排序出现在第一个窗口调用之前"。先 diff 再 sort 仍算风险
-    (diff 已在乱序数据上算完)。启发式:宁可多问一次,不让错误代码被固化后每天复用。
-    """
-    c = code or ""
-    m = _WINDOW_FUNC_PAT.search(c)
-    if not m:
-        return False
-    # 第一个窗口调用之前必须已出现排序;之后才排序 = 没救到窗口计算
-    sort_m = _SORT_PAT.search(c)
-    return not (sort_m and sort_m.start() < m.start())
-
-
-# 筛选类问题(找异常/超期/不达标…)合法输出子集,不做全量验收
-_FILTER_QUERY_PAT = re.compile(
-    r"异常|离群|超过|低于|高于|大于|小于|超出|筛选|挑出|找出|不达标|未达标|超期|逾期|大额"
-)
-
-
-def _results_look_truncated(results: list, n_src: int, query: str,
-                            metadata_rows=None, metadata_columns=None) -> int:
-    """
-    结果级偷懒验收(正则猜不全写法,行数骗不了人)。
-
-    用户口径:**数据每一行都是独立记录,任何分析都不得合并行** ——
-    "按大区 / 按产品线汇总"是排序方式,不是聚合压行;聚合 sheet 只能是
-    逐行明细之外的附加 sheet。因此全量类问题必须有一张 sheet 行数 ≈ 数据行数
-    (≥ 90%,容许剔除源合计行/坏行),否则返回最大 sheet 行数(疑似截断)。
-    豁免:TOP-N、筛选类(异常/超期…)、小数据(<30 行)。
-    """
-    if n_src < 30:
-        return 0
-    q = query or ""
-    if not _FULL_QUERY_PAT.search(q) or _TOPN_QUERY_PAT.search(q) or _FILTER_QUERY_PAT.search(q):
-        return 0
-    max_rows = 0
-    for r in results or []:
-        df = r.get("df")
-        try:
-            max_rows = max(max_rows, len(df))
-        except Exception:
-            continue
-    need = max(30, int(n_src * 0.9))
-    return max_rows if max_rows < need else 0
-
-
-def _build_done_files(decision, results, cipher_path, excel_stem, skill_calls, clean_summary, log):
-    """
-    计算完成 → 按 decision 产出下载文件(status=done 结果片段):
-      · decrypt        —— 同时产出 明文 Excel + 密文 Excel,前端两个并列下载
-      · keep_encrypted —— 产出 密文 Excel + 把结果加密暂存沙盒(供前端「解密」按钮事后解出明文)
-    任一写文件失败 → status=failed。
-    """
-    import secrets as _secrets
-    try:
-        # 密文文件加 _密文 后缀 —— 否则与明文同 stem+同秒时间戳会重名互相覆盖。
-        # staging=True:写到沙盒暂存目录,不自动落 Downloads(用户点「下载」才存)。
-        enc_path = export_skill_results_encrypted(results, cipher_path, stem=f"{excel_stem}_密文", staging=True)
-    except Exception as e:
-        return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": clean_summary}
-
-    if decision == "keep_encrypted":
-        # 结果加密暂存 → 供「解密」按钮事后解出明文(明文不落盘,直到用户点解密)
-        dec_run_id = _secrets.token_hex(8)
-        try:
-            from client.webui import sched_results
-            sched_results.persist_results_encrypted(results, dec_run_id)
-        except Exception:
-            dec_run_id = ""   # 暂存失败 → 不提供事后解密,但密文文件仍可下载
-        log("result", f"完成 · {enc_path.name}(保留密文)")
-        return {
-            "status": "done",
-            "summary": clean_summary + " · 已生成密文版 Excel;如需明文结果,点文件旁「解密」即可。",
-            "excel_path": "", "excel_name": "",
-            "enc_excel_path": str(enc_path), "enc_excel_name": enc_path.name,
-            "can_decrypt": bool(dec_run_id), "dec_run_id": dec_run_id, "dec_stem": excel_stem,
-            "skill_calls": skill_calls, "error": "",
-        }
-
-    # decrypt:明文 + 密文 两个文件,用户自由选择下载哪个(均写暂存,不自动落 Downloads)
-    try:
-        n_src = max((len(r["df"]) for r in results if r.get("df") is not None), default=0)
-        dec_path = write_skill_results(
-            results, stem=excel_stem, staging=True,
-            provenance={
-                "数据文件": cipher_path.name,
-                "执行方式": "固化技能" if skill_calls else "AI 生成代码(密态)",
-                "结果最大行数": str(n_src),
-            })
-    except Exception as e:
-        return {"status": "failed", "error": f"Excel 写入失败: {e}", "summary": clean_summary}
-    log("result", f"完成 · 明文 {dec_path.name} + 密文 {enc_path.name}")
-    return {
-        "status": "done",
-        "summary": clean_summary,
-        "excel_path": str(dec_path), "excel_name": dec_path.name,
-        "enc_excel_path": str(enc_path), "enc_excel_name": enc_path.name,
-        "can_decrypt": False,
-        "skill_calls": skill_calls, "error": "",
-    }
-
-
-_COMPOUND_MARKERS = ("、", "和", "并", "再", "同时", "然后", "以及", "+", "加上",
-                     "分别", "各", "排名", "top", "标记", "预警", "异常",
-                     "占比", "同比", "环比", "分类", "分群", "分箱")
-
-
-def _looks_compound(q: str) -> bool:
-    """粗判"复合分析问题"(多指标/多步骤),只对这类先做规划护栏,避免给简单问题平添一次 LLM 调用。"""
-    q = (q or "").lower()
-    if len(q) < 12:
-        return False
-    return sum(1 for m in _COMPOUND_MARKERS if m in q) >= 2
-
-
-_MAX_CODEGEN_ERROR_RETRIES = 2   # 真实数据执行崩溃 → 带错误反馈重生成的最大次数
-
-
-def _collect_identity_values(metadata_rows, metadata_columns, cap: int = 500) -> list:
-    """取身份列的去重取值(上限 cap),用作错误反馈的脱敏黑名单。"""
-    if not metadata_rows or not metadata_columns:
-        return []
-    seen: set = set()
-    for row in metadata_rows:
-        for c in metadata_columns:
-            v = row.get(c) if isinstance(row, dict) else None
-            if v is not None:
-                s = str(v).strip()
-                if len(s) >= 2:
-                    seen.add(s)
-            if len(seen) >= cap:
-                return list(seen)
-    return list(seen)
-
-
-def _format_exec_error_feedback(exc: Exception, code: str,
-                                identity_values: Optional[list] = None) -> str:
-    """
-    把执行异常整理成给 LLM 的修正反馈。只回传**异常类型 + 异常消息 + 出错代码行**,
-    异常消息里可能夹带数据值(如 "could not convert string to float: '张三'"),回流给 LLM
-    会破坏"明文不出本机" —— 故先做零明文过滤:模式(金额/日期/长数字)+ 身份列取值黑名单
-    (姓名/客户名等文本值没有通用模式,必须靠 blocklist 显式遮蔽)。
-    """
-    import traceback
-    etype = type(exc).__name__
-    emsg = str(exc)
-    try:
-        from client import permissions
-        # 身份列的真实取值作黑名单 —— 覆盖姓名/客户名/产品名等无模式的文本 PII
-        bl = None
-        if identity_values:
-            bl = [str(v) for v in identity_values if v is not None and len(str(v).strip()) >= 2]
-        res = permissions.scan_summary(emsg, extra_blocklist=bl)
-        if not res.clean:
-            for h in sorted(res.hits, key=lambda x: x.start, reverse=True):
-                emsg = emsg[:h.start] + "<已脱敏>" + emsg[h.end:]
-    except Exception:  # noqa: BLE001
-        pass
-    # 定位出错代码行(用户生成代码在 <string> 里执行)
-    lineno = None
-    for fr in reversed(traceback.extract_tb(exc.__traceback__)):
-        if fr.filename in ("<string>", "<generated>"):
-            lineno = fr.lineno
-            break
-    hint = ""
-    lines = code.splitlines()
-    if lineno and 1 <= lineno <= len(lines):
-        hint = f"\n出错代码行(第 {lineno} 行):{lines[lineno - 1].strip()[:120]}"
-    common = {
-        "KeyError": "列名拼错或该列不存在——列名严格照 schema,注意括号单位。",
-        "TypeError": "很可能对 CipherSeries/CipherDataFrame 直接算数,或类型不匹配——先 df = ct.decrypt_df(cdf) 取明文再用 pandas 处理。",
-        "AttributeError": "调了不存在的方法——检查是不是臆造了 API。",
-        "ValueError": "数值/形状不匹配,或含 NaN/inf 未清洗——拟合/相关前先 s = s[np.isfinite(s)]。",
-        "ZeroDivisionError": "除零——分母先 .replace(0, np.nan) 或判零。",
-    }.get(etype, "")
-    return (
-        f"⚠️ 你上次的代码在**真实数据**上执行时抛了 {etype}:{emsg[:200]}。"
-        f"{hint}\n可能原因:{common or '仔细检查上面这行。'}"
-        "请修正后重写完整代码(整段自包含,别只贴补丁)。"
-    )
-
-
-def _run_codegen_path(
-    *, effective_query, cipher_path, schema, metadata_rows, metadata_columns,
-    host_url, token, history, custom_block, excel_stem,
-    log, chk, prompt_decrypt, output_mode="interactive", run_id="",
-    cache_key="", lazy_feedback="", error_feedback="", error_retries=0,
-    web_search=False,
-) -> Optional[dict]:
-    """
-    代码生成主路径:LLM 读 SKILL.md → 写代码 → AST 扫描 → 受限 exec → Excel。
-    成功返回结果 dict;若任何环节失败,返回 None 让上层回退到固化 skill 路径。
-    cancelled / keep_encrypted 是终态,直接返回(不回退)。
-
-    output_mode:
-      "interactive"        —— 正常:算完弹解密授权(HITL),解密/保留密文/取消
-      "encrypted_sandbox"  —— 定时密态:自动允许计算,结果**加密暂存沙盒**,
-                              不写明文 Excel,返回 encrypted_run(供批量解密)
-    """
-    # 解密授权后置(与固化路径同序):计算阶段在本机内存自动放行解密
-    # (明文不出进程、不展示);算完 + 行数验收通过后,才向用户申请「解密展示」
-    # 授权 —— 行数等验收都在授权前完成,偷懒重生成也不会反复弹授权。
-    exec_prompt_decrypt = lambda: "decrypt"  # noqa: E731
-
-    # 0) 定时任务代码固化缓存:命中则跳过 LLM,直接复用首次成功的代码
-    cache_sig = ""
-    from_cache = False
-    code = ""
-    summary_raw = ""
-    lazy_waived = False
-    unsafe_window = False   # 窗口函数未排序且修正失败 → 禁止固化缓存
-    if cache_key:
-        cache_sig = _codegen_cache_sig(effective_query, schema)
-        cached = _codegen_cache_load(cache_key, cache_sig)
-        if cached:
-            code, summary_raw = cached["code"], cached["summary"]
-            # 固化代码也过偷懒检测 —— 早期定板可能把 head()/切片截断固化了进去
-            # (已豁免的不再重检,避免每次作废重生成、缓存名存实亡)
-            if not cached["lazy_waived"] and _detect_lazy_truncation(effective_query, code):
-                log("think", "固化代码截断了数据而用户要求全量 · 作废缓存,重新生成")
-                _codegen_cache_delete(cache_key)
-                code, summary_raw = "", ""
-            # 固化代码也复检窗口未排序风险 —— 加固上线前(或早期假阴性)固化的坏代码,
-            # 否则会每天复用且永不复检。命中即作废缓存,走重新生成(会带排序修正)。
-            elif _detect_unsorted_window_risk(code):
-                log("think", "固化代码有未排序窗口风险 · 作废缓存,重新生成")
-                _codegen_cache_delete(cache_key)
-                code, summary_raw = "", ""
-            else:
-                from_cache = True
-                log("think", "定时任务 · 复用首次固化的分析代码(每次运行结构保持一致)")
-
-    if not from_cache:
-        # 1) 意图路由选 SKILL.md
-        skill_docs = skills_loader.route(effective_query)
-        if not skill_docs:
-            return None
-        log("think", f"代码生成 · 加载技能文档:{' / '.join(d.name for d in skill_docs)}")
-
-        # 2) LLM 写代码(定时任务首次生成是"定板":提示补全意图,产出将被固化复用)
-        gen_query = effective_query
-        if cache_key:
-            gen_query = (
-                f"{effective_query}\n\n"
-                "(说明:这是**定时任务**的问题,会反复运行,本次生成的代码将被固化复用。"
-                "即使问题很简短,也请一次性补全分析意图,按完整专业报表标准输出:"
-                "关键指标排序+排名列、文字档位列、占比/合计、合适的图表;结构要经得起反复出表。)"
-            )
-        if lazy_feedback:
-            gen_query = f"{gen_query}\n\n{lazy_feedback}"
-        if error_feedback:
-            gen_query = f"{gen_query}\n\n{error_feedback}"
-        # 2.5) 复合问题:先出"步骤计划",用能力表校验(挡禁用算子/标授权解密),作为 codegen 脚手架。
-        #      架构上仍由单代码块执行;计划只当护栏+提示,gated 到复合问题、全程围栏、失败即跳过。
-        if _looks_compound(effective_query):
-            try:
-                from client.he_ops import planner as _planner
-                _ps, _pu = _planner.build_plan_messages(effective_query, schema)
-                _plan = _planner.parse_plan(
-                    call_llm_for_codegen(host_url, token, _ps, _pu,
-                                         history=history, should_cancel=chk, web_search=False))
-                if _plan.steps:
-                    _v = _planner.validate_plan(_plan)
-                    log("think", f"已规划 {len(_plan.steps)} 步"
-                        + (f" · 需授权解密步骤:{', '.join(_v.auth_steps)}" if _v.auth_steps else ""))
-                    _fix = ("\n⚠ 修正:" + "; ".join(_v.errors)) if _v.errors else ""
-                    gen_query = (gen_query +
-                                 "\n\n参考下面已按算子能力校验过的步骤计划实现(用可靠算子,避开禁用的):\n"
-                                 + _planner.plan_steps_text(_plan) + _fix)
-            except CancelledError:
-                raise
-            except Exception as e:  # noqa: BLE001 —— 规划失败绝不拖垮主流程
-                log("think", f"规划跳过({type(e).__name__})")
-        system, user = codegen_mod.build_codegen_messages(
-            skill_docs, schema, metadata_columns, gen_query, custom_block,
-        )
-        # 可信审计:记录"本次发给 LLM 的只有 schema 字段名 + 问题",附零明文断言
-        try:
-            from client.he_ops import audit as _audit
-            _audit.record_llm_exposure(schema, gen_query, purpose="codegen")
-        except Exception:  # noqa: BLE001 —— 审计失败不拖垮分析
-            pass
-        log("call", "调用 LLM 生成密态分析代码")
-        if chk():
-            raise CancelledError("用户已停止")
-        raw = call_llm_for_codegen(host_url, token, system, user, history=history,
-                                   should_cancel=chk, web_search=web_search)
-        if chk():
-            raise CancelledError("用户已停止")
-
-        try:
-            code, summary_raw = codegen_mod.extract_code(raw)
-        except Exception as e:
-            log("error", f"代码生成解析失败:{e} · 回退固化 skill")
-            return None
-
-        # 偷懒检测:用户要全量,代码却截断(head/sample/iloc[:N])→ 要求重写一次
-        if _detect_lazy_truncation(effective_query, code):
-            log("think", "检测到生成代码截断了数据,但用户要求全量 · 要求 LLM 重写")
-            retry_user = (
-                user + "\n\n⚠️ 你刚才的代码用 head()/sample()/iloc 截断了数据,"
-                "但用户要求处理**全部数据行**。请重写:禁止任何截断,逐行全量处理。"
-            )
-            try:
-                raw2 = call_llm_for_codegen(host_url, token, system, retry_user,
-                                            history=history, should_cancel=chk,
-                                            web_search=web_search)
-                code2, summary2 = codegen_mod.extract_code(raw2)
-                if not _detect_lazy_truncation(effective_query, code2):
-                    code, summary_raw = code2, summary2
-                    log("result", "重写完成 · 已改为全量处理")
-                else:
-                    lazy_waived = True  # 重写仍截断 · 存缓存时记豁免,下次不再反复作废
-                    log("error", "重写后仍含截断 · 按原样继续(结果可能不全)")
-            except Exception:
-                lazy_waived = True
-                log("error", "重写失败 · 按原代码继续(结果可能不全)")
-
-        # 窗口函数未排序风险:环比/移动平均等按行序算,没排序会静默算错并被固化 → 修正一次
-        if _detect_unsorted_window_risk(code):
-            log("think", "检测到窗口函数(环比/移动平均等)但代码未排序 · 要求 LLM 加时间排序")
-            retry_user = (
-                user + "\n\n⚠️ 你的代码用了 diff/shift/pct_change/rolling/cumsum 等**按行序计算**的函数,"
-                "但没有先按时间排序。这会算出**数值全错却不报错**的结果。请修正:调用这些函数前"
-                "必须先 `df = df.sort_values('<时间列>')`;多实体数据要**逐实体** groupby 后各自算"
-                "(如 `df.groupby('产品')['额'].diff()`),不能跨实体连着算。重写完整代码。"
-            )
-            try:
-                raw_w = call_llm_for_codegen(host_url, token, system, retry_user,
-                                             history=history, should_cancel=chk, web_search=web_search)
-                code_w, summary_w = codegen_mod.extract_code(raw_w)
-                if not _detect_unsorted_window_risk(code_w):
-                    code, summary_raw = code_w, summary_w
-                    log("result", "已加时间排序 · 采用修正后代码")
-                else:
-                    unsafe_window = True   # 仍未排序 · 禁止固化缓存(见下),避免每天复用错代码
-                    log("error", "修正后仍未排序 · 本次不固化缓存,避免错误代码被反复复用")
-            except CancelledError:
-                raise
-            except Exception:  # noqa: BLE001
-                unsafe_window = True
-                log("error", "窗口排序修正失败 · 本次不固化缓存")
-
-    def _retry_without_cache(reason: str) -> Optional[dict]:
-        """固化代码失效(数据形态变了等)→ 删缓存,本次就地重新生成一遍。"""
-        log("error", f"{reason} · 固化代码失效,重新生成")
-        _codegen_cache_delete(cache_key)
-        return _run_codegen_path(
-            effective_query=effective_query, cipher_path=cipher_path,
-            schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
-            host_url=host_url, token=token, history=history,
-            custom_block=custom_block, excel_stem=excel_stem,
-            log=log, chk=chk, prompt_decrypt=prompt_decrypt,
-            output_mode=output_mode, run_id=run_id, cache_key=cache_key,
-            web_search=web_search,
-        )
-
-    # 3) AST 安全扫描(缓存代码也重新扫,规则可能收紧过)
-    try:
-        codegen_mod.ast_safety_check(code)
-    except codegen_mod.UnsafeCode as e:
-        if from_cache:
-            return _retry_without_cache(f"固化代码未通过安全扫描:{e}")
-        log("error", f"生成代码未通过安全扫描:{e} · 回退固化 skill")
-        return None
-    log("result", "代码安全扫描通过")
-
-    # 4) 加载 cipher
-    log("call", f"加载密文 {cipher_path.name}")
-    try:
-        cdf = load_cipher_df(cipher_path)
-    except AuthorizationInitError as e:
-        # 仅当错误像"授权失效"才上报主机 disable —— 字典损坏/版本不匹配不上报,避免自锁账户
-        if getattr(e, "likely_authorization", True):
-            _report_init_failed_to_host(host_url, token, log)
-            hint = ("同态授权已失效(可能过期或被管理员吊销)。已通知主机端。"
-                    "请联系管理员续期/重新签发授权后,到「同态密钥」重新拉取证书。")
-        else:
-            hint = (f"密钥/字典初始化失败:{e}。多为字典文件损坏或版本不匹配 —— "
-                    "请到「同态密钥」重新上传正确的 sk / 字典文件后重试。")
-        log("error", f"初始化失败:{e}")
-        return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
-                "error": hint}
-    except Exception as e:
-        log("error", f"密文加载失败:{e} · 回退固化 skill")
-        return None
-
-    # 4.5) 明文小样本校验(建议式):用按 schema 合成的几行随机数据先跑一遍同样的密态链路,
-    #       几毫秒抓出列名错/崩溃/无产出等;硬失败→把错误反馈 LLM 重生成一次;**不硬拦**
-    #       (合成数据本机随机造、自动解密体检,不出本机、不给 LLM;只对新生成代码,固化代码跳过)。
-    if not from_cache:
-        try:
-            from client.he_ops.verifier import verify as _verify_code
-            _ncols = [str(c) for c in getattr(cdf, "columns", [])]
-            _vd = _verify_code(code, numeric_cols=_ncols, identity_cols=metadata_columns)
-            if _vd.ok:
-                log("result", f"小样本校验通过 · {_vd.summary()}")
-            else:
-                log("think", f"小样本校验未过:{_vd.error} · 反馈 LLM 重生成一次")
-                _retry = (
-                    user + f"\n\n⚠️ 你上次的代码在小样本上失败:{_vd.error}。常见原因:"
-                    "列名拼错、忘了先 `df = ct.decrypt_df(cdf)`、对 CipherSeries 误用 ct.decrypt、未把结果放进 results。"
-                    "请修正并重写完整代码。"
-                )
-                _raw3 = call_llm_for_codegen(host_url, token, system, _retry,
-                                             history=history, should_cancel=chk, web_search=web_search)
-                _code3, _summary3 = codegen_mod.extract_code(_raw3)
-                codegen_mod.ast_safety_check(_code3)
-                if _verify_code(_code3, numeric_cols=_ncols, identity_cols=metadata_columns).ok:
-                    code, summary_raw = _code3, _summary3
-                    log("result", "重生成后小样本校验通过 · 采用新代码")
-                else:
-                    log("error", "重生成仍未过 · 保留原代码,交由全量执行兜底")
-        except CancelledError:
-            raise
-        except Exception as e:  # noqa: BLE001 —— 校验器自身异常绝不拖垮主流程
-            log("think", f"小样本校验跳过(校验器异常:{type(e).__name__})")
-
-    # 5) 受限执行(decrypt 首次触发解密授权)
-    log("call", "受限执行生成代码 · 密态计算")
-    try:
-        results = codegen_mod.run_generated_code(
-            code, cdf=cdf,
-            metadata_rows=metadata_rows, metadata_columns=metadata_columns,
-            prompt_decrypt=exec_prompt_decrypt, should_cancel=chk,
-        )
-    except codegen_mod.CodegenCancelled:
-        log("error", "已停止 · 用户取消")
-        return {"status": "cancelled", "summary": "", "error": "用户已停止", "excel_path": "", "skill_calls": []}
-    except codegen_mod.CodegenTimeout as e:
-        # 死循环/超大运算超时是终态:回退固化 skill 也可能同样超时,直接报给用户
-        log("error", f"执行超时:{e}")
-        return {"status": "failed", "summary": "", "excel_path": "", "skill_calls": [],
-                "error": (f"{e}。请把问题拆小(如先按维度聚合、只看 TOP-N),"
-                          "或缩小数据范围后重试。")}
-    except codegen_mod.KeepEncrypted:
-        log("call", "用户选择保留密文 · 导出源密文 Excel")
-        try:
-            excel_path = export_cipher_as_is(cipher_path, metadata_rows, metadata_columns)
-        except Exception as e:
-            return {"status": "failed", "error": f"密文 Excel 写入失败: {e}", "summary": summary_raw}
-        log("result", f"完成 · {excel_path.name}")
-        return {
-            "status": "done",
-            "summary": "已按要求保留密文展示 · 数值列保持同态密文形式。若要明文结果请重新提问并选择「解密展示」。",
-            "excel_path": str(excel_path), "skill_calls": ["codegen"], "error": "",
-        }
-    except codegen_mod.DecryptionFailed as e:
-        # 解密失败是终态:密钥/密文不匹配、维度不符、密文损坏等。
-        # 固化 skill 用同一套密钥/密文,回退只会再失败一次且掩盖真因 ——
-        # 直接把原因报给用户,不回退。
-        log("error", f"解密失败:{e} · 已停止(不回退固化 skill)")
-        return {
-            "status": "failed",
-            "error": (
-                f"解密失败:{e}。计算已在密态完成,但结果解密这一步出错。"
-                "可重试一次;若反复出现,可能是密钥与该密文不是同一套 —— "
-                "到「同态密钥」tab 重新拉取证书,或重新上传数据后再试。"
-            ),
-            "summary": "", "excel_path": "", "skill_calls": ["codegen"],
-        }
-    except Exception as e:
-        if from_cache:
-            return _retry_without_cache(f"固化代码执行失败:{e}")
-        # 真实数据上执行崩溃 —— README 承诺的"回环自修复":把具体报错回喂 LLM 重生成,
-        # 而不是静默切到另一套固化 skill(那会给出结构迥异的结果或再撞同一个坑)。
-        if error_retries < _MAX_CODEGEN_ERROR_RETRIES:
-            _idvals = _collect_identity_values(metadata_rows, metadata_columns)
-            fb = _format_exec_error_feedback(e, code, identity_values=_idvals)
-            log("error", f"代码执行失败:{type(e).__name__}: {e} · "
-                         f"带报错反馈重生成(第 {error_retries + 1}/{_MAX_CODEGEN_ERROR_RETRIES} 次)")
-            return _run_codegen_path(
-                effective_query=effective_query, cipher_path=cipher_path,
-                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
-                host_url=host_url, token=token, history=history,
-                custom_block=custom_block, excel_stem=excel_stem,
-                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
-                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
-                web_search=web_search, lazy_feedback=lazy_feedback,
-                error_feedback=fb, error_retries=error_retries + 1,
-            )
-        log("error", f"代码执行失败且重生成 {error_retries} 次仍未通过:{e} · 回退固化 skill")
-        return None
-
-    if not results:
-        if from_cache:
-            return _retry_without_cache("固化代码没产出结果")
-        if error_retries < _MAX_CODEGEN_ERROR_RETRIES:
-            log("error", "生成代码没产出结果 · 带反馈重生成")
-            return _run_codegen_path(
-                effective_query=effective_query, cipher_path=cipher_path,
-                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
-                host_url=host_url, token=token, history=history,
-                custom_block=custom_block, excel_stem=excel_stem,
-                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
-                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
-                web_search=web_search, lazy_feedback=lazy_feedback,
-                error_feedback=(
-                    "⚠️ 你上次的代码跑完没有把任何结果放进 results 列表。"
-                    "请确保 results = [{'sheet_name':..., 'df':...}] 至少有一个元素。"
-                ),
-                error_retries=error_retries + 1,
-            )
-        log("error", "生成代码反复无产出 · 回退固化 skill")
-        return None
-    log("result", f"密态计算完成 · {len(results)} 个 sheet")
-
-    # 结果级偷懒验收:用户要全量但所有 sheet 行数都远小于数据行数 → 行数骗不了人
-    # (按身份实体聚合的行数 == 实体去重数,属合法全量,已在检查内豁免)
-    n_src = len(metadata_rows or [])
-    trunc_rows = _results_look_truncated(results, n_src, effective_query,
-                                         metadata_rows, metadata_columns)
-    if trunc_rows:
-        if from_cache:
-            return _retry_without_cache(
-                f"固化代码输出行数过少({trunc_rows} 行,数据 {n_src} 行)疑似截断")
-        if not lazy_feedback:
-            log("error",
-                f"结果疑似截断:数据 {n_src} 行,最大 sheet 仅 {trunc_rows} 行 · 带反馈重新生成")
-            return _run_codegen_path(
-                effective_query=effective_query, cipher_path=cipher_path,
-                schema=schema, metadata_rows=metadata_rows, metadata_columns=metadata_columns,
-                host_url=host_url, token=token, history=history,
-                custom_block=custom_block, excel_stem=excel_stem,
-                log=log, chk=chk, prompt_decrypt=prompt_decrypt,
-                output_mode=output_mode, run_id=run_id, cache_key=cache_key,
-                web_search=web_search,
-                error_retries=error_retries,   # 透传:截断重生成不重置 error 预算,防重试放大
-                lazy_feedback=(
-                    f"⚠️ 数据共 {n_src} 行,**每一行都是独立记录,不得合并行**;"
-                    f"但你上次只输出了 {trunc_rows} 行。请改为**逐行明细**:行数 = 数据行数。"
-                    "「按大区 / 按产品线 / 汇总」指的是**排序方式**(先按该维度排、"
-                    "组内再按指标排),不是 groupby 压行;"
-                    "聚合视角只能作为逐行明细之外的**附加** sheet。"
-                ),
-            )
-        lazy_waived = True  # 重试过仍偏少 · 按现有结果继续,缓存记豁免
-        log("think", f"重新生成后最大 sheet 仍只有 {trunc_rows} 行 · 按现有结果继续")
-
-    # 首次成功 → 固化本任务的分析代码,之后每次到点复用(输出结构一致)
-    # 窗口函数未排序且修正失败的代码绝不固化——否则错误结果会被定时任务每天复用。
-    if cache_key and not from_cache and not unsafe_window:
-        _codegen_cache_save(cache_key, cache_sig, code, summary_raw, lazy_waived=lazy_waived)
-        log("think", "已固化本任务的分析代码 · 后续每次运行保持同一结构")
-    elif cache_key and unsafe_window:
-        log("think", "本次代码有未排序窗口风险 · 不固化,下次运行会重新生成")
-
-    # 6a) 定时密态模式:结果加密暂存沙盒,不写明文 Excel
-    if output_mode == "encrypted_sandbox":
-        from client.webui import sched_results
-        log("call", "结果加密暂存(不解密)· 待批量解密")
-        try:
-            manifest = sched_results.persist_results_encrypted(results, run_id)
-        except Exception as e:
-            return {"status": "failed", "error": f"结果加密暂存失败: {e}", "summary": summary_raw}
-        log("result", f"已加密暂存 {len(manifest)} 张表 · 待你批量解密")
-        return {
-            "status": "encrypted_pending",
-            "summary": "密态计算已完成 · 结果已加密暂存(未解密)· 在「定时任务 → 待批运行」批量解密。",
-            "excel_path": "", "skill_calls": ["codegen"], "error": "",
-            "encrypted_run": {"run_id": run_id, "manifest": manifest},
-        }
-
-    # 6b) 解密展示授权(后置 · 与固化路径同序):计算与验收都已完成,才问用户
-    decision = "decrypt"
-    if prompt_decrypt:
-        log("think", f"密态计算完成 · 等待解密展示授权({len(results)} 个 sheet)")
-        try:
-            decision = prompt_decrypt() or "decrypt"
-        except CancelledError:
-            log("error", "已停止 · 用户取消")
-            return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
-                    "excel_path": "", "skill_calls": ["codegen"]}
-        log("result", f"用户选择:{'解密展示' if decision == 'decrypt' else '保留密文展示' if decision == 'keep_encrypted' else '取消'}")
-    # 可信审计:记录解密授权台账(谁/何时/哪个会话/授权解密还是保留密文)
-    try:
-        from client.he_ops import audit as _audit
-        _dec = "granted" if decision == "decrypt" else "keep_encrypted" if decision == "keep_encrypted" else "denied"
-        _audit.record_decrypt_auth(_dec, detail=f"{len(results)} 个 sheet 解密展示")
-    except Exception:  # noqa: BLE001
-        pass
-    if decision == "cancel":
-        return {"status": "cancelled", "summary": summary_raw, "error": "用户已停止",
-                "excel_path": "", "skill_calls": ["codegen"]}
-
-    # 6c) 产出下载文件(decrypt=明文+密文两个;keep_encrypted=密文+可事后解密)
-    # 零明文过滤带上身份列取值黑名单 —— 遮蔽 summary 里可能出现的姓名/客户名等文本 PII
-    fr = scan_summary(summary_raw,
-                      extra_blocklist=_collect_identity_values(metadata_rows, metadata_columns))
+   …13607 tokens truncated…identity_values(metadata_rows, metadata_columns))
     clean = summary_raw if fr.clean else "已生成分析,详见 Excel(summary 命中明文规则已隐去)。"
     log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
     return _build_done_files(decision, results, cipher_path, excel_stem, ["codegen"], clean, log)
@@ -1391,19 +506,43 @@ def _ask_impl(
         if chk():
             raise CancelledError("用户已停止")
 
-    # 把文本附件折到 user_query 顶部 —— 后续所有 LLM 调用都用这个版本
-    effective_query = _fold_text_attachments(user_query, text_attachments)
+    # 同时有 Word + Excel 也不能擅自计算：先结合用户动词分清“只读文档”还是
+    # “按文档规则计算数据”。这是本轮路由的最高优先级。
+    word_mode = _word_task_mode(user_query, cipher_path, text_attachments)
+    word_analysis_spec = word_mode == "analysis"
+    word_document_only = word_mode == "document_only"
+    effective_query = _fold_text_attachments(
+        user_query,
+        text_attachments,
+        word_analysis_spec=word_analysis_spec,
+        word_document_only=word_document_only,
+    )
     if text_attachments:
         names = [a.get("name", "") for a in text_attachments if a.get("content")]
         if names:
-            log("think", f"读取文本附件 · {' · '.join(names)}")
+            if word_analysis_spec:
+                word_names = [
+                    a.get("name", "") for a in text_attachments
+                    if a.get("content") and _is_word_attachment(a)
+                ]
+                log("think", f"先读取 Word 业务规则/公式 · {' · '.join(word_names)}")
+                log("think", "Word 规则已载入 · 准备映射加密 Excel 字段")
+            elif word_document_only:
+                log("think", "识别为 Word 文档问答 · 不触发 Excel 数据分析")
+                log("think", "只以 Word 原文为依据 · 未写明的公式不使用通用知识补全")
+            else:
+                log("think", f"读取文本附件 · {' · '.join(names)}")
 
     # 0) 意图识别 —— 不像分析就走自由聊天(允许"没附密文也能聊天")
     # 用原始 user_query 判断,不让附件内容干扰意图判断
-    is_analysis = looks_like_analysis(user_query)
+    is_analysis = _should_run_data_analysis(user_query, cipher_path, text_attachments)
     # 联网与否完全由用户的「联网搜索」开关决定:开=可联网,关=不联网(不擅自跳过按钮)。
     # 但若问的是实时信息却没开联网 → 在回复前加一句提示,告诉用户开开关,而不是让模型干巴巴拒绝。
-    need_web_tip = (not web_search) and _looks_like_web_lookup(user_query)
+    need_web_tip = (
+        not word_document_only
+        and (not web_search)
+        and _looks_like_web_lookup(user_query)
+    )
     _WEB_TIP = ("> 💡 你问的是**实时信息**,但「联网搜索」未开启,以下仅基于模型已有知识。\n"
                 "> 需要实时结果?点输入框左侧的 🌐 **联网搜索** 按钮打开后再问一次。\n\n")
 
@@ -1414,7 +553,7 @@ def _ask_impl(
 
     try:
         # 0.5) 无有效分析意图(空 / 几乎全是符号乱码)→ 直接友好追问,不硬塞给 LLM 产出莫名结果
-        if _looks_like_no_intent(user_query):
+        if _looks_like_no_intent(user_query) and word_mode == "none":
             log("think", "未识别到有效分析意图 · 追问")
             tip = ("没太看懂你想分析什么 😊 可以说得具体些,例如"
                    "「按大区算回款率并导出 Excel」「预测各产品下季度销量」"
@@ -1425,20 +564,33 @@ def _ask_impl(
 
         # 1) 没附密文 → 自由聊天(LLM 直接回答)
         if cipher_path is None:
-            log("think", "未附密文文件 · 自由聊天模式")
-            log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
+            if word_document_only:
+                log("call", "调用 LLM 进行 Word 原文问答（禁用外部公式补全）")
+            else:
+                log("think", "未附密文文件 · 自由聊天模式")
+                log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
             _ck()
-            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
+            text = call_llm_for_freechat(
+                host_url, token, effective_query, history=history, should_cancel=chk,
+                web_search=False if word_document_only else web_search,
+            )
             _ck()
             log("result", "已回复")
             return _freechat_result(text)
 
         # 2) 有密文但意图不像分析 → 仍走自由聊天
         if not is_analysis:
-            log("think", f"已附密文「{cipher_path.name}」· 但问题不像数据分析 · 自由聊天模式")
-            log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
+            if word_document_only:
+                log("think", f"忽略数据文件「{cipher_path.name}」· 本次只读取 Word")
+                log("call", "调用 LLM 进行 Word 原文问答（禁用外部公式补全）")
+            else:
+                log("think", f"已附密文「{cipher_path.name}」· 但问题不像数据分析 · 自由聊天模式")
+                log("call", "调用 LLM(freechat)" + (" · 联网搜索" if web_search else ""))
             _ck()
-            text = call_llm_for_freechat(host_url, token, effective_query, history=history, should_cancel=chk, web_search=web_search)
+            text = call_llm_for_freechat(
+                host_url, token, effective_query, history=history, should_cancel=chk,
+                web_search=False if word_document_only else web_search,
+            )
             _ck()
             log("result", "已回复")
             return _freechat_result(text)
@@ -1453,7 +605,10 @@ def _ask_impl(
     if not cipher_path.exists():
         return {"status": "failed", "error": f"密文文件不存在: {cipher_path}", "summary": ""}
 
-    log("think", f"识别意图:数据分析 · 文件「{cipher_path.name}」")
+    if word_analysis_spec:
+        log("think", f"触发 Word 规则驱动的数据分析 · 加密文件「{cipher_path.name}」")
+    else:
+        log("think", f"识别意图:数据分析 · 文件「{cipher_path.name}」")
 
     # 2) 加载 sidecar
     schema = load_schema(cipher_path)
@@ -1468,6 +623,9 @@ def _ask_impl(
         log("think", f"加载身份列 sidecar · {len(metadata_rows)} 行 · 列: {', '.join(metadata_columns[:6])}")
 
     excel_stem = derive_excel_stem(cipher_path, user_query)
+    required_metrics = _required_output_metrics(user_query)
+    if required_metrics:
+        log("think", f"锁定结果必需指标列 · {' · '.join(required_metrics)}")
 
     # ───────────────────────────────────────────────────────────
     # 主路径:代码生成(LLM 读 SKILL.md 写代码 → 安全执行)
@@ -1481,7 +639,8 @@ def _ask_impl(
             custom_block=custom_block, excel_stem=excel_stem,
             log=log, chk=chk, prompt_decrypt=prompt_decrypt,
             output_mode=output_mode, run_id=run_id,
-            cache_key=codegen_cache_key, web_search=web_search,
+            cache_key=codegen_cache_key, required_metrics=required_metrics,
+            web_search=web_search,
         )
     except CancelledError:
         log("error", "已停止 · 用户取消")
@@ -1545,7 +704,7 @@ def _ask_impl(
             try:
                 _ck()
                 plan, summary_repaired = call_llm_for_plan_repair(
-                    host_url, token, system_prompt, user_query, schema,
+                    host_url, token, system_prompt, effective_query, schema,
                     plan, plan_warnings,
                     history=history, should_cancel=chk,
                 )
@@ -1666,3 +825,4 @@ def _ask_impl(
     log("call", "产出 Excel" + ("(明文+密文)" if decision == "decrypt" else "(密文)"))
     return _build_done_files(decision, results, cipher_path, excel_stem,
                              [r["skill"] for r in results], clean, log)
+
