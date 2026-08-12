@@ -80,6 +80,7 @@ def build_admin_router(
     data_source_store=None,
     connector_registry=None,
     data_access_store=None,
+    query_gateway=None,
     admin_auth=None,
     login_throttle=None,
 ) -> APIRouter:
@@ -848,7 +849,7 @@ def build_admin_router(
         )
 
     # ============================================================
-    # 数据访问权限（第一版：用户 → 表/视图 → 字段 → 操作）
+    # 数据访问权限（用户/用户组 → 表/视图 → 行/字段 → 操作）
     # ============================================================
 
     @router.get("/data-permissions", response_class=HTMLResponse)
@@ -860,6 +861,12 @@ def build_admin_router(
             for p in data_access_store.list_all():
                 item = p.__dict__.copy()
                 item["source_name"] = source_names.get(p.data_source_id, "已删除数据源")
+                item["subject_kind"] = "user"
+                policies.append(item)
+            for p in data_access_store.list_group_policies():
+                item = p.__dict__.copy()
+                item["source_name"] = source_names.get(p.data_source_id, "已删除数据源")
+                item["subject_kind"] = "group"
                 policies.append(item)
         catalog = []
         for source in sources:
@@ -869,18 +876,55 @@ def build_admin_router(
             request, "data_permissions.html",
             {"active": "data_permissions", "policies": policies, "sources": sources,
              "catalog": catalog, "users": sorted(user_manager._accounts.keys()),
+             "groups": data_access_store.list_groups() if data_access_store else [],
              "messages": _pop_messages(request)},
         )
 
-    @router.post("/data-permissions")
-    def data_permission_grant(
-        request: Request, username: str = Form(...), data_source_id: str = Form(...),
-        schema_name: str = Form(...), table_name: str = Form(...),
-        allowed_columns: str = Form(...), operations: list[str] = Form(...),
-        max_rows: int = Form(10000),
-    ):
+    @router.post("/data-permissions/groups")
+    def data_group_create(request: Request, name: str = Form(...),
+                          description: str = Form("")):
+        try:
+            group = data_access_store.create_group(name, description)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions",
+                               ("success", f"已创建用户组「{group.name}」"))
+
+    @router.post("/data-permissions/groups/{group_id}/delete")
+    def data_group_delete(request: Request, group_id: str):
+        try:
+            data_access_store.delete_group(group_id)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions",
+                               ("success", "用户组及其组权限已删除"))
+
+    @router.post("/data-permissions/groups/{group_id}/members")
+    def data_group_member_add(request: Request, group_id: str,
+                              username: str = Form(...)):
         if username not in user_manager._accounts:
             return _flash_redirect("/admin/data-permissions", ("error", "用户不存在"))
+        try:
+            data_access_store.add_group_member(group_id, username)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions",
+                               ("success", f"已将「{username}」加入用户组"))
+
+    @router.post("/data-permissions/groups/{group_id}/members/{username}/remove")
+    def data_group_member_remove(request: Request, group_id: str, username: str):
+        data_access_store.remove_group_member(group_id, username)
+        return _flash_redirect("/admin/data-permissions",
+                               ("success", f"已将「{username}」移出用户组"))
+
+    @router.post("/data-permissions")
+    def data_permission_grant(
+        request: Request, subject: str = Form(...), data_source_id: str = Form(...),
+        schema_name: str = Form(...), table_name: str = Form(...),
+        allowed_columns: str = Form(...), operations: list[str] = Form(...),
+        max_rows: int = Form(10000), row_filter_sql: str = Form(""),
+        masked_columns: str = Form(""),
+    ):
         try:
             catalog = [c for c in data_source_store.list_catalog(data_source_id)
                        if c.schema_name == schema_name and c.table_name == table_name]
@@ -890,11 +934,37 @@ def build_admin_router(
             columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
             if "*" not in columns and any(c.lower() not in actual for c in columns):
                 raise ValueError("授权字段中包含结构目录不存在的字段")
-            policy = data_access_store.grant(
-                username=username, data_source_id=data_source_id, schema_name=schema_name,
-                table_name=table_name, allowed_columns=columns, operations=operations,
-                max_rows=max_rows,
-            )
+            masks = {}
+            for item in (part.strip() for part in masked_columns.split(",")):
+                if not item:
+                    continue
+                if ":" not in item:
+                    raise ValueError("脱敏配置格式应为 字段:策略，多个用逗号分隔")
+                column, strategy = item.split(":", 1)
+                masks[column.strip()] = strategy.strip()
+            if query_gateway:
+                query_gateway.validate_row_filter(
+                    data_source_id=data_source_id, row_filter_sql=row_filter_sql,
+                    catalog_columns=actual,
+                )
+            if subject.startswith("user:"):
+                username = subject.removeprefix("user:")
+                if username not in user_manager._accounts:
+                    raise ValueError("用户不存在")
+                policy = data_access_store.grant(
+                    username=username, data_source_id=data_source_id, schema_name=schema_name,
+                    table_name=table_name, allowed_columns=columns, operations=operations,
+                    max_rows=max_rows, row_filter_sql=row_filter_sql, masked_columns=masks,
+                )
+            elif subject.startswith("group:"):
+                policy = data_access_store.grant_group(
+                    group_id=subject.removeprefix("group:"), data_source_id=data_source_id,
+                    schema_name=schema_name, table_name=table_name, allowed_columns=columns,
+                    operations=operations, max_rows=max_rows,
+                    row_filter_sql=row_filter_sql, masked_columns=masks,
+                )
+            else:
+                raise ValueError("授权对象无效")
         except ValueError as exc:
             return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
         return _flash_redirect(
@@ -909,6 +979,14 @@ def build_admin_router(
         except ValueError as exc:
             return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
         return _flash_redirect("/admin/data-permissions", ("success", "权限已撤销并立即生效"))
+
+    @router.post("/data-permissions/group-policies/{policy_id}/revoke")
+    def data_group_permission_revoke(request: Request, policy_id: str):
+        try:
+            data_access_store.revoke_group_policy(policy_id)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions", ("success", "组权限已撤销并立即生效"))
 
     # ============================================================
     # 会话

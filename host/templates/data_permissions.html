@@ -2,23 +2,37 @@
 {% block title %}数据权限 · Admin{% endblock %}
 {% block content %}
   <h1 class="page-title">数据访问权限</h1>
-  <p class="page-subtitle">默认拒绝。只有这里明确授权的用户，才能通过数据网关访问指定表和字段；数据库密码始终不会下发。</p>
+  <p class="page-subtitle">默认拒绝。支持个人与用户组授权、行级范围和字段脱敏；所有策略由管理端查询网关强制执行，数据库密码始终不会下发。</p>
+  <div class="panel"><div class="panel-header"><h3>用户组</h3></div><div class="panel-body">
+    <form method="post" action="/admin/data-permissions/groups" class="inline-form permission-group-create">
+      <input name="name" placeholder="用户组名称，如：华东销售" required>
+      <input name="description" placeholder="用途说明（可选）">
+      <button class="btn btn-primary" type="submit">创建用户组</button>
+    </form>
+    {% if groups %}<div class="permission-groups">{% for g in groups %}<div class="permission-group-card">
+      <div><strong>{{ g.name }}</strong>{% if g.description %}<span class="muted"> · {{ g.description }}</span>{% endif %}</div>
+      <div class="group-members">{% for member in g.members %}<form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members/{{ member }}/remove"><button class="pill member-pill" title="点击移出用户组">{{ member }} ×</button></form>{% else %}<span class="muted">暂无成员</span>{% endfor %}</div>
+      <div class="group-actions"><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members" class="inline-form"><select name="username" required>{% for u in users %}<option value="{{ u }}">{{ u }}</option>{% endfor %}</select><button class="btn btn-sm">添加成员</button></form><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/delete" onsubmit="return confirm('删除用户组及其全部组权限？');"><button class="btn btn-danger btn-sm">删除组</button></form></div>
+    </div>{% endfor %}</div>{% else %}<div class="empty compact-empty">尚未创建用户组，可继续使用个人直授权。</div>{% endif %}
+  </div></div>
   <div class="panel"><div class="panel-header"><h3>现有授权</h3></div><div class="panel-body compact">
-    {% if policies %}<table class="table"><thead><tr><th>用户</th><th>数据源</th><th>表 / 视图</th><th>字段</th><th>操作</th><th>行数上限</th><th></th></tr></thead><tbody>
-    {% for p in policies %}<tr><td><strong>{{ p.username }}</strong></td><td>{{ p.source_name }}</td><td class="mono">{{ p.schema_name }}.{{ p.table_name }}</td><td class="mono ds-columns">{{ p.allowed_columns|join(', ') }}</td><td>{% for op in p.operations %}<span class="pill muted">{{ {'browse':'浏览','query':'查询','analyze':'分析','export':'导出'}[op] }}</span>{% endfor %}</td><td>{{ p.max_rows }}</td><td><form method="post" action="/admin/data-permissions/{{ p.id }}/revoke" onsubmit="return confirm('立即撤销这条权限？');"><button class="btn btn-danger btn-sm">撤销</button></form></td></tr>{% endfor %}
+    {% if policies %}<table class="table"><thead><tr><th>授权对象</th><th>数据源</th><th>表 / 视图</th><th>字段</th><th>行范围 / 脱敏</th><th>操作</th><th>行数上限</th><th></th></tr></thead><tbody>
+    {% for p in policies %}<tr><td><strong>{{ p.username }}</strong><div class="muted">{{ '用户组' if p.subject_kind == 'group' else '个人' }}</div></td><td>{{ p.source_name }}</td><td class="mono">{{ p.schema_name }}.{{ p.table_name }}</td><td class="mono ds-columns">{{ p.allowed_columns|join(', ') }}</td><td><div class="mono policy-rule">{{ p.row_filter_sql or '全部授权行' }}</div>{% if p.masked_columns %}<div class="muted">脱敏：{% for col,strategy in p.masked_columns.items() %}{{ col }}={{ {'partial':'部分隐藏','hash':'哈希','null':'置空'}[strategy] }}{% if not loop.last %}、{% endif %}{% endfor %}</div>{% endif %}</td><td>{% for op in p.operations %}<span class="pill muted">{{ {'browse':'浏览','query':'查询','analyze':'分析','export':'导出'}[op] }}</span>{% endfor %}</td><td>{{ p.max_rows }}</td><td><form method="post" action="{{ '/admin/data-permissions/group-policies/' ~ p.id ~ '/revoke' if p.subject_kind == 'group' else '/admin/data-permissions/' ~ p.id ~ '/revoke' }}" onsubmit="return confirm('立即撤销这条权限？');"><button class="btn btn-danger btn-sm">撤销</button></form></td></tr>{% endfor %}
     </tbody></table>{% else %}<div class="empty">尚未授权任何用户访问数据库。</div>{% endif %}
   </div></div>
 
-  <div class="panel"><div class="panel-header"><h3>授予表级与字段级权限</h3></div><div class="panel-body">
+  <div class="panel"><div class="panel-header"><h3>授予数据访问权限</h3></div><div class="panel-body">
     {% if not users %}<div class="alert warning">请先创建企业用户。</div>{% elif not catalog %}<div class="alert warning">请先在“数据源”页面测试连接并同步结构。</div>{% else %}
     <form method="post" action="/admin/data-permissions" id="permission-form">
       <div class="form-grid">
-        <div class="field"><label>用户</label><select name="username" required>{% for u in users %}<option value="{{ u }}">{{ u }}</option>{% endfor %}</select></div>
+        <div class="field"><label>授权对象</label><select name="subject" required><optgroup label="个人用户">{% for u in users %}<option value="user:{{ u }}">{{ u }}</option>{% endfor %}</optgroup>{% if groups %}<optgroup label="用户组">{% for g in groups %}<option value="group:{{ g.id }}">组：{{ g.name }}</option>{% endfor %}</optgroup>{% endif %}</select></div>
         <div class="field"><label>数据源</label><select name="data_source_id" id="perm-source" required>{% for s in sources %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select></div>
         <div class="field"><label>Schema</label><select name="schema_name" id="perm-schema" required></select></div>
         <div class="field"><label>表 / 视图</label><select name="table_name" id="perm-table" required></select></div>
         <div class="field"><label>允许字段（逗号分隔，* 表示全部字段）</label><input type="text" name="allowed_columns" id="perm-columns" required><div class="muted" id="perm-hint"></div></div>
         <div class="field"><label>最大返回行数</label><input type="number" name="max_rows" value="10000" min="1" max="1000000"></div>
+        <div class="field"><label>行级范围（可选）</label><input type="text" name="row_filter_sql" placeholder="如：region = '华东'"><div class="muted">仅允许列、常量、比较、IN/BETWEEN、IS NULL、AND/OR；不允许函数和子查询。</div></div>
+        <div class="field"><label>字段脱敏（可选）</label><input type="text" name="masked_columns" placeholder="如：phone:partial,id_card:hash"><div class="muted">策略：partial 部分隐藏、hash 不可逆哈希、null 置空。</div></div>
       </div>
       <div class="field" style="margin-top:18px;"><label>允许操作</label><div class="check-row"><label><input type="checkbox" name="operations" value="browse" checked> 浏览结构</label><label><input type="checkbox" name="operations" value="query" checked> 查询</label><label><input type="checkbox" name="operations" value="analyze"> 数据分析</label><label><input type="checkbox" name="operations" value="export"> 导出文件</label></div></div>
       <button class="btn btn-primary" type="submit">保存授权</button>
