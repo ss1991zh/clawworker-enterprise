@@ -1189,19 +1189,33 @@ async function renderDatabaseTab() {
   }
   $("dbBody").innerHTML = `<div class="field"><label>数据源</label><select id="dbSource">${sources.map(s=>`<option value="${esc(s.id)}">${esc(s.name)} · ${esc(s.engine)}</option>`).join("")}</select></div>
     <div class="db-catalog" id="dbCatalog"></div>
-    <div class="field"><label>只读 SQL</label><textarea id="dbSql" rows="7" placeholder="例如：SELECT id, amount FROM orders WHERE order_date >= '2026-01-01'"></textarea><p class="hint">必须明确列名，禁止 SELECT *；执行前会再次检查表、字段和行数权限。</p></div>
+    <div class="db-natural"><div class="field"><label>用大白话描述要查什么</label><textarea id="dbIntent" rows="3" placeholder="例如：按客户统计今年订单金额，取金额最高的前 20 名"></textarea><p class="hint">AI 只会看到上方授权表结构，不会看到数据库地址、密码、行级策略或任何数据行。</p></div><button class="btn-ghost" id="dbPlan">生成候选查询</button></div>
+    <div class="db-divider"><span>候选 SQL（可检查和修改）</span></div>
+    <div class="field"><label>只读 SQL</label><textarea id="dbSql" rows="7" placeholder="例如：SELECT id, amount FROM orders WHERE order_date >= '2026-01-01'"></textarea><p class="hint">必须明确列名，禁止 SELECT *；AI 生成后仍会检查表、字段、行范围、脱敏和行数权限。</p></div>
     <div class="db-actions"><button class="btn-ghost" id="dbPreview">检查并预览</button><button class="btn-primary" id="dbExecute" disabled>提取数据</button></div>
     <div id="dbPreviewBox"></div><div id="dbResult"></div>`;
-  const src=$("dbSource"), sql=$("dbSql"), execute=$("dbExecute");
+  const src=$("dbSource"), sql=$("dbSql"), intent=$("dbIntent"), execute=$("dbExecute"), plan=$("dbPlan");
   async function loadCatalog(){
     $("dbCatalog").innerHTML='<div class="db-loading">读取表结构…</div>';
     try { const rows=await api("GET",`/api/data/sources/${encodeURIComponent(src.value)}/catalog`);
-      $("dbCatalog").innerHTML=rows.map(t=>`<div class="db-table"><div class="db-table__head"><strong>${esc(t.schema)}.${esc(t.table)}</strong><span>最多 ${t.max_rows} 行 · ${t.operations.map(o=>esc(o)).join(' / ')}</span></div><div class="db-cols">${t.columns.map(c=>`<button type="button" class="db-col" data-table="${esc(t.table)}" data-col="${esc(c.name)}" title="${esc(c.type)}${c.comment?' · '+esc(c.comment):''}">${esc(c.name)} <small>${esc(c.type)}</small></button>`).join('')}</div></div>`).join('') || '<div class="db-empty">没有可见字段</div>';
+      const maskNames={partial:'部分隐藏',hash:'哈希',null:'置空'};
+      $("dbCatalog").innerHTML=rows.map(t=>`<div class="db-table"><div class="db-table__head"><strong>${esc(t.schema)}.${esc(t.table)}</strong><span>${t.row_restricted?'行范围受限 · ':''}最多 ${t.max_rows} 行 · ${t.operations.map(o=>esc(o)).join(' / ')}</span></div><div class="db-cols">${t.columns.map(c=>`<button type="button" class="db-col ${c.mask?'masked':''}" data-table="${esc(t.table)}" data-col="${esc(c.name)}" title="${esc(c.type)}${c.comment?' · '+esc(c.comment):''}${c.mask?' · '+maskNames[c.mask]+'脱敏':''}">${esc(c.name)} <small>${esc(c.type)}${c.mask?' · '+maskNames[c.mask]:''}</small></button>`).join('')}</div></div>`).join('') || '<div class="db-empty">没有可见字段</div>';
       document.querySelectorAll('.db-col').forEach(b=>b.addEventListener('click',()=>{ const txt=`SELECT ${b.dataset.col} FROM ${b.dataset.table}`; if(!sql.value.trim()) sql.value=txt; }));
     } catch(e){$("dbCatalog").innerHTML=`<div class="alert-box">${esc(e.message)}</div>`;}
   }
   src.addEventListener('change',()=>{execute.disabled=true; $("dbPreviewBox").innerHTML=''; loadCatalog();});
   sql.addEventListener('input',()=>{execute.disabled=true;});
+  plan.addEventListener('click',async()=>{
+    const q=intent.value.trim(); if(!q){intent.focus(); return;}
+    plan.disabled=true; plan.textContent='正在生成…'; execute.disabled=true;
+    $("dbPreviewBox").innerHTML='<div class="db-loading">AI 正在根据授权结构生成候选，并通过安全网关检查…</div>';
+    try { const p=await api("POST","/api/data/query/plan",{data_source_id:src.value,intent:q,operation:'query'});
+      sql.value=p.sql;
+      $("dbPreviewBox").innerHTML=`<div class="db-preview db-ai-preview"><strong>候选查询已生成，尚未执行</strong><div>${esc(p.explanation)}</div><div>将访问：${p.tables.map(esc).join('、')} · 字段：${p.columns.map(esc).join('、')} · 最多 ${p.max_rows} 行</div><code>${esc(p.preview_sql||p.sql)}</code><div class="db-confirm-note">上方为安全网关将实际执行的预览。请检查编辑框和访问范围；确认无误后再点击“提取数据”。</div></div>`;
+      execute.disabled=false;
+    } catch(e){$("dbPreviewBox").innerHTML=`<div class="alert-box">生成失败：${esc(e.message)}</div>`;}
+    finally {plan.disabled=false; plan.textContent='生成候选查询';}
+  });
   $("dbPreview").addEventListener('click',async()=>{
     execute.disabled=true; $("dbPreviewBox").innerHTML='<div class="db-loading">正在检查权限与 SQL…</div>';
     try { const p=await api("POST","/api/data/query/preview",{data_source_id:src.value,sql:sql.value,operation:'query'});

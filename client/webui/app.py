@@ -564,6 +564,14 @@ async def api_data_query_preview(request: Request):
     return _host_api("POST", "/data/query/preview", json_body=payload)
 
 
+@app.post("/api/data/query/plan")
+async def api_data_query_plan(request: Request):
+    if not _is_logged_in():
+        return _need_login()
+    payload = await request.json()
+    return _host_api("POST", "/data/query/plan", json_body=payload, timeout=120.0)
+
+
 @app.post("/api/data/query/execute")
 async def api_data_query_execute(request: Request):
     if not _is_logged_in():
