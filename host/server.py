@@ -219,10 +219,78 @@ def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
     return out
 
 
+def _authorized_catalog_rows(username: str, source_id: str) -> list[dict]:
+    """供自然语言规划复用授权目录；不包含数据库凭据、行策略正文或数据行。"""
+    policies = data_access_store.list_for_user(username, source_id)
+    if not policies:
+        return []
+    catalog = data_source_store.list_catalog(source_id)
+    rows = []
+    for schema_key, table_key in sorted({
+        (p.schema_name.lower(), p.table_name.lower()) for p in policies
+    }):
+        matches = [p for p in policies if p.schema_name.lower() == schema_key
+                   and p.table_name.lower() == table_key]
+        columns = [c for c in catalog if c.schema_name.lower() == schema_key
+                   and c.table_name.lower() == table_key
+                   and any(p.permits_column(c.column_name) for p in matches)]
+        rows.append({
+            "schema": matches[0].schema_name, "table": matches[0].table_name,
+            "columns": [{"name": c.column_name, "type": c.data_type,
+                         "mask": query_gateway._effective_mask([matches], c.column_name)}
+                        for c in columns],
+        })
+    return rows
+
+
 class DataQueryRequest(BaseModel):
     data_source_id: str
     sql: str
     operation: str = "query"
+
+
+class NaturalDataQueryRequest(BaseModel):
+    data_source_id: str
+    intent: str
+    operation: str = "query"
+
+
+@app.post("/data/query/plan")
+def plan_natural_data_query(req: NaturalDataQueryRequest,
+                            sess=Depends(get_current_session)):
+    from host.nl_query import NaturalQueryError, generate_candidate
+
+    source = data_source_store.get(req.data_source_id)
+    if not source or not source.enabled:
+        raise HTTPException(404, "数据源不存在或已停用")
+    catalog = _authorized_catalog_rows(sess.username, source.id)
+    if not catalog:
+        raise HTTPException(403, "没有此数据源的访问权限")
+    provider, cfg = _resolve_user_provider(sess.username)
+    try:
+        candidate = generate_candidate(
+            provider, engine=source.engine, source_name=source.name,
+            intent=req.intent, catalog=catalog,
+        )
+        preview = query_gateway.preview(
+            username=sess.username, data_source_id=source.id,
+            sql=candidate.sql, operation=req.operation,
+        )
+    except NaturalQueryError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    except QueryDenied as exc:
+        raise HTTPException(422, f"候选查询未通过安全检查：{exc}") from exc
+    usage = getattr(provider, "last_usage", {}) or {}
+    pt, ct = int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)
+    cost = usage.get("cost_usd")
+    if cost is None:
+        cost = estimate_cost(cfg.model_name, pt, ct)
+    call_stats.record(config=cfg, username=sess.username, prompt_tokens=pt,
+                      completion_tokens=ct, success=True, cost_usd=float(cost))
+    return {"sql": candidate.sql, "preview_sql": preview.sql,
+            "explanation": candidate.explanation,
+            "tables": preview.tables, "columns": preview.columns,
+            "max_rows": preview.max_rows, "requires_confirmation": True}
 
 
 @app.post("/data/query/preview")
