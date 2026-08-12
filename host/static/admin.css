@@ -614,3 +614,17 @@ form select:focus {
 /* 邮件设置:授权码获取提示 */
 .smtp-hint { margin-top: 8px; font-size: 12px; line-height: 1.6; color: var(--text-muted);
   background: var(--pill-bg); border-radius: 8px; padding: 8px 12px; }
+
+/* 数据权限：用户组、成员、行级与脱敏策略 */
+.permission-group-create { margin-bottom: 14px; }
+.permission-group-create input { min-width: 220px; }
+.permission-groups { display: grid; grid-template-columns: repeat(auto-fit,minmax(300px,1fr)); gap: 12px; }
+.permission-group-card { border: 1px solid var(--border); border-radius: 10px; padding: 14px; background: var(--surface); }
+.group-members { display: flex; flex-wrap: wrap; gap: 6px; min-height: 30px; align-items: center; margin: 10px 0; }
+.group-members form { display: inline; }
+.member-pill { border: 0; cursor: pointer; }
+.group-actions { display: flex; justify-content: space-between; gap: 10px; align-items: center; flex-wrap: wrap; }
+.group-actions select { min-width: 130px; }
+.policy-rule { max-width: 260px; overflow-wrap: anywhere; font-size: 12px; }
+.compact-empty { padding: 12px 0 0; }
+

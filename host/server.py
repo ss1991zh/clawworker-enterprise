@@ -122,6 +122,7 @@ app.include_router(
         data_source_store=data_source_store,
         connector_registry=connector_registry,
         data_access_store=data_access_store,
+        query_gateway=query_gateway,
         admin_auth=admin_auth,
         login_throttle=_login_throttle,
     )
@@ -197,15 +198,23 @@ def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
         raise HTTPException(403, "没有此数据源的访问权限")
     catalog = data_source_store.list_catalog(source_id)
     out = []
-    for policy in policies:
-        columns = [c for c in catalog if c.schema_name.lower() == policy.schema_name.lower()
-                   and c.table_name.lower() == policy.table_name.lower()
-                   and policy.permits_column(c.column_name)]
+    keys = sorted({(p.schema_name.lower(), p.table_name.lower()) for p in policies})
+    for schema_key, table_key in keys:
+        matches = [p for p in policies if p.schema_name.lower() == schema_key
+                   and p.table_name.lower() == table_key]
+        columns = [c for c in catalog if c.schema_name.lower() == schema_key
+                   and c.table_name.lower() == table_key
+                   and any(p.permits_column(c.column_name) for p in matches)]
         out.append({
-            "schema": policy.schema_name, "table": policy.table_name,
-            "columns": [{"name": c.column_name, "type": c.data_type,
-                         "nullable": c.nullable, "comment": c.comment} for c in columns],
-            "operations": list(policy.operations), "max_rows": policy.max_rows,
+            "schema": matches[0].schema_name, "table": matches[0].table_name,
+            "columns": [{
+                "name": c.column_name, "type": c.data_type,
+                "nullable": c.nullable, "comment": c.comment,
+                "mask": query_gateway._effective_mask([matches], c.column_name),
+            } for c in columns],
+            "operations": sorted({op for p in matches for op in p.operations}),
+            "max_rows": max(p.max_rows for p in matches),
+            "row_restricted": bool(matches) and all(p.row_filter_sql.strip() for p in matches),
         })
     return out
 
@@ -542,3 +551,4 @@ def chat(req: ChatRequest, sess=Depends(get_current_session)):
     dispatcher.complete(task_id, resp.model_dump())
     return {**resp.model_dump(),
             "usage": {"prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct}}
+
