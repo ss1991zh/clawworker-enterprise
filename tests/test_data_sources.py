@@ -76,6 +76,8 @@ def test_crud_toggle_and_password_preserved_on_blank_update(tmp_path):
 @pytest.mark.parametrize("field,value", [
     ("engine", "oracle"), ("port", 70000), ("max_rows", 0),
     ("connect_timeout_seconds", 0), ("query_timeout_seconds", 4000),
+    ("max_result_bytes", 1024), ("max_concurrent_queries", 0),
+    ("max_queries_per_minute", 0),
 ])
 def test_validation_rejects_unsafe_values(tmp_path, field, value):
     store = _store(tmp_path)
@@ -127,3 +129,20 @@ def test_safe_error_redacts_common_connection_string_passwords():
     message = safe_error(RuntimeError("PWD=hunter2; Password=secret host down"), "hunter2")
     assert "hunter2" not in message
     assert "secret" not in message
+
+
+def test_old_control_database_is_migrated_with_execution_limits(tmp_path):
+    db = tmp_path / "legacy.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("""CREATE TABLE data_sources (
+            id TEXT PRIMARY KEY, name TEXT, engine TEXT, host TEXT, port INTEGER,
+            database_name TEXT, username TEXT, password_cipher TEXT, ssl_mode TEXT,
+            ca_path TEXT, connect_timeout_seconds INTEGER, query_timeout_seconds INTEGER,
+            max_rows INTEGER, enabled INTEGER, created_at TEXT, updated_at TEXT,
+            last_test_status TEXT, last_test_message TEXT, last_test_at TEXT,
+            catalog_synced_at TEXT)""")
+    store = DataSourceStore(db, harden=lambda path: True, require_encryption=False)
+    with sqlite3.connect(db) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(data_sources)")}
+    assert {"max_result_bytes", "max_concurrent_queries", "max_queries_per_minute"} <= columns
+

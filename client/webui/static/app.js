@@ -342,7 +342,7 @@ function updateSessionChrome() {
   const pendBtn = document.querySelector('#taskActions [data-tpanel="pending"]');
   if (pendBtn) {
     const isData = !!(meta && meta.task_needs_data);
-    pendBtn.style.disp…34230 tokens truncated…L =
+    pendBtn.style.disp…34741 tokens truncated…L =
       `<div class="alert-box">加载失败:${esc(e.message)}</div>`;
   }
 }

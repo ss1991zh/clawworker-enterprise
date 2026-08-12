@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import secrets
+import json
+import threading
 import time
 from contextlib import closing
 from dataclasses import dataclass
@@ -15,6 +17,61 @@ class QueryDenied(ValueError):
     def __init__(self, message: str, code: str = "query_denied"):
         super().__init__(message)
         self.code = code
+
+
+class QueryCancelled(RuntimeError):
+    pass
+
+
+class QueryTimedOut(RuntimeError):
+    pass
+
+
+class ResultTooLarge(RuntimeError):
+    pass
+
+
+class QueryExecutionSignal:
+    """线程安全的查询中止信号；任务管理器可在驱动执行期间调用 cancel。"""
+
+    def __init__(self) -> None:
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._cancel_driver = None
+        self.reason = ""
+
+    def bind(self, callback) -> None:
+        with self._lock:
+            self._cancel_driver = callback
+            already_cancelled = self._event.is_set()
+        if already_cancelled:
+            self._invoke(callback)
+
+    def clear_driver(self) -> None:
+        with self._lock:
+            self._cancel_driver = None
+
+    def cancel(self, reason: str = "cancelled") -> None:
+        with self._lock:
+            if not self._event.is_set():
+                self.reason = reason
+                self._event.set()
+            callback = self._cancel_driver
+        if callback:
+            self._invoke(callback)
+
+    @staticmethod
+    def _invoke(callback) -> None:
+        try:
+            callback()
+        except Exception:
+            pass
+
+    def raise_if_cancelled(self) -> None:
+        if self._event.is_set():
+            if self.reason == "timeout":
+                raise QueryTimedOut("查询超过管理员设置的时间限制")
+            raise QueryCancelled("查询已由用户取消")
 
 
 @dataclass(frozen=True)
@@ -311,16 +368,20 @@ class QueryGateway:
                               "invalid_row_policy")
 
     def execute(self, *, username: str, data_source_id: str, sql: str,
-                operation: str = "query") -> dict:
-        request_id = secrets.token_hex(10)
+                operation: str = "query", request_id: str = "",
+                signal: QueryExecutionSignal | None = None) -> dict:
+        request_id = request_id or secrets.token_hex(10)
         started = time.monotonic()
         plan = None
+        signal = signal or QueryExecutionSignal()
         try:
+            signal.raise_if_cancelled()
             plan = self.plan(username=username, data_source_id=data_source_id,
                              sql=sql, operation=operation)
             source = self.sources.get(data_source_id)
             password = self.sources.get_password(data_source_id)
-            columns, rows = self._execute(source, password, plan)
+            columns, rows, result_bytes = self._execute(source, password, plan, signal)
+            signal.raise_if_cancelled()
             duration = int((time.monotonic() - started) * 1000)
             self.access.record_audit(
                 request_id=request_id, username=username, data_source_id=data_source_id,
@@ -330,7 +391,34 @@ class QueryGateway:
             )
             return {"request_id": request_id, "columns": columns, "rows": rows,
                     "row_count": len(rows), "truncated_at": plan.max_rows,
-                    "duration_ms": duration}
+                    "result_bytes": result_bytes, "duration_ms": duration}
+        except QueryCancelled:
+            self.access.record_audit(
+                request_id=request_id, username=username, data_source_id=data_source_id,
+                operation=operation, sql_text=(plan.sql if plan else sql),
+                tables=list(plan.tables) if plan else [], columns=list(plan.columns) if plan else [],
+                status="cancelled", duration_ms=int((time.monotonic()-started)*1000),
+                error_code="cancelled",
+            )
+            raise
+        except QueryTimedOut:
+            self.access.record_audit(
+                request_id=request_id, username=username, data_source_id=data_source_id,
+                operation=operation, sql_text=(plan.sql if plan else sql),
+                tables=list(plan.tables) if plan else [], columns=list(plan.columns) if plan else [],
+                status="timeout", duration_ms=int((time.monotonic()-started)*1000),
+                error_code="query_timeout",
+            )
+            raise
+        except ResultTooLarge:
+            self.access.record_audit(
+                request_id=request_id, username=username, data_source_id=data_source_id,
+                operation=operation, sql_text=(plan.sql if plan else sql),
+                tables=list(plan.tables) if plan else [], columns=list(plan.columns) if plan else [],
+                status="denied", duration_ms=int((time.monotonic()-started)*1000),
+                error_code="result_too_large",
+            )
+            raise
         except QueryDenied as exc:
             self.access.record_audit(
                 request_id=request_id, username=username, data_source_id=data_source_id,
@@ -350,11 +438,18 @@ class QueryGateway:
             )
             raise RuntimeError(safe_error(exc)) from exc
 
-    def _execute(self, source: DataSource, password: str, plan: QueryPlan):
+    def _execute(self, source: DataSource, password: str, plan: QueryPlan,
+                 signal: QueryExecutionSignal):
         connector = self.connectors.for_engine(source.engine)
         with closing(connector._connect(source, password)) as conn:
             cur = conn.cursor()
             try:
+                cancel_driver = getattr(cur, "cancel", None)
+                if not callable(cancel_driver):
+                    cancel_driver = getattr(conn, "cancel", None)
+                if not callable(cancel_driver):
+                    cancel_driver = conn.close
+                signal.bind(cancel_driver)
                 if source.engine == "mysql":
                     cur.execute("SET SESSION TRANSACTION READ ONLY")
                     cur.execute(f"SET SESSION MAX_EXECUTION_TIME={source.query_timeout_seconds * 1000}")
@@ -363,10 +458,47 @@ class QueryGateway:
                     cur.execute("SET statement_timeout = %s", (source.query_timeout_seconds * 1000,))
                 elif source.engine == "sqlserver":
                     cur.execute(f"SET LOCK_TIMEOUT {source.query_timeout_seconds * 1000}")
+                    try:
+                        cur.timeout = source.query_timeout_seconds
+                    except Exception:
+                        pass
+                signal.raise_if_cancelled()
                 cur.execute(plan.sql)
+                signal.raise_if_cancelled()
                 headers = [str(d[0]) for d in (cur.description or [])]
-                rows = [list(row) for row in cur.fetchmany(plan.max_rows)]
-                return headers, rows
+                result_bytes = len(json.dumps(headers, ensure_ascii=False).encode("utf-8"))
+                rows = []
+                while len(rows) < plan.max_rows:
+                    signal.raise_if_cancelled()
+                    batch = cur.fetchmany(min(256, plan.max_rows - len(rows)))
+                    if not batch:
+                        break
+                    for raw in batch:
+                        row = list(raw)
+                        result_bytes += len(json.dumps(
+                            row, ensure_ascii=False, default=str,
+                        ).encode("utf-8"))
+                        if result_bytes > source.max_result_bytes:
+                            raise ResultTooLarge(
+                                f"查询结果超过管理员设置的 {source.max_result_bytes // 1048576} MB 限制"
+                            )
+                        rows.append(row)
+                return headers, rows, result_bytes
+            except (QueryCancelled, QueryTimedOut, ResultTooLarge):
+                raise
+            except Exception as exc:
+                signal.raise_if_cancelled()
+                text = safe_error(exc).lower()
+                if any(marker in text for marker in (
+                    "timeout", "timed out", "statement timeout", "maximum statement execution",
+                    "query timeout", "hyt00", "hyt01",
+                )):
+                    raise QueryTimedOut("查询超过管理员设置的时间限制") from exc
+                raise
             finally:
-                cur.close()
+                signal.clear_driver()
+                try:
+                    cur.close()
+                except Exception:
+                    pass
 

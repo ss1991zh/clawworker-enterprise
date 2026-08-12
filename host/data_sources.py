@@ -45,6 +45,9 @@ class DataSource:
     connect_timeout_seconds: int
     query_timeout_seconds: int
     max_rows: int
+    max_result_bytes: int
+    max_concurrent_queries: int
+    max_queries_per_minute: int
     enabled: bool
     created_at: str
     updated_at: str
@@ -152,13 +155,25 @@ class DataSourceStore:
                     ON data_catalog_columns(data_source_id, schema_name, table_name);
                 """
             )
+            # 1.6.1 查询执行管控。SQLite 的 CREATE TABLE IF NOT EXISTS 不会给旧库
+            # 自动补列，因此逐列做兼容迁移；已有数据源直接继承安全默认值。
+            existing = {row[1] for row in conn.execute("PRAGMA table_info(data_sources)")}
+            migrations = {
+                "max_result_bytes": "INTEGER NOT NULL DEFAULT 52428800",
+                "max_concurrent_queries": "INTEGER NOT NULL DEFAULT 1",
+                "max_queries_per_minute": "INTEGER NOT NULL DEFAULT 20",
+            }
+            for column, definition in migrations.items():
+                if column not in existing:
+                    conn.execute(f"ALTER TABLE data_sources ADD COLUMN {column} {definition}")
             self._harden(self.db_path)
 
     @staticmethod
     def _validate(
         *, name: str, engine: str, host: str, port: int, database_name: str,
         username: str, ssl_mode: str, connect_timeout_seconds: int,
-        query_timeout_seconds: int, max_rows: int,
+        query_timeout_seconds: int, max_rows: int, max_result_bytes: int,
+        max_concurrent_queries: int, max_queries_per_minute: int,
     ) -> None:
         if not name.strip():
             raise ValueError("数据源名称不能为空")
@@ -180,6 +195,12 @@ class DataSourceStore:
             raise ValueError("查询超时必须在 1～3600 秒之间")
         if not 1 <= int(max_rows) <= 1_000_000:
             raise ValueError("最大返回行数必须在 1～1,000,000 之间")
+        if not 1 * 1024 * 1024 <= int(max_result_bytes) <= 1024 * 1024 * 1024:
+            raise ValueError("最大结果大小必须在 1～1024 MB 之间")
+        if not 1 <= int(max_concurrent_queries) <= 20:
+            raise ValueError("单用户并发查询数必须在 1～20 之间")
+        if not 1 <= int(max_queries_per_minute) <= 600:
+            raise ValueError("每分钟查询次数必须在 1～600 之间")
 
     def _encrypt_password(self, password: str) -> str:
         if not password:
@@ -201,7 +222,8 @@ class DataSourceStore:
         database_name: str, username: str, password: str,
         ssl_mode: str = "prefer", ca_path: str = "",
         connect_timeout_seconds: int = 8, query_timeout_seconds: int = 60,
-        max_rows: int = 10_000,
+        max_rows: int = 10_000, max_result_bytes: int = 50 * 1024 * 1024,
+        max_concurrent_queries: int = 1, max_queries_per_minute: int = 20,
     ) -> DataSource:
         engine = engine.strip().lower()
         actual_port = int(port or DEFAULT_PORTS.get(engine, 0))
@@ -211,6 +233,9 @@ class DataSourceStore:
             ssl_mode=ssl_mode.strip().lower(),
             connect_timeout_seconds=int(connect_timeout_seconds),
             query_timeout_seconds=int(query_timeout_seconds), max_rows=int(max_rows),
+            max_result_bytes=int(max_result_bytes),
+            max_concurrent_queries=int(max_concurrent_queries),
+            max_queries_per_minute=int(max_queries_per_minute),
         )
         self._validate(**values)
         password_cipher = self._encrypt_password(password)
@@ -221,12 +246,15 @@ class DataSourceStore:
                     """INSERT INTO data_sources
                     (id,name,engine,host,port,database_name,username,password_cipher,
                      ssl_mode,ca_path,connect_timeout_seconds,query_timeout_seconds,max_rows,
+                     max_result_bytes,max_concurrent_queries,max_queries_per_minute,
                      enabled,created_at,updated_at)
-                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)""",
                     (source_id, values["name"], engine, values["host"], actual_port,
                      values["database_name"], values["username"], password_cipher,
                      values["ssl_mode"], ca_path.strip(), values["connect_timeout_seconds"],
-                     values["query_timeout_seconds"], values["max_rows"], now, now),
+                     values["query_timeout_seconds"], values["max_rows"],
+                     values["max_result_bytes"], values["max_concurrent_queries"],
+                     values["max_queries_per_minute"], now, now),
                 )
         except sqlite3.IntegrityError as exc:
             raise ValueError(f"数据源名称「{values['name']}」已存在") from exc
@@ -247,12 +275,16 @@ class DataSourceStore:
             "connect_timeout_seconds": int(changes.get("connect_timeout_seconds", current.connect_timeout_seconds)),
             "query_timeout_seconds": int(changes.get("query_timeout_seconds", current.query_timeout_seconds)),
             "max_rows": int(changes.get("max_rows", current.max_rows)),
+            "max_result_bytes": int(changes.get("max_result_bytes", current.max_result_bytes)),
+            "max_concurrent_queries": int(changes.get("max_concurrent_queries", current.max_concurrent_queries)),
+            "max_queries_per_minute": int(changes.get("max_queries_per_minute", current.max_queries_per_minute)),
         }
         self._validate(**merged)
         fields = [
             "name=?", "engine=?", "host=?", "port=?", "database_name=?", "username=?",
             "ssl_mode=?", "ca_path=?", "connect_timeout_seconds=?",
-            "query_timeout_seconds=?", "max_rows=?", "updated_at=?",
+            "query_timeout_seconds=?", "max_rows=?", "max_result_bytes=?",
+            "max_concurrent_queries=?", "max_queries_per_minute=?", "updated_at=?",
             "last_test_status='untested'", "last_test_message=''", "last_test_at=''",
         ]
         params: list[object] = [
@@ -260,7 +292,8 @@ class DataSourceStore:
             merged["database_name"], merged["username"], merged["ssl_mode"],
             str(changes.get("ca_path", current.ca_path)).strip(),
             merged["connect_timeout_seconds"], merged["query_timeout_seconds"],
-            merged["max_rows"], _now(),
+            merged["max_rows"], merged["max_result_bytes"],
+            merged["max_concurrent_queries"], merged["max_queries_per_minute"], _now(),
         ]
         if password:
             fields.append("password_cipher=?")
@@ -367,3 +400,4 @@ class DataSourceStore:
                 (source_id,),
             ).fetchall()
         return [CatalogColumn(**{**dict(row), "nullable": bool(row["nullable"])}) for row in rows]
+

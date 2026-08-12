@@ -460,7 +460,7 @@ def login_submit(
 
     body = r.json()
     with _lock:
-        _session_state.up…20558 tokens truncated…安装 croniter")
+        _session_state.up…20774 tokens truncated…安装 croniter")
         except Exception:
             raise HTTPException(400, "cron 表达式不合法(标准 5 段:分 时 日 月 周)")
     cipher_path = (data.get("cipher_path") or "").strip()

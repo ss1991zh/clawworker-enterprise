@@ -94,6 +94,37 @@ def test_encryption_failure_still_deletes_plaintext(tmp_path, monkeypatch):
     assert not plaintext.exists()
 
 
+def test_local_excel_size_limit_is_checked_before_encryption(tmp_path, monkeypatch):
+    class NamedTemp:
+        def __init__(self, *args, **kwargs):
+            self.name = str(tmp_path / "oversized.xlsx")
+        def __enter__(self):
+            Path(self.name).touch()
+            return self
+        def __exit__(self, *args): return False
+
+    encrypted_called = False
+    def must_not_encrypt(*args, **kwargs):
+        nonlocal encrypted_called
+        encrypted_called = True
+
+    monkeypatch.setattr(app_mod.tempfile, "NamedTemporaryFile", NamedTemp)
+    monkeypatch.setattr("pandas.DataFrame.to_excel",
+                        lambda self, path, index=False: Path(path).write_bytes(b"x" * 100))
+    monkeypatch.setattr(app_mod, "_ingest_plaintext_path", must_not_encrypt)
+    try:
+        app_mod._encrypt_database_result(
+            {"columns": ["id"], "rows": [[1]], "max_result_bytes": 50},
+            {"data_source_id": "erp"},
+        )
+    except Exception as exc:
+        assert "超过管理员设置" in str(exc)
+    else:
+        raise AssertionError("超出本地结果文件大小限制时必须拒绝")
+    assert encrypted_called is False
+    assert not (tmp_path / "oversized.xlsx").exists()
+
+
 def test_model_analysis_starts_only_after_database_result_is_local_cipher(
     tmp_path, monkeypatch,
 ):

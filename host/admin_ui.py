@@ -435,7 +435,7 @@ def build_admin_router(
         except ValueError as e:
             result = ("error", str(e))
         except Exception as e:
-            resul…5810 tokens truncated…         columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
+            resul…5963 tokens truncated…         columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
             if "*" not in columns and any(c.lower() not in actual for c in columns):
                 raise ValueError("授权字段中包含结构目录不存在的字段")
             masks = {}

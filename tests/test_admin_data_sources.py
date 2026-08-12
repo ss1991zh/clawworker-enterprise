@@ -55,9 +55,14 @@ def test_data_source_page_and_end_to_end_admin_actions(tmp_path):
         "database_name": "erp", "username": "reader", "password": "db-secret",
         "ssl_mode": "require", "connect_timeout_seconds": "8",
         "query_timeout_seconds": "60", "max_rows": "10000",
+        "max_result_mb": "25", "max_concurrent_queries": "2",
+        "max_queries_per_minute": "12",
     }, follow_redirects=False)
     assert created.status_code == 303
     source = store.list_all()[0]
+    assert source.max_result_bytes == 25 * 1024 * 1024
+    assert source.max_concurrent_queries == 2
+    assert source.max_queries_per_minute == 12
 
     tested = client.post(f"/admin/data-sources/{source.id}/test", follow_redirects=False)
     assert tested.status_code == 303
@@ -70,3 +75,4 @@ def test_data_source_page_and_end_to_end_admin_actions(tmp_path):
     html = client.get("/admin/data-sources").text
     assert "db-secret" not in html
     assert "ERP库" in html
+

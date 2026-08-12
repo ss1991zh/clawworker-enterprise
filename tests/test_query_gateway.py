@@ -6,6 +6,7 @@ from host.data_access import DataAccessStore
 from host.data_sources import CatalogColumn, DataSourceStore
 from host.db_connectors import ConnectorRegistry
 from host.query_gateway import QueryDenied, QueryGateway
+from host.query_gateway import QueryExecutionSignal, ResultTooLarge
 
 
 def setup_gateway(tmp_path):
@@ -266,4 +267,35 @@ def test_unsafe_row_policy_is_denied_at_query_time(tmp_path, row_filter):
         gateway.plan(username="alice", data_source_id=source.id,
                      sql="SELECT id FROM orders")
     assert err.value.code == "invalid_row_policy"
+
+
+def test_result_size_limit_is_enforced_while_fetching_and_connection_closes(tmp_path):
+    gateway, source, access = setup_gateway(tmp_path)
+    source = gateway.sources.update(source.id, max_result_bytes=1024 * 1024)
+
+    class Cursor:
+        description = [("id",)]
+        closed = False
+        def execute(self, sql, *args): pass
+        def fetchmany(self, size): return [["x" * (1024 * 1024 + 10)]]
+        def close(self): self.closed = True
+
+    class Connection:
+        closed = False
+        def __init__(self): self.cur = Cursor()
+        def cursor(self): return self.cur
+        def close(self): self.closed = True
+
+    conn = Connection()
+    gateway.connectors._connectors["mysql"] = type(
+        "Connector", (), {"_connect": lambda self, source, password: conn},
+    )()
+    with pytest.raises(ResultTooLarge):
+        gateway.execute(username="alice", data_source_id=source.id,
+                        sql="SELECT id FROM orders", signal=QueryExecutionSignal())
+    assert conn.cur.closed is True
+    assert conn.closed is True
+    audit = access.list_audits(1)[0]
+    assert audit["status"] == "denied"
+    assert audit["error_code"] == "result_too_large"
 
