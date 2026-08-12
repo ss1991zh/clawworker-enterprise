@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import os
+import json
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -987,6 +988,40 @@ def build_admin_router(
         except ValueError as exc:
             return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
         return _flash_redirect("/admin/data-permissions", ("success", "组权限已撤销并立即生效"))
+
+    # ============================================================
+    # 数据使用记录（只记录访问元数据，不保存查询结果正文）
+    # ============================================================
+
+    @router.get("/data-usage", response_class=HTMLResponse)
+    def data_usage_list(request: Request, username: str = "", data_source_id: str = "",
+                        operation: str = "", status: str = ""):
+        sources = data_source_store.list_all() if data_source_store else []
+        source_names = {source.id: source.name for source in sources}
+        audits = []
+        if data_access_store:
+            for row in data_access_store.list_audits(
+                500, username=username.strip(), data_source_id=data_source_id.strip(),
+                operation=operation.strip(), status=status.strip(),
+            ):
+                item = dict(row)
+                item["source_name"] = source_names.get(item["data_source_id"],
+                                                       item["data_source_id"] or "全部授权目录")
+                try:
+                    item["tables"] = json.loads(item.pop("tables_json"))
+                    item["columns"] = json.loads(item.pop("columns_json"))
+                except (ValueError, TypeError):
+                    item["tables"], item["columns"] = [], []
+                audits.append(item)
+        return templates.TemplateResponse(
+            request, "data_usage.html",
+            {"active": "data_usage", "audits": audits, "sources": sources,
+             "users": sorted(user_manager._accounts.keys()),
+             "summary": data_access_store.audit_summary() if data_access_store else {},
+             "filters": {"username": username, "data_source_id": data_source_id,
+                         "operation": operation, "status": status},
+             "messages": _pop_messages(request)},
+        )
 
     # ============================================================
     # 会话

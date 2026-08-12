@@ -14,6 +14,7 @@ gateway 在同一进程中提供本机 HTTP :8442 与局域网 HTTPS :8443。
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Optional
 
@@ -178,7 +179,8 @@ def get_current_session(authorization: str = Header(...)):
 @app.get("/data/sources")
 def list_authorized_data_sources(sess=Depends(get_current_session)):
     policies = data_access_store.list_for_user(sess.username)
-    allowed_ids = {p.data_source_id for p in policies}
+    # 数据源列表本身也是目录信息；没有 browse 权限时不在用户端展示。
+    allowed_ids = {p.data_source_id for p in policies if p.permits("browse")}
     result = []
     for source in data_source_store.list_all():
         if source.enabled and source.id in allowed_ids:
@@ -188,13 +190,27 @@ def list_authorized_data_sources(sess=Depends(get_current_session)):
                 "operations": sorted({op for p in policies if p.data_source_id == source.id
                                       for op in p.operations}),
             })
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username, data_source_id="",
+        operation="browse", sql_text="", tables=[], columns=[], status="success",
+    )
     return result
 
 
 @app.get("/data/sources/{source_id}/catalog")
 def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
-    policies = data_access_store.list_for_user(sess.username, source_id)
+    # “可使用”与“可看见”分别由操作权限控制。目录接口只暴露显式授予
+    # browse 的表和字段；即使用户猜到未展示的名称，查询网关仍会再次校验。
+    policies = [
+        policy for policy in data_access_store.list_for_user(sess.username, source_id)
+        if policy.permits("browse")
+    ]
     if not policies:
+        data_access_store.record_audit(
+            request_id=secrets.token_hex(10), username=sess.username,
+            data_source_id=source_id, operation="browse", sql_text="",
+            tables=[], columns=[], status="denied", error_code="no_source_permission",
+        )
         raise HTTPException(403, "没有此数据源的访问权限")
     catalog = data_source_store.list_catalog(source_id)
     out = []
@@ -216,12 +232,21 @@ def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
             "max_rows": max(p.max_rows for p in matches),
             "row_restricted": bool(matches) and all(p.row_filter_sql.strip() for p in matches),
         })
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username,
+        data_source_id=source_id, operation="browse", sql_text="",
+        tables=[f"{item['schema']}.{item['table']}" for item in out],
+        columns=sorted({column["name"] for item in out for column in item["columns"]}),
+        status="success",
+    )
     return out
 
 
-def _authorized_catalog_rows(username: str, source_id: str) -> list[dict]:
+def _authorized_catalog_rows(username: str, source_id: str,
+                             operation: str = "query") -> list[dict]:
     """供自然语言规划复用授权目录；不包含数据库凭据、行策略正文或数据行。"""
-    policies = data_access_store.list_for_user(username, source_id)
+    policies = [policy for policy in data_access_store.list_for_user(username, source_id)
+                if policy.permits(operation)]
     if not policies:
         return []
     catalog = data_source_store.list_catalog(source_id)
@@ -263,10 +288,11 @@ def plan_natural_data_query(req: NaturalDataQueryRequest,
     source = data_source_store.get(req.data_source_id)
     if not source or not source.enabled:
         raise HTTPException(404, "数据源不存在或已停用")
-    catalog = _authorized_catalog_rows(sess.username, source.id)
+    catalog = _authorized_catalog_rows(sess.username, source.id, req.operation)
     if not catalog:
         raise HTTPException(403, "没有此数据源的访问权限")
     provider, cfg = _resolve_user_provider(sess.username)
+    request_id = secrets.token_hex(10)
     try:
         candidate = generate_candidate(
             provider, engine=source.engine, source_name=source.name,
@@ -277,8 +303,18 @@ def plan_natural_data_query(req: NaturalDataQueryRequest,
             sql=candidate.sql, operation=req.operation,
         )
     except NaturalQueryError as exc:
+        data_access_store.record_audit(
+            request_id=request_id, username=sess.username, data_source_id=source.id,
+            operation="plan", sql_text="", tables=[], columns=[], status="failed",
+            error_code="natural_query_error",
+        )
         raise HTTPException(422, str(exc)) from exc
     except QueryDenied as exc:
+        data_access_store.record_audit(
+            request_id=request_id, username=sess.username, data_source_id=source.id,
+            operation="plan", sql_text=candidate.sql if 'candidate' in locals() else "",
+            tables=[], columns=[], status="denied", error_code=exc.code,
+        )
         raise HTTPException(422, f"候选查询未通过安全检查：{exc}") from exc
     usage = getattr(provider, "last_usage", {}) or {}
     pt, ct = int(usage.get("prompt_tokens", 0) or 0), int(usage.get("completion_tokens", 0) or 0)
@@ -287,6 +323,11 @@ def plan_natural_data_query(req: NaturalDataQueryRequest,
         cost = estimate_cost(cfg.model_name, pt, ct)
     call_stats.record(config=cfg, username=sess.username, prompt_tokens=pt,
                       completion_tokens=ct, success=True, cost_usd=float(cost))
+    data_access_store.record_audit(
+        request_id=request_id, username=sess.username, data_source_id=source.id,
+        operation="plan", sql_text=preview.sql, tables=list(preview.tables),
+        columns=list(preview.columns), status="success",
+    )
     return {"sql": candidate.sql, "preview_sql": preview.sql,
             "explanation": candidate.explanation,
             "tables": preview.tables, "columns": preview.columns,
@@ -301,7 +342,17 @@ def preview_data_query(req: DataQueryRequest, sess=Depends(get_current_session))
             sql=req.sql, operation=req.operation,
         )
     except QueryDenied as exc:
+        data_access_store.record_audit(
+            request_id=secrets.token_hex(10), username=sess.username,
+            data_source_id=req.data_source_id, operation="preview", sql_text=req.sql,
+            tables=[], columns=[], status="denied", error_code=exc.code,
+        )
         raise HTTPException(403, str(exc)) from exc
+    data_access_store.record_audit(
+        request_id=secrets.token_hex(10), username=sess.username,
+        data_source_id=req.data_source_id, operation="preview", sql_text=plan.sql,
+        tables=list(plan.tables), columns=list(plan.columns), status="success",
+    )
     return {"sql": plan.sql, "tables": plan.tables, "columns": plan.columns,
             "max_rows": plan.max_rows}
 

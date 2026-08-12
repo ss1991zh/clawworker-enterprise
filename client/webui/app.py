@@ -580,6 +580,15 @@ async def api_data_query_execute(request: Request):
     result = _host_api("POST", "/data/query/execute", json_body=payload, timeout=300.0)
     if not isinstance(result, dict):
         raise HTTPException(502, "管理端返回的查询结果格式无效")
+    return _encrypt_database_result(result, payload)
+
+
+def _encrypt_database_result(result: dict, payload: dict) -> dict:
+    """将管理端返回的数据行在本机立即加密；调用方只能获得密文元数据。
+
+    明文行不会返回浏览器。受控临时 Excel 仅在本函数内存在，并且无论加密成功
+    还是失败都会删除。后续模型分析接收的是密文文件与 schema，而不是这里的 rows。
+    """
     # 明文结果只存在于当前请求内存与受控临时文件。返回浏览器前立即走现有摄取/加密
     # 流程，浏览器只得到密文文件路径和列概要，不得到数据行正文。
     import pandas as pd
@@ -602,13 +611,15 @@ async def api_data_query_execute(request: Request):
         tmp_path.unlink(missing_ok=True)
         frame = None
         rows = None
-    return {
+    response = {
         "request_id": result.get("request_id", ""),
         "row_count": result.get("row_count", encrypted.get("row_count", 0)),
         "duration_ms": result.get("duration_ms", 0),
         "columns": columns,
         "encrypted": encrypted,
     }
+    assert "rows" not in response
+    return response
 
 
 @app.get("/api/me")

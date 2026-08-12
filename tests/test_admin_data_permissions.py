@@ -5,6 +5,7 @@ from fastapi.testclient import TestClient
 
 from host.admin_ui import build_admin_router
 from host.data_access import DataAccessStore
+from host.data_access import redact_audit_sql
 from host.data_sources import CatalogColumn, DataSourceStore
 from host.db_connectors import ConnectorRegistry
 from host.query_gateway import QueryGateway
@@ -103,3 +104,64 @@ def test_admin_rejects_invalid_row_filter_before_saving(tmp_path):
     )
     assert response.status_code == 303
     assert access.list_for_user("alice", source.id) == []
+
+
+def test_admin_data_usage_page_filters_and_never_contains_result_rows(tmp_path):
+    client, source, access = setup_admin(tmp_path)
+    access.record_audit(
+        request_id="req-1", username="alice", data_source_id=source.id,
+        operation="query", sql_text="SELECT id FROM erp.orders LIMIT 10",
+        tables=["erp.orders"], columns=["id"], status="success",
+        row_count=2, duration_ms=15,
+    )
+    # 查询结果正文永远不进入 audit API，自然也不应出现在管理页面。
+    secret_result_value = "CUSTOMER-SECRET-ROW-VALUE"
+
+    page = client.get(
+        f"/admin/data-usage?username=alice&data_source_id={source.id}&operation=query&status=success"
+    )
+    assert page.status_code == 200
+    assert "数据使用记录" in page.text
+    assert "SELECT id FROM erp.orders LIMIT 10" in page.text
+    assert "erp.orders" in page.text
+    assert "2 行" in page.text
+    assert secret_result_value not in page.text
+    assert access.audit_summary()["rows"] == 2
+
+
+def test_admin_data_usage_filter_excludes_other_users(tmp_path):
+    client, source, access = setup_admin(tmp_path)
+    for username, sql in (("alice", "SELECT id FROM erp.orders"),
+                          ("bob", "SELECT amount FROM erp.orders")):
+        access.record_audit(
+            request_id=f"req-{username}", username=username,
+            data_source_id=source.id, operation="preview", sql_text=sql,
+            tables=["erp.orders"], columns=["id"], status="success",
+        )
+    page = client.get("/admin/data-usage?username=alice")
+    assert "SELECT id FROM erp.orders" in page.text
+    assert "SELECT amount FROM erp.orders" not in page.text
+
+
+def test_audit_sql_redacts_business_literals_but_keeps_query_shape(tmp_path):
+    client, source, access = setup_admin(tmp_path)
+    access.record_audit(
+        request_id="req-sensitive", username="alice", data_source_id=source.id,
+        operation="query",
+        sql_text="SELECT id FROM erp.orders WHERE customer='张三' AND amount>10000 LIMIT 50",
+        tables=["erp.orders"], columns=["id"], status="success", row_count=1,
+    )
+    row = access.list_audits(1)[0]
+    assert "张三" not in row["sql_text"]
+    assert "10000" not in row["sql_text"]
+    assert "customer='***'" in row["sql_text"]
+    assert "amount>?" in row["sql_text"]
+    assert "LIMIT 50" in row["sql_text"]
+    assert "张三" not in client.get("/admin/data-usage").text
+
+
+def test_redact_audit_sql_handles_escaped_quotes():
+    redacted = redact_audit_sql("SELECT id FROM t WHERE name='O''Brien' AND score=98.5")
+    assert "O''Brien" not in redacted
+    assert "98.5" not in redacted
+    assert "name='***'" in redacted

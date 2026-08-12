@@ -6,8 +6,8 @@
       powershell -ExecutionPolicy Bypass -File packaging\windows\build_installers.ps1
 
   产物:packaging\windows\dist\
-      Clawworker-admin-Setup-1.5.0.exe   ← 装在管理端机器
-      Clawworker-client-Setup-1.5.0.exe  ← 装在每台用户机器
+      Clawworker-admin-Setup-1.6.0.exe   ← 装在管理端机器
+      Clawworker-client-Setup-1.6.0.exe  ← 装在每台用户机器
 #>
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
