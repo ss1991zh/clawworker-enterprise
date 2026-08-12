@@ -1126,6 +1126,7 @@ function pickExistingCipher(path, name) {
 // ============ 设置 Modal ============
 const TABS = {
   general: { title: "连接 / 计算", render: renderGeneralTab },
+  database:{ title: "企业数据库", render: renderDatabaseTab },
   ops:     { title: "自启 / 运维", render: renderOpsTab },
   skills:  { title: "Skill 管理", render: renderSkillsTab },
   keys:    { title: "同态密钥", render: renderKeysTab },
@@ -1174,6 +1175,49 @@ async function renderGeneralTab() {
       $("cfgAlert").innerHTML = `<div class="alert-box">保存失败:${esc(e.message)}</div>`;
     }
   });
+}
+
+async function renderDatabaseTab() {
+  $("modalBody").innerHTML = `<h2>${TABS.database.title}</h2>
+    <p class="sub">仅显示管理员已授权的数据源、表和字段。数据库地址、账号和密码不会下发到本机。</p>
+    <div id="dbAlert"></div><div id="dbBody"><div class="db-loading">正在读取授权目录…</div></div>`;
+  let sources;
+  try { sources = await api("GET", "/api/data/sources"); }
+  catch (e) { $("dbBody").innerHTML = `<div class="alert-box">读取失败：${esc(e.message)}</div>`; return; }
+  if (!sources.length) {
+    $("dbBody").innerHTML = `<div class="db-empty"><strong>尚无数据库访问权限</strong><span>请联系管理员在“数据权限”中授权。</span></div>`; return;
+  }
+  $("dbBody").innerHTML = `<div class="field"><label>数据源</label><select id="dbSource">${sources.map(s=>`<option value="${esc(s.id)}">${esc(s.name)} · ${esc(s.engine)}</option>`).join("")}</select></div>
+    <div class="db-catalog" id="dbCatalog"></div>
+    <div class="field"><label>只读 SQL</label><textarea id="dbSql" rows="7" placeholder="例如：SELECT id, amount FROM orders WHERE order_date >= '2026-01-01'"></textarea><p class="hint">必须明确列名，禁止 SELECT *；执行前会再次检查表、字段和行数权限。</p></div>
+    <div class="db-actions"><button class="btn-ghost" id="dbPreview">检查并预览</button><button class="btn-primary" id="dbExecute" disabled>提取数据</button></div>
+    <div id="dbPreviewBox"></div><div id="dbResult"></div>`;
+  const src=$("dbSource"), sql=$("dbSql"), execute=$("dbExecute");
+  async function loadCatalog(){
+    $("dbCatalog").innerHTML='<div class="db-loading">读取表结构…</div>';
+    try { const rows=await api("GET",`/api/data/sources/${encodeURIComponent(src.value)}/catalog`);
+      $("dbCatalog").innerHTML=rows.map(t=>`<div class="db-table"><div class="db-table__head"><strong>${esc(t.schema)}.${esc(t.table)}</strong><span>最多 ${t.max_rows} 行 · ${t.operations.map(o=>esc(o)).join(' / ')}</span></div><div class="db-cols">${t.columns.map(c=>`<button type="button" class="db-col" data-table="${esc(t.table)}" data-col="${esc(c.name)}" title="${esc(c.type)}${c.comment?' · '+esc(c.comment):''}">${esc(c.name)} <small>${esc(c.type)}</small></button>`).join('')}</div></div>`).join('') || '<div class="db-empty">没有可见字段</div>';
+      document.querySelectorAll('.db-col').forEach(b=>b.addEventListener('click',()=>{ const txt=`SELECT ${b.dataset.col} FROM ${b.dataset.table}`; if(!sql.value.trim()) sql.value=txt; }));
+    } catch(e){$("dbCatalog").innerHTML=`<div class="alert-box">${esc(e.message)}</div>`;}
+  }
+  src.addEventListener('change',()=>{execute.disabled=true; $("dbPreviewBox").innerHTML=''; loadCatalog();});
+  sql.addEventListener('input',()=>{execute.disabled=true;});
+  $("dbPreview").addEventListener('click',async()=>{
+    execute.disabled=true; $("dbPreviewBox").innerHTML='<div class="db-loading">正在检查权限与 SQL…</div>';
+    try { const p=await api("POST","/api/data/query/preview",{data_source_id:src.value,sql:sql.value,operation:'query'});
+      $("dbPreviewBox").innerHTML=`<div class="db-preview"><strong>检查通过</strong><div>将访问：${p.tables.map(esc).join('、')} · 字段：${p.columns.map(esc).join('、')} · 最多 ${p.max_rows} 行</div><code>${esc(p.sql)}</code></div>`; execute.disabled=false;
+    } catch(e){$("dbPreviewBox").innerHTML=`<div class="alert-box">未通过：${esc(e.message)}</div>`;}
+  });
+  execute.addEventListener('click',async()=>{
+    execute.disabled=true; execute.textContent='提取中…'; $("dbResult").innerHTML='';
+    try { const r=await api("POST","/api/data/query/execute",{data_source_id:src.value,sql:sql.value,operation:'query'});
+      const enc=r.encrypted||{}; state.pendingCipher={name:enc.name,path:enc.path,uploading:false}; renderAttachChips();
+      $("dbResult").innerHTML=`<div class="db-result-head"><strong>已提取并自动加密 ${r.row_count} 行</strong><span>耗时 ${r.duration_ms} ms</span></div><div class="db-preview"><strong>已加入当前会话附件</strong><div>密文文件：${esc(enc.name||'')} · 加密字段：${(enc.encrypted_columns||[]).map(esc).join('、')||'无数值字段'} · 明文标识字段：${(enc.plaintext_columns||[]).map(esc).join('、')||'无'}</div></div><button class="btn-primary" id="dbContinue">返回会话并分析</button>`;
+      $("dbContinue")?.addEventListener('click',()=>{closeModal(); $("input")?.focus();}); loadFiles();
+    } catch(e){$("dbResult").innerHTML=`<div class="alert-box">提取失败：${esc(e.message)}</div>`;}
+    finally {execute.disabled=false; execute.textContent='提取数据';}
+  });
+  await loadCatalog();
 }
 
 // ============ 自启 / 运维 Tab(客户端自身开机自启 + 崩溃重启)============

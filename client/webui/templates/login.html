@@ -29,7 +29,8 @@
             <button type="button" id="scanBtn" class="scan-btn">扫描内网</button>
           </label>
           <input type="text" id="hostInput" name="host_url" value="{{ default_host }}" required
-                 placeholder="https://127.0.0.1:8443">
+                 placeholder="https://管理端IP:8443">
+          <div class="scan-tip">用户端通过局域网 HTTPS 8443 连接管理端</div>
           <div id="scanOut" class="scan-out"></div>
         </div>
         <div class="field">
@@ -64,7 +65,7 @@
   btn.addEventListener("click", function () {
     btn.disabled = true;
     btn.textContent = "扫描中…";
-    out.innerHTML = '<div class="scan-tip">正在扫描本机所在网段…</div>';
+    out.innerHTML = '<div class="scan-tip">正在扫描本机所在网段的管理端 HTTPS 服务（8443）…</div>';
 
     fetch("/api/host/scan", {method: "POST", credentials: "same-origin"})
       .then(function (r) { return r.json(); })
@@ -73,24 +74,29 @@
         if (!cs.length) {
           var msg = d.too_large
             ? "本机所在网段过大,未扫描。请手动填写主机地址。"
-            : "未找到主机。确认主机端已启动、与本机在同一网段(访客 WiFi 常隔离设备互访)。";
+            : "未找到管理端。请确认管理端已启动、8443 端口已放行，并与本机在同一网段(访客 WiFi 常隔离设备互访)。";
           out.innerHTML = '<div class="scan-tip">' + esc(msg) + "</div>";
           return;
         }
-        // 公钥与本地已锁定一致 = 就是之前信任过的那台,可直接用(攻击者伪造不出相同公钥)
+        // 仅扫描到一台且公钥与本地锁定一致时才自动填入。
+        // 多台管理端时，即使恰好只有一台是以前信任过的，也必须让用户明确选择；
+        // 否则很容易把本机/旧管理端误当成刚安装的远端管理端。
         var known = cs.filter(function (c) { return c.known; });
-        if (known.length === 1) {
+        if (cs.length === 1 && known.length === 1) {
           input.value = known[0].url;
           out.innerHTML = '<div class="scan-ok">✓ 已找到此前信任的主机 '
-            + esc(known[0].url) + "(公钥指纹一致,已自动填入)</div>";
+            + esc(known[0].url)
+            + "（公钥指纹一致，已自动填入；账号尚未验证）</div>";
           return;
         }
         // 其余情况一律人工选 —— 首次连接必须核对指纹,不能因为"扫到了"就信任
         var html = '<div class="scan-tip">找到 ' + cs.length
-          + " 台候选。<b>首次连接请对照管理端显示的公钥指纹核对</b>后再选:</div>";
+          + " 台管理端。扫描只确认网络和证书可达，<b>请点击要连接的那一台"
+          + "（首次连接需核对公钥指纹）</b>：</div>";
         cs.forEach(function (c) {
           html += '<div class="scan-item" data-url="' + esc(c.url) + '">'
             + '<span class="scan-url">' + esc(c.url) + "</span>"
+            + (c.local ? '<span class="scan-badge">本机</span>' : "")
             + (c.known ? '<span class="scan-badge">已信任</span>' : "")
             + '<span class="scan-fp">' + esc(c.spki.slice(0, 29)) + "…</span></div>";
         });
@@ -98,7 +104,8 @@
         Array.prototype.forEach.call(out.querySelectorAll(".scan-item"), function (el) {
           el.addEventListener("click", function () {
             input.value = el.getAttribute("data-url");
-            out.innerHTML = '<div class="scan-ok">已选择 ' + esc(input.value) + "</div>";
+            out.innerHTML = '<div class="scan-ok">✓ 已选择 ' + esc(input.value)
+              + "；网络和证书可达，账号将在登录时验证</div>";
           });
         });
       })

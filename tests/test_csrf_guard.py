@@ -12,6 +12,13 @@ GOOD_HOST = "127.0.0.1:8444"
 TOKEN = app_mod._CSRF_TOKEN
 
 
+def test_healthz_is_fast_unauthenticated_startup_probe():
+    r = client.get("/healthz", headers={"Host": GOOD_HOST})
+
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok", "service": "client"}
+
+
 def test_bad_host_header_rejected():
     # DNS-rebinding:浏览器带攻击者域名的 Host
     r = client.get("/api/sessions", headers={"Host": "evil.example.com"})

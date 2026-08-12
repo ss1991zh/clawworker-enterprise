@@ -1,0 +1,37 @@
+{% extends "base.html" %}
+{% block title %}数据权限 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">数据访问权限</h1>
+  <p class="page-subtitle">默认拒绝。只有这里明确授权的用户，才能通过数据网关访问指定表和字段；数据库密码始终不会下发。</p>
+  <div class="panel"><div class="panel-header"><h3>现有授权</h3></div><div class="panel-body compact">
+    {% if policies %}<table class="table"><thead><tr><th>用户</th><th>数据源</th><th>表 / 视图</th><th>字段</th><th>操作</th><th>行数上限</th><th></th></tr></thead><tbody>
+    {% for p in policies %}<tr><td><strong>{{ p.username }}</strong></td><td>{{ p.source_name }}</td><td class="mono">{{ p.schema_name }}.{{ p.table_name }}</td><td class="mono ds-columns">{{ p.allowed_columns|join(', ') }}</td><td>{% for op in p.operations %}<span class="pill muted">{{ {'browse':'浏览','query':'查询','analyze':'分析','export':'导出'}[op] }}</span>{% endfor %}</td><td>{{ p.max_rows }}</td><td><form method="post" action="/admin/data-permissions/{{ p.id }}/revoke" onsubmit="return confirm('立即撤销这条权限？');"><button class="btn btn-danger btn-sm">撤销</button></form></td></tr>{% endfor %}
+    </tbody></table>{% else %}<div class="empty">尚未授权任何用户访问数据库。</div>{% endif %}
+  </div></div>
+
+  <div class="panel"><div class="panel-header"><h3>授予表级与字段级权限</h3></div><div class="panel-body">
+    {% if not users %}<div class="alert warning">请先创建企业用户。</div>{% elif not catalog %}<div class="alert warning">请先在“数据源”页面测试连接并同步结构。</div>{% else %}
+    <form method="post" action="/admin/data-permissions" id="permission-form">
+      <div class="form-grid">
+        <div class="field"><label>用户</label><select name="username" required>{% for u in users %}<option value="{{ u }}">{{ u }}</option>{% endfor %}</select></div>
+        <div class="field"><label>数据源</label><select name="data_source_id" id="perm-source" required>{% for s in sources %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select></div>
+        <div class="field"><label>Schema</label><select name="schema_name" id="perm-schema" required></select></div>
+        <div class="field"><label>表 / 视图</label><select name="table_name" id="perm-table" required></select></div>
+        <div class="field"><label>允许字段（逗号分隔，* 表示全部字段）</label><input type="text" name="allowed_columns" id="perm-columns" required><div class="muted" id="perm-hint"></div></div>
+        <div class="field"><label>最大返回行数</label><input type="number" name="max_rows" value="10000" min="1" max="1000000"></div>
+      </div>
+      <div class="field" style="margin-top:18px;"><label>允许操作</label><div class="check-row"><label><input type="checkbox" name="operations" value="browse" checked> 浏览结构</label><label><input type="checkbox" name="operations" value="query" checked> 查询</label><label><input type="checkbox" name="operations" value="analyze"> 数据分析</label><label><input type="checkbox" name="operations" value="export"> 导出文件</label></div></div>
+      <button class="btn btn-primary" type="submit">保存授权</button>
+    </form>
+    {% endif %}
+  </div></div>
+  {% if catalog %}<script>
+    const catalog={{ catalog|tojson }};
+    const source=document.getElementById('perm-source'), schema=document.getElementById('perm-schema'), table=document.getElementById('perm-table'), columns=document.getElementById('perm-columns'), hint=document.getElementById('perm-hint');
+    function uniq(a){return [...new Set(a)];} function fill(el,values){el.innerHTML=values.map(v=>`<option value="${v}">${v}</option>`).join('');}
+    function sourceChanged(){fill(schema,uniq(catalog.filter(c=>c.source_id===source.value).map(c=>c.schema_name))); schemaChanged();}
+    function schemaChanged(){fill(table,uniq(catalog.filter(c=>c.source_id===source.value&&c.schema_name===schema.value).map(c=>c.table_name))); tableChanged();}
+    function tableChanged(){const a=catalog.filter(c=>c.source_id===source.value&&c.schema_name===schema.value&&c.table_name===table.value).map(c=>c.column_name); columns.value=a.join(','); hint.textContent='可用字段：'+a.join('、');}
+    source.addEventListener('change',sourceChanged); schema.addEventListener('change',schemaChanged); table.addEventListener('change',tableChanged); sourceChanged();
+  </script>{% endif %}
+{% endblock %}

@@ -3,6 +3,8 @@
 启动:
     uvicorn client.webui:app --host 127.0.0.1 --port 8444
 
+该入口是仅绑定 loopback 的本机 HTTP;客户端到 Host 的跨机器请求仍使用 HTTPS。
+
 提供 6 个页面 + 后端 API:
   /            概览(session、工具状态、最近任务)
   /login       账号密码登录

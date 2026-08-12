@@ -19,18 +19,28 @@ _PREFIX = "dpapi:"
 
 
 class _DATA_BLOB(ctypes.Structure):
-    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_char))]
+    _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(wintypes.BYTE))]
 
 
-def _blob(data: bytes) -> "_DATA_BLOB":
-    buf = ctypes.create_string_buffer(data, len(data))
-    return _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+def _blob(data: bytes) -> tuple["_DATA_BLOB", ctypes.Array]:
+    """返回 BLOB 和其拥有的缓冲区。
+
+    缓冲区必须在 CryptProtectData/CryptUnprotectData 调用结束前保持存活。旧实现
+    只返回裸指针，局部 ``buf`` 会被 Python 提前回收，Windows 上会随机表现为
+    ``DPAPI 调用失败``，而上层又会静默退回明文。
+    """
+    buf = ctypes.create_string_buffer(data, max(1, len(data)))
+    blob = _DATA_BLOB(len(data), ctypes.cast(buf, ctypes.POINTER(wintypes.BYTE)))
+    return blob, buf
 
 
 def _blob_bytes(blob: "_DATA_BLOB") -> bytes:
     n = int(blob.cbData)
     out = ctypes.string_at(blob.pbData, n)
-    ctypes.windll.kernel32.LocalFree(blob.pbData)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+    kernel32.LocalFree(ctypes.cast(blob.pbData, ctypes.c_void_p))
     return out
 
 
@@ -64,18 +74,27 @@ def _entropy() -> bytes:
 
 
 def _dpapi(data: bytes, encrypt: bool, use_entropy: bool = True) -> bytes:
-    fn = (ctypes.windll.crypt32.CryptProtectData if encrypt
-          else ctypes.windll.crypt32.CryptUnprotectData)
-    inp = _blob(data)
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    fn = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+    fn.argtypes = [
+        ctypes.POINTER(_DATA_BLOB), ctypes.c_wchar_p,
+        ctypes.POINTER(_DATA_BLOB), ctypes.c_void_p, ctypes.c_void_p,
+        wintypes.DWORD, ctypes.POINTER(_DATA_BLOB),
+    ]
+    fn.restype = wintypes.BOOL
+    inp, inp_buf = _blob(data)
     ent_ptr = None
+    ent_buf = None
     if use_entropy:
-        ent = _blob(_entropy())      # pOptionalEntropy:加解密必须一致
+        ent, ent_buf = _blob(_entropy())      # pOptionalEntropy:加解密必须一致
         ent_ptr = ctypes.byref(ent)
     out = _DATA_BLOB()
     # flags=1 → CRYPTPROTECT_UI_FORBIDDEN(不弹 UI,适合服务/后台)
     ok = fn(ctypes.byref(inp), None, ent_ptr, None, None, 1, ctypes.byref(out))
     if not ok:
-        raise OSError("DPAPI 调用失败")
+        raise ctypes.WinError(ctypes.get_last_error())
+    # 显式引用到调用结束，避免优化器/解释器提前释放底层输入内存。
+    _ = (inp_buf, ent_buf)
     return _blob_bytes(out)
 
 

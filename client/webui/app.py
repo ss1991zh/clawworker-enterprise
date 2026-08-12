@@ -231,26 +231,42 @@ def _validate_host_url(raw: str) -> str:
     host = (parsed.hostname or "").strip()
     if not host:
         raise ValueError("主机地址格式不正确")
+    try:
+        parsed.port
+    except ValueError:
+        raise ValueError("主机端口格式不正确")
+    if parsed.username or parsed.password:
+        raise ValueError("主机地址不能包含用户名或密码")
     # 只允许**字面 IP** 或 localhost —— 拒绝主机名。
     # 原因:主机名要 DNS 解析,而校验时解析和 httpx 请求时解析是两次(TOCTOU),
     # 攻击者可让域名先解私网(过校验)、请求时再解公网(DNS-rebinding)把口令/token 送外。
     # 字面 IP 无解析歧义;localhost 由 hosts 文件固定指向回环,不可被 DNS 操纵。
-    if host.lower() == "localhost":
-        return url
-    try:
-        ip = ipaddress.ip_address(host)
-    except ValueError:
-        raise ValueError(f"只允许填**内网 IP** 或 localhost,不接受主机名「{host}」(防 DNS 劫持)")
-    # IPv4-mapped IPv6(::ffff:a.b.c.d)先归一到 IPv4 再判,避免旧版误判
-    if getattr(ip, "ipv4_mapped", None) is not None:
-        ip = ip.ipv4_mapped
-    # 显式拒 link-local —— 169.254.169.254 是云元数据端点(某些 Python 版本 is_private
-    # 也含 link-local,故单独判),放行会被 SSRF 窃取实例凭证
-    if ip.is_link_local:
-        raise ValueError(f"拒绝链路本地/元数据地址「{host}」")
-    if not (ip.is_private or ip.is_loopback):
-        raise ValueError(f"只允许连内网/本机主机,拒绝地址「{host}」")
-    return url
+    if host.lower() != "localhost":
+        try:
+            ip = ipaddress.ip_address(host)
+        except ValueError:
+            raise ValueError(f"只允许填**内网 IP** 或 localhost,不接受主机名「{host}」(防 DNS 劫持)")
+        # IPv4-mapped IPv6(::ffff:a.b.c.d)先归一到 IPv4 再判,避免旧版误判
+        if getattr(ip, "ipv4_mapped", None) is not None:
+            ip = ip.ipv4_mapped
+        # 显式拒 link-local —— 169.254.169.254 是云元数据端点(某些 Python 版本 is_private
+        # 也含 link-local,故单独判),放行会被 SSRF 窃取实例凭证
+        if ip.is_link_local:
+            raise ValueError(f"拒绝链路本地/元数据地址「{host}」")
+        if not (ip.is_private or ip.is_loopback):
+            raise ValueError(f"只允许连内网/本机主机,拒绝地址「{host}」")
+    from client import host_trust
+    return host_trust.to_lan_https(url)
+
+
+def _format_login_failure(host_url: str, detail: str) -> str:
+    """把认证失败和实际连接的管理端绑定展示，避免多主机时误判为网络故障。"""
+    hint = ""
+    if detail == "账户不存在":
+        hint = "。请使用在该管理端“用户管理”中创建的用户账号（不是管理端登录账号）"
+    elif detail == "密码错误":
+        hint = "。请在该管理端“用户管理”中重置此用户的密码后重试"
+    return f"登录失败（管理端 {host_url}）：{detail}{hint}"
 
 
 def _need_login() -> JSONResponse:
@@ -303,7 +319,9 @@ def host_trust_page():
     """主机证书信任核对页 —— 首次登记或证书轮换后,核对指纹一致再点重新信任。
     无需登录(证书变更会阻断登录),仅本机 + 同源可访问(中间件 Host+Origin 兜底)。"""
     from client import host_trust
-    host_url = host_trust.to_https(_config.get("host_url", "") or "https://127.0.0.1:8443")
+    host_url = host_trust.to_lan_https(
+        _config.get("host_url", "") or "https://127.0.0.1:8443"
+    )
     pinned = host_trust.pinned_fingerprint(host_url) or "(尚未锁定)"
     seen = host_trust.server_fingerprint(host_url) or "(取不到 · 主机未启动?)"
     match = pinned == seen
@@ -343,6 +361,12 @@ def host_trust_repin():
 # ----------------------------------------------------------------------------
 
 
+@app.get("/healthz")
+def healthz():
+    """供本机桌面启动器探测；不渲染模板，也不访问管理端。"""
+    return {"status": "ok", "service": "client"}
+
+
 @app.get("/", response_class=HTMLResponse)
 def index(request: Request):
     if not _is_logged_in():
@@ -358,10 +382,17 @@ def index(request: Request):
 def login_form(request: Request):
     if _is_logged_in():
         return RedirectResponse("/", status_code=303)
+    default_host = _config.get("host_url", "")
+    if default_host:
+        try:
+            # 登录页加载时即迁移旧版保存的 HTTP/:8442 地址。
+            default_host = _validate_host_url(default_host)
+        except ValueError:
+            pass
     return templates.TemplateResponse(
         request, "login.html",
         {
-            "default_host": _config.get("host_url", ""),
+            "default_host": default_host,
             "messages": _pop_messages(request),
             "asset_ver": _asset_version(),
         },
@@ -380,7 +411,7 @@ def login_submit(
     except ValueError as e:
         return _flash_redirect("/login", ("error", str(e)))
     from client import host_trust
-    host_url = host_trust.to_https(host_url)      # 主机端已启 TLS
+    host_url = host_trust.to_lan_https(host_url)  # 跨机器固定走局域网 HTTPS :8443
     try:
         verify = host_trust.verify_for(host_url)  # TOFU:首连锁定主机证书,之后校验一致
     except Exception as e:  # noqa: BLE001 —— 抓不到证书(主机没起/网络)
@@ -423,7 +454,9 @@ def login_submit(
             msg = r.json().get("detail", r.text)
         except Exception:
             msg = r.text
-        return _flash_redirect("/login", ("error", f"登录失败:{msg}"))
+        return _flash_redirect(
+            "/login", ("error", _format_login_failure(host_url, str(msg)))
+        )
 
     body = r.json()
     with _lock:
@@ -488,6 +521,86 @@ def logout():
 # ----------------------------------------------------------------------------
 # /api/me /api/config /api/keys
 # ----------------------------------------------------------------------------
+
+
+def _host_api(method: str, path: str, *, json_body=None, timeout: float = 60.0):
+    """把用户端数据库请求转发给已登录的管理端；不接触数据库凭据。"""
+    if not _is_logged_in():
+        return _need_login()
+    host_url = _session_state["host_url"]
+    try:
+        response = httpx.request(
+            method, f"{host_url}{path}", json=json_body,
+            headers={"Authorization": f"Bearer {_session_state['token']}"},
+            timeout=timeout, verify=host_trust.verify_for(host_url), trust_env=False,
+        )
+    except httpx.RequestError as exc:
+        raise HTTPException(502, f"无法连接管理端：{type(exc).__name__}") from exc
+    try:
+        body = response.json()
+    except Exception:
+        body = {"detail": "管理端返回了无法识别的响应"}
+    if response.status_code >= 400:
+        detail = body.get("detail", "数据库请求失败") if isinstance(body, dict) else "数据库请求失败"
+        raise HTTPException(response.status_code, detail)
+    return body
+
+
+@app.get("/api/data/sources")
+def api_data_sources():
+    return _host_api("GET", "/data/sources")
+
+
+@app.get("/api/data/sources/{source_id}/catalog")
+def api_data_catalog(source_id: str):
+    return _host_api("GET", f"/data/sources/{quote(source_id, safe='')}/catalog")
+
+
+@app.post("/api/data/query/preview")
+async def api_data_query_preview(request: Request):
+    if not _is_logged_in():
+        return _need_login()
+    payload = await request.json()
+    return _host_api("POST", "/data/query/preview", json_body=payload)
+
+
+@app.post("/api/data/query/execute")
+async def api_data_query_execute(request: Request):
+    if not _is_logged_in():
+        return _need_login()
+    payload = await request.json()
+    result = _host_api("POST", "/data/query/execute", json_body=payload, timeout=300.0)
+    if not isinstance(result, dict):
+        raise HTTPException(502, "管理端返回的查询结果格式无效")
+    # 明文结果只存在于当前请求内存与受控临时文件。返回浏览器前立即走现有摄取/加密
+    # 流程，浏览器只得到密文文件路径和列概要，不得到数据行正文。
+    import pandas as pd
+    columns = result.get("columns") or []
+    rows = result.pop("rows", []) or []
+    frame = pd.DataFrame(rows, columns=columns)
+    source_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(payload.get("data_source_id", "db")))[:24]
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
+        tmp_path = Path(tmp.name)
+    try:
+        frame.to_excel(tmp_path, index=False)
+        encrypted = _ingest_plaintext_path(
+            tmp_path, f"数据库提取_{source_id}_{stamp}.xlsx",
+            dst_stem=f"db_{source_id}_{stamp}",
+        )
+    except ValueError as exc:
+        raise HTTPException(400, f"查询成功但自动加密失败：{exc}") from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+        frame = None
+        rows = None
+    return {
+        "request_id": result.get("request_id", ""),
+        "row_count": result.get("row_count", encrypted.get("row_count", 0)),
+        "duration_ms": result.get("duration_ms", 0),
+        "columns": columns,
+        "encrypted": encrypted,
+    }
 
 
 @app.get("/api/me")

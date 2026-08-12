@@ -63,8 +63,8 @@ Clawworker Enterprise 是一套**面向企业的隐私计算数据分析平台**
 │  • 多 LLM 配置 + 用量统计        │◀───▶│  • 密文文件管理 + 自动加密入库          │
 │  • LLM 代理(只转发,不存数据)  │     │  • Skill 引擎:代码生成 + 安全执行      │
 │  • Admin Web UI                 │     │  • 定时任务调度 + 文件夹监控            │
-│         :8443                   │     │  • 多 sheet Excel 产品级渲染           │
-└─────────────────────────────────┘     │         :8444                          │
+│  本机 HTTP :8442 · 局域网 HTTPS :8443 │     │  • 多 sheet Excel 产品级渲染           │
+└─────────────────────────────────┘     │  本机 HTTP :8444                       │
                                          └────────────────────────────────────────┘
         ↑ 只传 schema + 用户意图,密钥与明文始终留在客户端本机 ↑
 ```
@@ -108,12 +108,20 @@ pip install -e ".[dev]" ".[host]"
 #    详见 PROVIDE_ME.md;把企业签发的 sk / evk / user_authorization 放到约定位置
 
 # 3. 启动(两进程)
-AGENT_BACKEND=real uvicorn host.server:app   --host 0.0.0.0   --port 8443   # 主机端
-AGENT_BACKEND=real uvicorn client.webui:app  --host 127.0.0.1 --port 8444   # 客户端
+# 主机端同一进程双监听:127.0.0.1:8442 HTTP + 0.0.0.0:8443 HTTPS
+AGENT_BACKEND=real python -m host.gateway
+
+# 用户端仅本机回环 HTTP
+AGENT_BACKEND=real uvicorn client.webui:app --host 127.0.0.1 --port 8444
 ```
 
-- **Admin 后台**:http://127.0.0.1:8443/admin —— 建账户、签发证书、配 LLM、看用量
+- **Admin 后台(本机)**:http://127.0.0.1:8442/admin —— 建账户、签发证书、配 LLM、看用量
+- **Host API / 远程 Admin(局域网)**:https://<主机地址>:8443 —— 强制 TLS
 - **用户端**:http://127.0.0.1:8444 —— 登录、上传加密数据、提问、出 Excel、设定时任务
+
+### 远程企业数据库模式
+
+管理端可统一连接一个或多个远程 MySQL / PostgreSQL / SQL Server，并按用户授予表、字段和操作权限。数据库凭据只在管理端使用 Windows DPAPI 加密保存，不下发到用户端；查询结果由管理端在内存中短暂转发且默认不落盘，大模型始终只接收授权结构与用户意图，不接收数据行。完整边界与接口见下方数据库访问文档。
 
 测试:`pytest`(stub 后端)· `AGENT_BACKEND=real pytest`(真实加密)
 
@@ -122,6 +130,7 @@ AGENT_BACKEND=real uvicorn client.webui:app  --host 127.0.0.1 --port 8444   # �
 ## 文档
 
 - [`docs/architecture.md`](docs/architecture.md) —— 完整架构、模块边界、数据流
+- [`docs/database-access.md`](docs/database-access.md) —— 远程数据库、权限控制、安全查询网关与审计
 - [`docs/llm_system_prompt.md`](docs/llm_system_prompt.md) —— AI 系统 prompt(技能与契约)
 - [`PROVIDE_ME.md`](PROVIDE_ME.md) —— 接入真实同态加密工具链清单
 

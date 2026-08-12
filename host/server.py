@@ -1,12 +1,14 @@
 """
-主机 HTTP 服务(FastAPI)。
+主机 FastAPI 应用。
 
 提供两类端点:
 - /auth/login           账号密码登录,返回 session token
 - /llm/chat             调用 LLM 代理(需 session token,按用户绑定的 LLM 配置路由)
 
-启动:
-    uvicorn host.server:app --host 0.0.0.0 --port 8443
+生产启动:
+    python -m host.gateway
+
+gateway 在同一进程中提供本机 HTTP :8442 与局域网 HTTPS :8443。
 """
 
 from __future__ import annotations
@@ -31,6 +33,10 @@ from host.llm_configs import (
 )
 from host.llm_proxy import LLMProvider, make_provider
 from host.user_manager import UserManager
+from host.data_sources import DataSourceStore
+from host.db_connectors import ConnectorRegistry
+from host.data_access import DataAccessStore
+from host.query_gateway import QueryDenied, QueryGateway
 
 
 # ---------------------------------------------------------------------------
@@ -46,6 +52,10 @@ dispatcher = Dispatcher()
 llm_config_store = LLMConfigStore()
 provider_manager = ProviderManager(llm_config_store)
 call_stats = CallStatStore()
+data_source_store = DataSourceStore()
+connector_registry = ConnectorRegistry()
+data_access_store = DataAccessStore(data_source_store.db_path)
+query_gateway = QueryGateway(data_source_store, data_access_store, connector_registry)
 
 from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
 from host.login_throttle import LoginThrottle
@@ -109,13 +119,17 @@ app.include_router(
         llm_config_store=llm_config_store,
         provider_manager=provider_manager,
         call_stats=call_stats,
+        data_source_store=data_source_store,
+        connector_registry=connector_registry,
+        data_access_store=data_access_store,
         admin_auth=admin_auth,
         login_throttle=_login_throttle,
     )
 )
 
 
-# 根路径 → 管理后台(裸访问 :8443 时不再 404;登录闸门交给下面中间件)
+# 根路径 → 管理后台（本机 :8442 或局域网 :8443 裸访问时不再 404；
+# 登录闸门交给下面中间件）
 @app.get("/")
 def _root():
     from fastapi.responses import RedirectResponse
@@ -155,6 +169,77 @@ def get_current_session(authorization: str = Header(...)):
     if not sess:
         raise HTTPException(401, "session 无效或已过期")
     return sess
+
+
+# ----- 企业数据访问网关（用户端只见授权目录，不见连接凭据）-----
+
+
+@app.get("/data/sources")
+def list_authorized_data_sources(sess=Depends(get_current_session)):
+    policies = data_access_store.list_for_user(sess.username)
+    allowed_ids = {p.data_source_id for p in policies}
+    result = []
+    for source in data_source_store.list_all():
+        if source.enabled and source.id in allowed_ids:
+            result.append({
+                "id": source.id, "name": source.name, "engine": source.engine,
+                "catalog_synced_at": source.catalog_synced_at,
+                "operations": sorted({op for p in policies if p.data_source_id == source.id
+                                      for op in p.operations}),
+            })
+    return result
+
+
+@app.get("/data/sources/{source_id}/catalog")
+def authorized_catalog(source_id: str, sess=Depends(get_current_session)):
+    policies = data_access_store.list_for_user(sess.username, source_id)
+    if not policies:
+        raise HTTPException(403, "没有此数据源的访问权限")
+    catalog = data_source_store.list_catalog(source_id)
+    out = []
+    for policy in policies:
+        columns = [c for c in catalog if c.schema_name.lower() == policy.schema_name.lower()
+                   and c.table_name.lower() == policy.table_name.lower()
+                   and policy.permits_column(c.column_name)]
+        out.append({
+            "schema": policy.schema_name, "table": policy.table_name,
+            "columns": [{"name": c.column_name, "type": c.data_type,
+                         "nullable": c.nullable, "comment": c.comment} for c in columns],
+            "operations": list(policy.operations), "max_rows": policy.max_rows,
+        })
+    return out
+
+
+class DataQueryRequest(BaseModel):
+    data_source_id: str
+    sql: str
+    operation: str = "query"
+
+
+@app.post("/data/query/preview")
+def preview_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+    try:
+        plan = query_gateway.preview(
+            username=sess.username, data_source_id=req.data_source_id,
+            sql=req.sql, operation=req.operation,
+        )
+    except QueryDenied as exc:
+        raise HTTPException(403, str(exc)) from exc
+    return {"sql": plan.sql, "tables": plan.tables, "columns": plan.columns,
+            "max_rows": plan.max_rows}
+
+
+@app.post("/data/query/execute")
+def execute_data_query(req: DataQueryRequest, sess=Depends(get_current_session)):
+    try:
+        return query_gateway.execute(
+            username=sess.username, data_source_id=req.data_source_id,
+            sql=req.sql, operation=req.operation,
+        )
+    except QueryDenied as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(502, str(exc)) from exc
 
 
 # ----- 登录 -----

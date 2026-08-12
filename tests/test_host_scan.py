@@ -55,6 +55,34 @@ def test_scan_marks_known_by_spki(monkeypatch):
     assert r["candidates"][0]["ip"] == "192.168.3.9"
 
 
+def test_scan_marks_local_candidate_without_excluding_it(monkeypatch):
+    """多管理端时标出本机，供 UI 避免把本机旧管理端误认成远端目标。"""
+    monkeypatch.setattr(host_scan, "candidate_networks", lambda: ["192.168.3.0/24"])
+    monkeypatch.setattr(host_scan, "local_ipv4", lambda: ["192.168.3.169"])
+    fake = {
+        "192.168.3.169": {
+            "ip": "192.168.3.169",
+            "url": "https://192.168.3.169:8443",
+            "spki": "LOCAL",
+            "cn": host_scan._HOST_CN,
+        },
+        "192.168.3.146": {
+            "ip": "192.168.3.146",
+            "url": "https://192.168.3.146:8443",
+            "spki": "REMOTE",
+            "cn": host_scan._HOST_CN,
+        },
+    }
+    monkeypatch.setattr(host_scan, "_probe", lambda ip: fake.get(ip))
+    monkeypatch.setattr(host_scan, "known_spkis", lambda: set())
+
+    result = host_scan.scan()
+    by_ip = {candidate["ip"]: candidate for candidate in result["candidates"]}
+
+    assert by_ip["192.168.3.169"]["local"] is True
+    assert by_ip["192.168.3.146"]["local"] is False
+
+
 def test_probe_rejects_non_product_service(monkeypatch):
     """8443 上跑着别的服务(CN 不符)→ 不列为候选,避免误导用户去连。"""
     monkeypatch.setattr(host_scan, "_port_open", lambda ip, port=8443: True)
@@ -63,6 +91,21 @@ def test_probe_rejects_non_product_service(monkeypatch):
     monkeypatch.setattr(ht, "_spki_of_pem", lambda pem: "AA:BB")
     monkeypatch.setattr(host_scan, "_cert_cn", lambda pem: "Some Other Server")
     assert host_scan._probe("192.168.3.7") is None
+
+
+def test_probe_always_returns_lan_https_url(monkeypatch):
+    """扫描结果只能是跨机器 HTTPS :8443,不能回填本机管理 HTTP :8442。"""
+    monkeypatch.setattr(host_scan, "_port_open", lambda ip, port=8443: True)
+    import client.host_trust as ht
+    monkeypatch.setattr(ht, "fetch_server_cert_pem", lambda url: b"pem")
+    monkeypatch.setattr(ht, "_spki_of_pem", lambda pem: "AA:BB")
+    monkeypatch.setattr(host_scan, "_cert_cn", lambda pem: host_scan._HOST_CN)
+
+    candidate = host_scan._probe("192.168.3.169")
+
+    assert candidate is not None
+    assert candidate["url"] == "https://192.168.3.169:8443"
+    assert "8442" not in candidate["url"]
 
 
 def test_scan_endpoint_is_csrf_exempt_but_origin_checked():

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Clawworker 守护进程 —— 把 host(:8443)+ client(:8444)托管起来:
+Clawworker 守护进程 —— 托管 host(本机 HTTP :8442 + 局域网 HTTPS :8443)
+与 client(本机 HTTP :8444):
   · 启动时拉起两个服务(若端口已被本机健康实例占用 → 直接接管,不重复拉起)
   · 每 3s 健康探测;子进程崩溃 / 端口不通 → 指数退避后自动重启
   · 持续写心跳到 ~/.agent-system/supervisor/state.json(供 admin 状态页读取)
@@ -24,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from host import service_manager as sm  # noqa: E402
 
-POLL_SEC = 3.0
+POLL_SEC = 1.0
 BACKOFF_BASE = 2.0
 BACKOFF_FACTOR = 2.0
 BACKOFF_CAP = 30.0
@@ -64,17 +65,43 @@ def _handle_signal(signum, frame):  # noqa: ARG001
     _log(f"收到信号 {signum},准备退出")
 
 
+def _handoff_or_replace_existing(want: list[str]) -> bool:
+    """处理共享状态里已存在的守护；返回 True 表示当前进程应退出。
+
+    同协议的新守护可以动态接管角色，直接把请求交给它。旧协议守护不认识
+    :8442/:8443 双入口和角色并集，必须连同旧子服务一起替换。
+    """
+    running, pid = sm.supervisor_running(require_compatible=False)
+    if not running or not pid or pid == os.getpid():
+        return False
+    if sm.supervisor_state_compatible():
+        merged = sm.add_desired(want)
+        _log(
+            f"已有兼容 supervisor 在运行(pid={pid}),已请求其接管 {want}"
+            f"(期望集合={merged}),本进程退出"
+        )
+        return True
+
+    _log(f"发现不兼容旧 supervisor(pid={pid}),正在终止旧守护及其子服务")
+    if not sm.terminate_incompatible_supervisor(pid):
+        raise RuntimeError(f"无法终止旧 supervisor(pid={pid}),请注销 Windows 后重试")
+    wanted = sm.set_desired(want)
+    _log(f"旧 supervisor 已退出,由当前安装目录接管(期望集合={wanted})")
+    return False
+
+
 def main() -> int:
     # ---- 单例守护:已有健康 supervisor 在跑就退出 ----
     # 退出前先把本进程想托管的角色并进「期望集合」—— 在跑的那个每轮会读它并接管。
     # 否则角色分片 + 单例锁会互相堵死:先起的只管 client,后来点「管理端」图标起的
     # supervisor 撞锁即退,没人拉 host,表现为点图标毫无反应。
     want = sm.managed_service_keys()
-    running, pid = sm.supervisor_running()
-    if running and pid and pid != os.getpid():
-        merged = sm.add_desired(want)
-        _log(f"已有 supervisor 在运行(pid={pid}),已请求其接管 {want}(期望集合={merged}),本进程退出")
-        return 0
+    try:
+        if _handoff_or_replace_existing(want):
+            return 0
+    except RuntimeError as exc:
+        _log(f"启动失败: {exc}")
+        return 2
 
     signal.signal(signal.SIGTERM, _handle_signal)
     signal.signal(signal.SIGINT, _handle_signal)
@@ -99,10 +126,13 @@ def main() -> int:
                 "pid": proc.pid if proc else None,
                 "restarts": m["restarts"],
                 "last_restart": m["last_restart"],
-                "healthy": sm.probe_port(sm.SERVICES[key]["port"]),
+                "healthy": sm.service_healthy(key),
                 "backoff": round(m["backoff"], 1),
             }
         sm.write_state({
+            "protocol": sm.SUPERVISOR_PROTOCOL,
+            "project_dir": str(sm.PROJECT_DIR),
+            "supervisor_py": str(sm.SUPERVISOR_PY),
             "pid": os.getpid(),
             "started_at": started_at,
             "ts": _now(),
@@ -130,7 +160,7 @@ def main() -> int:
                 m["proc"] = None
                 proc = None
 
-            healthy = sm.probe_port(svc["port"])
+            healthy = sm.service_healthy(key)
 
             if healthy:
                 # 健康:可能是我们拉的,也可能是已存在的实例(接管监控)

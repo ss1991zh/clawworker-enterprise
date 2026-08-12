@@ -77,6 +77,9 @@ def build_admin_router(
     llm_config_store: LLMConfigStore,
     provider_manager: ProviderManager,
     call_stats: CallStatStore,
+    data_source_store=None,
+    connector_registry=None,
+    data_access_store=None,
     admin_auth=None,
     login_throttle=None,
 ) -> APIRouter:
@@ -119,12 +122,10 @@ def build_admin_router(
             login_throttle.record_success(tkey)
         token = admin_auth.login()
         resp = RedirectResponse("/admin/", status_code=303)
-        # 主机走 HTTPS(TLS 证书存在即启用)→ cookie 加 Secure,禁止明文回传
-        try:
-            from host import tls_cert
-            secure = tls_cert.current_fingerprint() is not None
-        except Exception:  # noqa: BLE001
-            secure = False
+        # 同一应用有两个入口:本机 HTTP :8442 与局域网 HTTPS :8443。
+        # Secure 必须按**本次请求协议**设置;若仅因磁盘上存在 TLS 证书就设 True,
+        # 本机 HTTP 登录成功后浏览器不会回传 cookie,表现为无限跳回登录页。
+        secure = request.url.scheme == "https"
         resp.set_cookie(ADMIN_COOKIE, token, max_age=SESSION_TTL,
                         httponly=True, samesite="lax", secure=secure)
         return resp
@@ -697,6 +698,217 @@ def build_admin_router(
             "count": len(models),
             "used_stored_key": used_stored,
         })
+
+    # ============================================================
+    # 企业数据源（远程数据库连接由管理端统一保管）
+    # ============================================================
+
+    @router.get("/data-sources", response_class=HTMLResponse)
+    def data_source_list(request: Request):
+        sources = []
+        if data_source_store:
+            for source in data_source_store.list_all():
+                item = source.__dict__.copy()
+                item["catalog"] = data_source_store.catalog_summary(source.id)
+                sources.append(item)
+        return templates.TemplateResponse(
+            request, "data_sources.html",
+            {"active": "data_sources", "sources": sources,
+             "messages": _pop_messages(request)},
+        )
+
+    @router.post("/data-sources")
+    def data_source_create(
+        request: Request,
+        name: str = Form(...), engine: str = Form(...), host: str = Form(...),
+        port: int = Form(...), database_name: str = Form(...),
+        username: str = Form(...), password: str = Form(...),
+        ssl_mode: str = Form("prefer"), ca_path: str = Form(""),
+        connect_timeout_seconds: int = Form(8), query_timeout_seconds: int = Form(60),
+        max_rows: int = Form(10000),
+    ):
+        if not data_source_store:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源模块未初始化"))
+        try:
+            source = data_source_store.create(
+                name=name, engine=engine, host=host, port=port,
+                database_name=database_name, username=username, password=password,
+                ssl_mode=ssl_mode, ca_path=ca_path,
+                connect_timeout_seconds=connect_timeout_seconds,
+                query_timeout_seconds=query_timeout_seconds, max_rows=max_rows,
+            )
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-sources", ("error", str(exc)))
+        return _flash_redirect(
+            "/admin/data-sources",
+            ("success", f"已创建数据源「{source.name}」；请先测试连接，再同步结构"),
+        )
+
+    @router.get("/data-sources/{source_id}/edit", response_class=HTMLResponse)
+    def data_source_edit_form(request: Request, source_id: str):
+        source = data_source_store.get(source_id) if data_source_store else None
+        if not source:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源不存在"))
+        return templates.TemplateResponse(
+            request, "data_source_edit.html",
+            {"active": "data_sources", "source": source,
+             "catalog": data_source_store.catalog_summary(source.id),
+             "messages": _pop_messages(request)},
+        )
+
+    @router.post("/data-sources/{source_id}/update")
+    def data_source_update(
+        request: Request, source_id: str,
+        name: str = Form(...), engine: str = Form(...), host: str = Form(...),
+        port: int = Form(...), database_name: str = Form(...),
+        username: str = Form(...), password: str = Form(""),
+        ssl_mode: str = Form("prefer"), ca_path: str = Form(""),
+        connect_timeout_seconds: int = Form(8), query_timeout_seconds: int = Form(60),
+        max_rows: int = Form(10000),
+    ):
+        try:
+            source = data_source_store.update(
+                source_id, name=name, engine=engine, host=host, port=port,
+                database_name=database_name, username=username, password=password,
+                ssl_mode=ssl_mode, ca_path=ca_path,
+                connect_timeout_seconds=connect_timeout_seconds,
+                query_timeout_seconds=query_timeout_seconds, max_rows=max_rows,
+            )
+        except ValueError as exc:
+            return _flash_redirect(
+                f"/admin/data-sources/{source_id}/edit", ("error", str(exc))
+            )
+        return _flash_redirect(
+            "/admin/data-sources", ("success", f"已更新数据源「{source.name}」")
+        )
+
+    @router.post("/data-sources/{source_id}/test")
+    def data_source_test(request: Request, source_id: str):
+        source = data_source_store.get(source_id) if data_source_store else None
+        if not source or not connector_registry:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源不存在或模块未初始化"))
+        try:
+            password = data_source_store.get_password(source_id)
+            result = connector_registry.test(source, password)
+        except Exception as exc:
+            from host.db_connectors import safe_error
+            result = type("Result", (), {"ok": False, "message": safe_error(exc),
+                                           "server_version": ""})()
+        detail = result.message
+        if result.server_version:
+            detail += f" · 版本 {result.server_version}"
+        data_source_store.record_test(source_id, result.ok, detail)
+        return _flash_redirect(
+            "/admin/data-sources",
+            (("success" if result.ok else "error"), f"「{source.name}」：{detail}"),
+        )
+
+    @router.post("/data-sources/{source_id}/sync")
+    def data_source_sync(request: Request, source_id: str):
+        source = data_source_store.get(source_id) if data_source_store else None
+        if not source or not connector_registry:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源不存在或模块未初始化"))
+        try:
+            password = data_source_store.get_password(source_id)
+            columns = connector_registry.inspect_catalog(source, password)
+            count = data_source_store.replace_catalog(source_id, columns)
+            summary = data_source_store.catalog_summary(source_id)
+        except Exception as exc:
+            from host.db_connectors import safe_error
+            return _flash_redirect(
+                "/admin/data-sources",
+                ("error", f"「{source.name}」同步失败：{safe_error(exc)}"),
+            )
+        return _flash_redirect(
+            "/admin/data-sources",
+            ("success", f"「{source.name}」已同步 {summary['schemas']} 个架构、"
+                        f"{summary['tables']} 张表/视图、{count} 个字段"),
+        )
+
+    @router.post("/data-sources/{source_id}/toggle")
+    def data_source_toggle(request: Request, source_id: str):
+        source = data_source_store.get(source_id) if data_source_store else None
+        if not source:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源不存在"))
+        updated = data_source_store.set_enabled(source_id, not source.enabled)
+        return _flash_redirect(
+            "/admin/data-sources",
+            ("success", f"已{'启用' if updated.enabled else '停用'}「{updated.name}」"),
+        )
+
+    @router.post("/data-sources/{source_id}/delete")
+    def data_source_delete(request: Request, source_id: str):
+        source = data_source_store.get(source_id) if data_source_store else None
+        if not source:
+            return _flash_redirect("/admin/data-sources", ("error", "数据源不存在"))
+        data_source_store.delete(source_id)
+        return _flash_redirect(
+            "/admin/data-sources",
+            ("success", f"已删除数据源「{source.name}」及其本地结构目录；远程数据库未受影响"),
+        )
+
+    # ============================================================
+    # 数据访问权限（第一版：用户 → 表/视图 → 字段 → 操作）
+    # ============================================================
+
+    @router.get("/data-permissions", response_class=HTMLResponse)
+    def data_permission_list(request: Request):
+        sources = data_source_store.list_all() if data_source_store else []
+        source_names = {s.id: s.name for s in sources}
+        policies = []
+        if data_access_store:
+            for p in data_access_store.list_all():
+                item = p.__dict__.copy()
+                item["source_name"] = source_names.get(p.data_source_id, "已删除数据源")
+                policies.append(item)
+        catalog = []
+        for source in sources:
+            for column in data_source_store.list_catalog(source.id):
+                catalog.append({"source_id": source.id, **column.__dict__})
+        return templates.TemplateResponse(
+            request, "data_permissions.html",
+            {"active": "data_permissions", "policies": policies, "sources": sources,
+             "catalog": catalog, "users": sorted(user_manager._accounts.keys()),
+             "messages": _pop_messages(request)},
+        )
+
+    @router.post("/data-permissions")
+    def data_permission_grant(
+        request: Request, username: str = Form(...), data_source_id: str = Form(...),
+        schema_name: str = Form(...), table_name: str = Form(...),
+        allowed_columns: str = Form(...), operations: list[str] = Form(...),
+        max_rows: int = Form(10000),
+    ):
+        if username not in user_manager._accounts:
+            return _flash_redirect("/admin/data-permissions", ("error", "用户不存在"))
+        try:
+            catalog = [c for c in data_source_store.list_catalog(data_source_id)
+                       if c.schema_name == schema_name and c.table_name == table_name]
+            if not catalog:
+                raise ValueError("表不在已同步的结构目录中；请先到数据源页面同步结构")
+            actual = {c.column_name.lower() for c in catalog}
+            columns = [c.strip() for c in allowed_columns.split(",") if c.strip()]
+            if "*" not in columns and any(c.lower() not in actual for c in columns):
+                raise ValueError("授权字段中包含结构目录不存在的字段")
+            policy = data_access_store.grant(
+                username=username, data_source_id=data_source_id, schema_name=schema_name,
+                table_name=table_name, allowed_columns=columns, operations=operations,
+                max_rows=max_rows,
+            )
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect(
+            "/admin/data-permissions",
+            ("success", f"已授权「{policy.username}」访问 {policy.schema_name}.{policy.table_name}"),
+        )
+
+    @router.post("/data-permissions/{policy_id}/revoke")
+    def data_permission_revoke(request: Request, policy_id: str):
+        try:
+            data_access_store.revoke(policy_id)
+        except ValueError as exc:
+            return _flash_redirect("/admin/data-permissions", ("error", str(exc)))
+        return _flash_redirect("/admin/data-permissions", ("success", "权限已撤销并立即生效"))
 
     # ============================================================
     # 会话

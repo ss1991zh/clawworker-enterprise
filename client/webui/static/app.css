@@ -988,6 +988,26 @@ button.send.stop .ic-stop {
 .badge.no   { background: #fee2e2; color: #991b1b; }
 .badge.warn { background: #fef3c7; color: #92400e; }
 .badge.use  { background: var(--blue-light); color: var(--blue); }
+.db-loading { padding: 20px; text-align: center; color: var(--text-muted); }
+.db-empty { padding: 28px; text-align: center; border: 1px dashed var(--border); border-radius: 12px; color: var(--text-muted); display:flex; flex-direction:column; gap:5px; }
+.db-catalog { max-height: 210px; overflow:auto; margin-bottom:16px; border:1px solid var(--border); border-radius:12px; }
+.db-table { padding:12px 14px; border-bottom:1px solid var(--border); }
+.db-table:last-child { border-bottom:none; }
+.db-table__head { display:flex; justify-content:space-between; gap:12px; font-size:13px; margin-bottom:8px; }
+.db-table__head span { color:var(--text-muted); font-size:11px; }
+.db-cols { display:flex; flex-wrap:wrap; gap:6px; }
+.db-col { border:1px solid var(--border); background:var(--bg); border-radius:7px; padding:5px 8px; font-size:12px; cursor:pointer; color:var(--text); }
+.db-col:hover { border-color:var(--blue); color:var(--blue); }
+.db-col small { color:var(--text-muted); margin-left:3px; }
+.db-actions { display:flex; gap:10px; margin-bottom:14px; }
+.db-preview { padding:12px 14px; border:1px solid #a7f3d0; background:#ecfdf5; color:#065f46; border-radius:10px; font-size:12px; margin-bottom:14px; }
+.db-preview code { display:block; margin-top:8px; padding:8px; background:rgba(255,255,255,.7); white-space:pre-wrap; word-break:break-word; }
+.db-result-head { display:flex; justify-content:space-between; gap:10px; margin:14px 0 8px; font-size:13px; }
+.db-result-head span { color:var(--text-muted); font-size:12px; }
+.db-result-scroll { overflow:auto; max-height:260px; border:1px solid var(--border); border-radius:10px; }
+.db-result-table { border-collapse:collapse; width:100%; font-size:12px; }
+.db-result-table th,.db-result-table td { padding:7px 9px; border-bottom:1px solid var(--border); white-space:nowrap; text-align:left; }
+.db-result-table th { position:sticky; top:0; background:var(--bg); }
 
 .sk-drop {
   position: relative;

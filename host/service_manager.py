@@ -2,7 +2,8 @@
 跨平台服务管理 —— 开机自启 + 健康监控 + 崩溃自愈的底座。
 
 设计:
-- 两个被托管服务:host(控制面 :8443)+ client(数据面 :8444)。
+- 两个被托管服务:host(控制面:本机 HTTP :8442 + 局域网 HTTPS :8443)
+  与 client(数据面:本机 HTTP :8444)。
 - **统一守护模型**:开机自启只负责拉起**一个** supervisor 进程;
   supervisor 负责 spawn / 健康探测 / 崩溃重启两个服务(纯 Python 循环,
   三平台行为一致 —— 见 supervisor.py)。
@@ -22,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -42,17 +44,21 @@ STATE_FILE = STATE_DIR / "state.json"
 # 而在跑的那个又不托管新角色 —— 表现为点了图标毫无反应。
 DESIRED_FILE = STATE_DIR / "desired_services.json"
 SUP_LOG = STATE_DIR / "supervisor.log"
+# 守护进程协作协议。旧版状态文件没有该字段,且旧守护不会动态接管新角色/新端口。
+# 安装版发现协议不一致时必须替换旧进程,不能把启动请求交给它后直接退出。
+SUPERVISOR_PROTOCOL = 2
 
 # 服务定义(supervisor 与 admin 共用这一份事实来源)。
-# 注意:host(控制面 :8443)部署在中心机器(admin 所在机);
+# 注意:host(控制面)在中心机器同时提供本机 HTTP :8442 与局域网 HTTPS :8443;
 #       client(数据面 :8444)部署在**各终端用户机器**上,各自托管。
 # 因此一台机器的守护**只托管它本地承担的角色**(见 managed_service_keys)。
 SERVICES: dict[str, dict] = {
     "host": {
         "label": "控制面 Host",
-        "app": "host.server:app",
-        "bind": "0.0.0.0",
-        "port": 8443,
+        "module": "host.gateway",
+        "local_port": 8442,
+        "lan_port": 8443,
+        "port": 8442,  # 兼容旧调用:本机健康检查走 HTTP listener
     },
     "client": {
         "label": "数据面 Client",
@@ -66,7 +72,7 @@ SERVICES: dict[str, dict] = {
 def managed_service_keys() -> list[str]:
     """本机守护要托管的服务键。
 
-    默认只托管 **host**(:8443)—— admin/控制面机器的角色。
+    默认只托管 **host**(:8442 + :8443)—— admin/控制面机器的角色。
     client(:8444)运行在各终端机器上,由那台机器自己的守护托管。
     终端机器部署时设环境变量切换,例如:
         CLAWWORKER_MANAGED_SERVICES=client
@@ -107,22 +113,34 @@ def _py_exe() -> str:
 
 
 def service_run_argv(svc_key: str) -> list[str]:
-    """拉起单个服务的命令行(uvicorn)。supervisor 用它 spawn 子进程。
-    host(控制面)与 client(数据面)都启 HTTPS,共用同一张自签证书(覆盖 localhost + 本机 IP)。
-    证书随安装导入 Windows 信任库 → 浏览器不弹警告;客户端连主机另有指纹锁定(TOFU)。"""
+    """拉起单个服务的命令行。supervisor 用它 spawn 子进程。
+
+    host 由 gateway 在**同进程**内双监听:
+      - 127.0.0.1:8442 HTTP(本机 Admin)
+      - 0.0.0.0:8443 HTTPS(局域网客户端 / 远程 Admin)
+    client 只监听 127.0.0.1:8444 HTTP,不再生成或安装本机自签证书。
+    """
     svc = SERVICES[svc_key]
+    if svc_key == "host":
+        return [_py_exe(), "-m", svc["module"]]
+
     argv = [
         _py_exe(), "-m", "uvicorn", svc["app"],
         "--host", svc["bind"], "--port", str(svc["port"]),
         "--timeout-keep-alive", "75",
     ]
-    try:
-        from host import tls_cert
-        cert_path, key_path, _fp = tls_cert.ensure_cert()
-        argv += ["--ssl-keyfile", str(key_path), "--ssl-certfile", str(cert_path)]
-    except Exception:  # noqa: BLE001 —— 证书生成失败则退回 HTTP,不阻断启动(日志会记)
-        pass
     return argv
+
+
+def service_healthy(svc_key: str) -> bool:
+    """服务健康检查。host 必须同时具备本机 HTTP 与局域网 TLS 两个 listener。"""
+    svc = SERVICES[svc_key]
+    if svc_key == "host":
+        return (
+            probe_port(svc["local_port"], host="127.0.0.1")
+            and probe_tls_port(svc["lan_port"], host="127.0.0.1")
+        )
+    return probe_port(svc["port"], host="127.0.0.1")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +157,19 @@ def probe_port(port: int, host: str = "127.0.0.1", timeout: float = 0.6) -> bool
         return False
 
 
+def probe_tls_port(port: int, host: str = "127.0.0.1", timeout: float = 0.6) -> bool:
+    """完成一次不校验证书链的 TLS 握手，用于确认端口不是误开的明文 HTTP。"""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as raw:
+            with context.wrap_socket(raw, server_hostname=host):
+                return True
+    except (OSError, ssl.SSLError):
+        return False
+
+
 def pid_alive(pid: Optional[int]) -> bool:
     if not pid or pid <= 0:
         return False
@@ -146,12 +177,23 @@ def pid_alive(pid: Optional[int]) -> bool:
     if plat == "windows":
         try:
             import ctypes  # noqa: PLC0415
+            from ctypes import wintypes  # noqa: PLC0415
             PROCESS_QUERY_LIMITED = 0x1000
+            STILL_ACTIVE = 259
             h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, int(pid))
             if not h:
                 return False
-            ctypes.windll.kernel32.CloseHandle(h)
-            return True
+            try:
+                exit_code = wintypes.DWORD()
+                if not ctypes.windll.kernel32.GetExitCodeProcess(
+                    h, ctypes.byref(exit_code)
+                ):
+                    return False
+                # 已退出的进程在仍有句柄被其他程序持有时 OpenProcess 仍可能成功；
+                # 不能因此把它误判为存活并阻止新守护接管。
+                return exit_code.value == STILL_ACTIVE
+            finally:
+                ctypes.windll.kernel32.CloseHandle(h)
         except Exception:
             return False
     try:
@@ -186,28 +228,63 @@ def read_desired() -> list[str]:
         return []
 
 
+def _atomic_write_json(path: Path, payload) -> None:
+    """并发安全地写 JSON；临时文件名按进程/时刻隔离，避免多个守护互相覆盖。"""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last_error: Optional[OSError] = None
+    for attempt in range(5):
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        try:
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(path)
+            return
+        except OSError as exc:
+            last_error = exc
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            time.sleep(0.03 * (attempt + 1))
+    assert last_error is not None
+    raise last_error
+
+
+def set_desired(keys: list[str]) -> list[str]:
+    """覆盖期望角色；仅用于替换不兼容旧守护后的干净接管。"""
+    wanted = sorted({k for k in keys if k in SERVICES})
+    try:
+        _atomic_write_json(DESIRED_FILE, wanted)
+    except OSError:
+        pass
+    return wanted
+
+
 def add_desired(keys: list[str]) -> list[str]:
     """把 keys 并进期望集合并返回并集 —— 让在跑的单例 supervisor 接管新角色。"""
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     merged = sorted(set(read_desired()) | {k for k in keys if k in SERVICES})
     try:
-        tmp = DESIRED_FILE.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(merged, ensure_ascii=False), encoding="utf-8")
-        tmp.replace(DESIRED_FILE)
+        _atomic_write_json(DESIRED_FILE, merged)
     except Exception:  # noqa: BLE001 —— 写失败不阻断启动
         pass
     return merged
 
 
 def write_state(state: dict) -> None:
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    _atomic_write_json(STATE_FILE, state)
 
 
-def supervisor_running() -> tuple[bool, Optional[int]]:
-    """守护进程是否在跑 = pid 存活 且 心跳新鲜。返回 (running, pid)。"""
+def supervisor_state_compatible(state: Optional[dict] = None) -> bool:
+    """状态是否来自能理解当前角色接管/双端口约定的新守护。"""
+    st = state if state is not None else read_state()
+    return st.get("protocol") == SUPERVISOR_PROTOCOL
+
+
+def supervisor_running(require_compatible: bool = True) -> tuple[bool, Optional[int]]:
+    """守护是否存活且心跳新鲜；默认还要求协作协议与当前版本一致。"""
     st = read_state()
     pid = st.get("pid")
     ts = st.get("ts", 0)
@@ -215,7 +292,36 @@ def supervisor_running() -> tuple[bool, Optional[int]]:
         return False, pid
     if ts and (time.time() - ts) > HEARTBEAT_STALE_SEC:
         return False, pid           # 进程在,但心跳停了(卡死)→ 视为不健康
+    if require_compatible and not supervisor_state_compatible(st):
+        return False, pid
     return True, pid
+
+
+def terminate_incompatible_supervisor(pid: Optional[int], timeout: float = 6.0) -> bool:
+    """终止由共享状态文件确认的旧守护及其子服务,为当前协议让路。
+
+    Windows 使用 ``taskkill /T``，因为旧守护可能还留着占用 8443 的明文 Host
+    子进程；只杀父进程会让新双端口 gateway 仍然无法绑定。调用方必须先确认
+    状态心跳新鲜且协议不兼容。
+    """
+    if not pid_alive(pid):
+        return True
+    try:
+        if current_platform() == "windows":
+            result = _run(["taskkill", "/PID", str(int(pid)), "/T", "/F"], timeout=10)
+            if result.returncode != 0 and pid_alive(pid):
+                return False
+        else:
+            os.kill(int(pid), 15)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return False
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not pid_alive(pid):
+            return True
+        time.sleep(0.1)
+    return not pid_alive(pid)
 
 
 def status_snapshot() -> dict:
@@ -227,12 +333,14 @@ def status_snapshot() -> dict:
     services = []
     for key in managed_service_keys():
         svc = SERVICES[key]
-        healthy = probe_port(svc["port"], host="127.0.0.1")
+        healthy = service_healthy(key)
         ext = sup_services.get(key, {})
         services.append({
             "key": key,
             "label": svc["label"],
             "port": svc["port"],
+            "local_port": svc.get("local_port", svc["port"]),
+            "lan_port": svc.get("lan_port"),
             "healthy": healthy,
             "pid": ext.get("pid"),
             "restarts": ext.get("restarts", 0),
