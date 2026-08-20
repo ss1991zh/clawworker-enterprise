@@ -16,7 +16,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-SESSIONS_DIR = Path.home() / ".agent-system" / "sessions"
+from shared.paths import SESSIONS_DIR
+from shared.storage import atomic_write_json
 
 
 @dataclass
@@ -28,6 +29,10 @@ class Message:
     event_kind: str = ""
     # user-only:用户在这条消息附带的密文文件(可为空,自动沿用上一条 user 消息的)
     attached_cipher: str = ""
+    # user-only:本条消息选择的企业数据库。只保存授权数据源的标识与显示名，
+    # 不保存连接地址、凭据、SQL 或任何查询结果明文。
+    database_source_id: str = ""
+    database_source_name: str = ""
     # user-only:本条消息附带的明文文本附件名(供前端 chip 展示;内容不持久化)
     text_attachment_names: list[str] = field(default_factory=list)
     # assistant-only:
@@ -62,6 +67,8 @@ class Message:
             content=d.get("content", ""),
             event_kind=d.get("event_kind", ""),
             attached_cipher=d.get("attached_cipher", "") or d.get("attached_cipher_path", ""),
+            database_source_id=d.get("database_source_id", "") or "",
+            database_source_name=d.get("database_source_name", "") or "",
             text_attachment_names=list(d.get("text_attachment_names", []) or []),
             summary=d.get("summary", ""),
             excel_path=d.get("excel_path", ""),
@@ -185,10 +192,7 @@ class SessionStore:
 
     def _save(self, sess: ChatSession) -> None:
         try:
-            self._path(sess.id).write_text(
-                json.dumps(sess.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            atomic_write_json(self._path(sess.id), sess.to_dict())
         except Exception:
             pass
 

@@ -2,76 +2,25 @@
 from __future__ import annotations
 
 import secrets
-import json
-import threading
 import time
-from contextlib import closing
 from dataclasses import dataclass
 
 from host.data_access import AccessPolicy, DataAccessStore
 from host.data_sources import DataSource, DataSourceStore
 from host.db_connectors import ConnectorRegistry, safe_error
+from host.query_execution import (
+    QueryCancelled,
+    QueryExecutionSignal,
+    QueryTimedOut,
+    ResultTooLarge,
+    execute_readonly,
+)
 
 
 class QueryDenied(ValueError):
     def __init__(self, message: str, code: str = "query_denied"):
         super().__init__(message)
         self.code = code
-
-
-class QueryCancelled(RuntimeError):
-    pass
-
-
-class QueryTimedOut(RuntimeError):
-    pass
-
-
-class ResultTooLarge(RuntimeError):
-    pass
-
-
-class QueryExecutionSignal:
-    """线程安全的查询中止信号；任务管理器可在驱动执行期间调用 cancel。"""
-
-    def __init__(self) -> None:
-        self._event = threading.Event()
-        self._lock = threading.Lock()
-        self._cancel_driver = None
-        self.reason = ""
-
-    def bind(self, callback) -> None:
-        with self._lock:
-            self._cancel_driver = callback
-            already_cancelled = self._event.is_set()
-        if already_cancelled:
-            self._invoke(callback)
-
-    def clear_driver(self) -> None:
-        with self._lock:
-            self._cancel_driver = None
-
-    def cancel(self, reason: str = "cancelled") -> None:
-        with self._lock:
-            if not self._event.is_set():
-                self.reason = reason
-                self._event.set()
-            callback = self._cancel_driver
-        if callback:
-            self._invoke(callback)
-
-    @staticmethod
-    def _invoke(callback) -> None:
-        try:
-            callback()
-        except Exception:
-            pass
-
-    def raise_if_cancelled(self) -> None:
-        if self._event.is_set():
-            if self.reason == "timeout":
-                raise QueryTimedOut("查询超过管理员设置的时间限制")
-            raise QueryCancelled("查询已由用户取消")
 
 
 @dataclass(frozen=True)
@@ -160,13 +109,39 @@ class QueryGateway:
 
         aliases = {t.alias_or_name.lower(): t.alias_or_name.lower() for t in tree.find_all(exp.Table)
                    if t.name.lower() not in cte_names}
+        # 派生表/CTE 的外层字段不是新的数据库字段，而是内层已校验投影的输出。
+        # 记录其公开列名：外层只允许引用这些列；内层物理字段仍按原有权限、脱敏和
+        # 行级策略逐一校验，不能借子查询绕过授权。
+        virtual_outputs: dict[str, set[str]] = {}
+        for subquery in tree.find_all(exp.Subquery):
+            alias = subquery.alias_or_name.lower()
+            select = subquery.this
+            if alias and isinstance(select, exp.Select):
+                virtual_outputs[alias] = {
+                    str(name).lower() for name in select.named_selects if name
+                }
+        for cte in tree.find_all(exp.CTE):
+            alias = cte.alias_or_name.lower()
+            select = cte.this
+            if alias and isinstance(select, exp.Select):
+                virtual_outputs[alias] = {
+                    str(name).lower() for name in select.named_selects if name
+                }
         requested_columns: list[str] = []
         column_bindings: list[tuple[object, list[str]]] = []
         required_by_alias: dict[str, set[str]] = {alias: set() for alias in table_policies}
         for col in tree.find_all(exp.Column):
             name = col.name
-            table_alias = aliases.get((col.table or "").lower(), "")
-            if col.table and not table_alias and col.table.lower() not in cte_names:
+            qualifier = (col.table or "").lower()
+            if qualifier in virtual_outputs:
+                if name.lower() not in virtual_outputs[qualifier]:
+                    raise QueryDenied(
+                        f"子查询 {col.table} 未输出字段 {name}", "column_denied",
+                    )
+                requested_columns.append(name)
+                continue
+            table_alias = aliases.get(qualifier, "")
+            if col.table and not table_alias and qualifier not in cte_names:
                 raise QueryDenied(f"字段限定符 {col.table} 未对应已授权表", "column_denied")
             candidate_aliases = [table_alias] if table_alias else list(table_policies)
             candidate_sets = [table_policies[alias] for alias in candidate_aliases]
@@ -440,64 +415,10 @@ class QueryGateway:
 
     def _execute(self, source: DataSource, password: str, plan: QueryPlan,
                  signal: QueryExecutionSignal):
-        connector = self.connectors.for_engine(source.engine)
-        with closing(connector._connect(source, password)) as conn:
-            cur = conn.cursor()
-            try:
-                cancel_driver = getattr(cur, "cancel", None)
-                if not callable(cancel_driver):
-                    cancel_driver = getattr(conn, "cancel", None)
-                if not callable(cancel_driver):
-                    cancel_driver = conn.close
-                signal.bind(cancel_driver)
-                if source.engine == "mysql":
-                    cur.execute("SET SESSION TRANSACTION READ ONLY")
-                    cur.execute(f"SET SESSION MAX_EXECUTION_TIME={source.query_timeout_seconds * 1000}")
-                elif source.engine == "postgresql":
-                    cur.execute("SET default_transaction_read_only = on")
-                    cur.execute("SET statement_timeout = %s", (source.query_timeout_seconds * 1000,))
-                elif source.engine == "sqlserver":
-                    cur.execute(f"SET LOCK_TIMEOUT {source.query_timeout_seconds * 1000}")
-                    try:
-                        cur.timeout = source.query_timeout_seconds
-                    except Exception:
-                        pass
-                signal.raise_if_cancelled()
-                cur.execute(plan.sql)
-                signal.raise_if_cancelled()
-                headers = [str(d[0]) for d in (cur.description or [])]
-                result_bytes = len(json.dumps(headers, ensure_ascii=False).encode("utf-8"))
-                rows = []
-                while len(rows) < plan.max_rows:
-                    signal.raise_if_cancelled()
-                    batch = cur.fetchmany(min(256, plan.max_rows - len(rows)))
-                    if not batch:
-                        break
-                    for raw in batch:
-                        row = list(raw)
-                        result_bytes += len(json.dumps(
-                            row, ensure_ascii=False, default=str,
-                        ).encode("utf-8"))
-                        if result_bytes > source.max_result_bytes:
-                            raise ResultTooLarge(
-                                f"查询结果超过管理员设置的 {source.max_result_bytes // 1048576} MB 限制"
-                            )
-                        rows.append(row)
-                return headers, rows, result_bytes
-            except (QueryCancelled, QueryTimedOut, ResultTooLarge):
-                raise
-            except Exception as exc:
-                signal.raise_if_cancelled()
-                text = safe_error(exc).lower()
-                if any(marker in text for marker in (
-                    "timeout", "timed out", "statement timeout", "maximum statement execution",
-                    "query timeout", "hyt00", "hyt01",
-                )):
-                    raise QueryTimedOut("查询超过管理员设置的时间限制") from exc
-                raise
-            finally:
-                signal.clear_driver()
-                try:
-                    cur.close()
-                except Exception:
-                    pass
+        return execute_readonly(
+            connector=self.connectors.for_engine(source.engine),
+            source=source,
+            password=password,
+            plan=plan,
+            signal=signal,
+        )

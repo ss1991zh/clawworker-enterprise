@@ -30,7 +30,10 @@ from pathlib import Path
 from typing import Any, Optional
 
 
-CUSTOM_SKILLS_FILE = Path.home() / ".agent-system" / "custom_skills.json"
+from shared.paths import APP_DATA_DIR
+from shared.storage import atomic_write_json
+
+CUSTOM_SKILLS_FILE = APP_DATA_DIR / "custom_skills.json"
 
 
 # ---------------------------------------------------------------------------
@@ -99,13 +102,7 @@ class CustomSkillStore:
 
     def _save(self) -> None:
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(
-                json.dumps([asdict(c) for c in self._items.values()], ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            tmp.replace(self._path)
+            atomic_write_json(self._path, [asdict(c) for c in self._items.values()])
         except Exception:
             pass
 

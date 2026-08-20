@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from host.llm_proxy import LLMProvider, make_provider
+from shared.paths import HOST_CONFIG_DIR
+from shared.storage import atomic_write_json
 
 
 # ---------------------------------------------------------------------------
@@ -201,7 +203,7 @@ class CallStat:
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_STORE_PATH = Path.home() / ".agent-system" / "host-config" / "llm_configs.json"
+DEFAULT_STORE_PATH = HOST_CONFIG_DIR / "llm_configs.json"
 
 
 class LLMConfigStore:
@@ -243,7 +245,7 @@ class LLMConfigStore:
                 downgraded = True          # 加密降级(非Windows/DPAPI失败)→ key 明文落盘
             d["api_key"] = enc
             data.append(d)
-        self._path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        atomic_write_json(self._path, data)
         acl_ok = secret_store.harden_file(self._path)   # 文件 ACL 收紧到仅属主可读
         if downgraded:
             logging.getLogger("clawworker").warning(
@@ -348,7 +350,7 @@ class LLMConfigStore:
 # ---------------------------------------------------------------------------
 
 
-DEFAULT_STAT_PATH = Path.home() / ".agent-system" / "host-config" / "call_stats.json"
+DEFAULT_STAT_PATH = HOST_CONFIG_DIR / "call_stats.json"
 
 
 def _today_key() -> str:
@@ -419,10 +421,7 @@ class CallStatStore:
                 "daily":    [asdict(s) for s in self._daily.values()],
                 "monthly":  [asdict(s) for s in self._monthly.values()],
             }
-            # 原子写:tmp → rename
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            atomic_write_json(self._path, data)
         except Exception:
             # 持久化失败不阻断业务
             pass

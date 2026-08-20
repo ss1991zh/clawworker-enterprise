@@ -18,7 +18,8 @@ from typing import Any, Optional
 
 # 路径白名单(B6 §2)
 # 交互式输出暂存目录:Excel 先写这里(不自动落 Downloads),用户点「下载」才存到 Downloads
-OUTPUTS_DIR = Path.home() / ".agent-system" / "outputs"
+from shared.paths import DOWNLOADS_DIR, OUTPUTS_DIR
+from shared.storage import atomic_write_file
 
 _ENC_ROW_LIMIT = 50_000   # 密文版 Excel 单表行数上限(再加密慢+文件巨大),超则截断并标注
 
@@ -32,7 +33,7 @@ def make_excel_path(stem: Optional[str] = None, staging: bool = False) -> Path:
     """
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_stem = (stem or "analysis").strip("_") or "analysis"
-    base = OUTPUTS_DIR if staging else (Path.home() / "Downloads")
+    base = OUTPUTS_DIR if staging else DOWNLOADS_DIR
     return base / f"{safe_stem}_{ts}.xlsx"
 
 
@@ -122,7 +123,7 @@ def enforce_excel_path(path: Path) -> Path:
     """B6 §2:Excel 输出强制在白名单目录 —— ~/Downloads/、暂存 ~/.agent-system/outputs/,
     以及用户为定时任务显式指定并已登记的输出文件夹。"""
     resolved = path.expanduser().resolve()
-    roots = [(Path.home() / "Downloads").resolve(), OUTPUTS_DIR.resolve(), *_EXTRA_OUTPUT_ROOTS]
+    roots = [DOWNLOADS_DIR.resolve(), OUTPUTS_DIR.resolve(), *_EXTRA_OUTPUT_ROOTS]
     for r in roots:
         try:
             resolved.relative_to(r)
@@ -371,7 +372,7 @@ def write_skill_results(
         except Exception:
             pass  # 溯源失败不阻断落盘
 
-    wb.save(dst)
+    atomic_write_file(dst, wb.save)
     return dst
 
 
@@ -787,7 +788,7 @@ def export_cipher_as_is(
         ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
     ws.freeze_panes = "A2"
 
-    wb.save(dst)
+    atomic_write_file(dst, wb.save)
     return dst
 
 
@@ -896,7 +897,7 @@ def export_skill_results_encrypted(
             ws.column_dimensions[get_column_letter(ci)].width = min(max(len(h) * 2.1, 12), 36)
         ws.freeze_panes = f"A{header_row + 1}"
 
-    wb.save(dst)
+    atomic_write_file(dst, wb.save)
     return dst
 
 

@@ -22,6 +22,8 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, Optional
 
+import httpx
+
 from shared.contract import ComputationPlan, LLMResponse
 
 
@@ -77,19 +79,55 @@ class StubLLMProvider(LLMProvider):
 
 
 class AnthropicLLMProvider(LLMProvider):
-    """对接 Anthropic Claude API。需要 api_key + model。"""
+    """直接使用 Anthropic Messages HTTP API，避免离线安装包依赖额外 SDK。"""
 
     def __init__(self, api_key: str, model: str = "claude-sonnet-4-5", max_tokens: int = 16000,
-                 timeout: float = 1800.0):
-        try:
-            import anthropic  # type: ignore
-        except ImportError as e:
-            raise RuntimeError("未安装 anthropic 包,请 `pip install anthropic`") from e
-        # timeout 单位秒 · 长任务(5-15 分钟级)不能默认 10 分钟就断
-        self._client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
+                 timeout: float = 1800.0,
+                 base_url: str = "https://api.anthropic.com/v1"):
+        self._client = httpx.Client(
+            base_url=base_url.rstrip("/"),
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            timeout=httpx.Timeout(timeout, connect=10.0),
+            trust_env=False,
+        )
         self._model = model
         self._max_tokens = max_tokens
         self.last_usage: dict[str, int] = {}
+
+    def _request(self, payload: dict) -> dict:
+        try:
+            response = self._client.post("/messages", json=payload)
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Anthropic 连接失败：{type(exc).__name__}") from exc
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Anthropic 返回了无法识别的响应") from exc
+        if response.status_code >= 400:
+            detail = body.get("error", {}).get("message") if isinstance(body, dict) else ""
+            raise RuntimeError(f"Anthropic 请求失败（HTTP {response.status_code}）：{detail or '未知错误'}")
+        if not isinstance(body, dict):
+            raise RuntimeError("Anthropic 返回格式无效")
+        return body
+
+    @staticmethod
+    def _text(body: dict) -> str:
+        return "".join(
+            str(block.get("text") or "")
+            for block in body.get("content", [])
+            if isinstance(block, dict) and block.get("type") == "text"
+        )
+
+    def _capture_usage(self, body: dict) -> None:
+        usage = body.get("usage") if isinstance(body, dict) else None
+        self.last_usage = {
+            "prompt_tokens": int((usage or {}).get("input_tokens") or 0),
+            "completion_tokens": int((usage or {}).get("output_tokens") or 0),
+        }
 
     def _complete(self, system: str, user: str, web_search: bool = False) -> str:
         # 联网搜索:Anthropic 服务端 web_search 工具,API 自动跑搜索、最终文本带引用返回。
@@ -99,45 +137,38 @@ class AnthropicLLMProvider(LLMProvider):
                 return self._complete_with_search(system, user)
             except Exception:
                 pass  # 降级
-        resp = self._client.messages.create(
-            model=self._model,
-            max_tokens=self._max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": user}],
-        )
-        text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-        # 抓 token 用量(Anthropic 返回 input_tokens / output_tokens)
-        usage = getattr(resp, "usage", None)
-        if usage is not None:
-            self.last_usage = {
-                "prompt_tokens": getattr(usage, "input_tokens", 0) or 0,
-                "completion_tokens": getattr(usage, "output_tokens", 0) or 0,
-            }
-        else:
-            self.last_usage = {}
-        return text
+        body = self._request({
+            "model": self._model,
+            "max_tokens": self._max_tokens,
+            "system": system,
+            "messages": [{"role": "user", "content": user}],
+        })
+        self._capture_usage(body)
+        return self._text(body)
 
     def _complete_with_search(self, system: str, user: str) -> str:
         """带 web_search 工具调用;处理 pause_turn(超 10 轮服务端循环)续跑。"""
         tools = [{"type": "web_search_20250305", "name": "web_search", "max_uses": 5}]
         messages = [{"role": "user", "content": user}]
         pt = ct = 0
-        resp = None
+        body: dict = {}
         for _ in range(5):  # 最多续 5 次,防失控
-            resp = self._client.messages.create(
-                model=self._model, max_tokens=self._max_tokens,
-                system=system, messages=messages, tools=tools,
-            )
-            usage = getattr(resp, "usage", None)
-            if usage is not None:
-                pt += getattr(usage, "input_tokens", 0) or 0
-                ct += getattr(usage, "output_tokens", 0) or 0
-            if getattr(resp, "stop_reason", "") != "pause_turn":
+            body = self._request({
+                "model": self._model,
+                "max_tokens": self._max_tokens,
+                "system": system,
+                "messages": messages,
+                "tools": tools,
+            })
+            usage = body.get("usage") or {}
+            pt += int(usage.get("input_tokens") or 0)
+            ct += int(usage.get("output_tokens") or 0)
+            if body.get("stop_reason") != "pause_turn":
                 break
             messages = [{"role": "user", "content": user},
-                        {"role": "assistant", "content": resp.content}]
+                        {"role": "assistant", "content": body.get("content") or []}]
         self.last_usage = {"prompt_tokens": pt, "completion_tokens": ct}
-        return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+        return self._text(body)
 
     def chat(self, system: str, user: str, web_search: bool = False) -> LLMResponse:
         return parse_llm_text(self._complete(system, user, web_search))
@@ -463,6 +494,7 @@ def make_provider(model_type: str, **kwargs: Any) -> LLMProvider:
         return AnthropicLLMProvider(
             api_key=kwargs["api_key"],
             model=kwargs.get("model", "claude-sonnet-4-5"),
+            base_url=kwargs.get("base_url") or "https://api.anthropic.com/v1",
         )
     if model_type in _OPENAI_COMPATIBLE:
         return OpenAICompatibleProvider(

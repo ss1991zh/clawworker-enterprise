@@ -15,6 +15,22 @@ import pandas as pd
 import pytest
 
 from client.webui import codegen as cg
+from client.webui import pipeline
+
+
+def test_codegen_prompt_forbids_claiming_plaintext_was_sent_to_model():
+    assert "明文数据未发送给大模型" in cg.CODEGEN_SYSTEM
+    assert "大模型只生成代码" in cg.CODEGEN_SYSTEM
+
+
+def test_summary_rewrites_misleading_plaintext_execution_wording():
+    original = "所有计算均在解密后的全量明文数据上进行，未截断任何记录。"
+
+    cleaned = pipeline._normalize_security_summary(original)
+
+    assert "解密后的全量明文数据" not in cleaned
+    assert "本机受控计算环境" in cleaned
+    assert "明文未发送给大模型" in cleaned
 
 
 # —— 仿 pandaseal 类型(类名必须正好是 CipherSeries / CipherDataFrame)——

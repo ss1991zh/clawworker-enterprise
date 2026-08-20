@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional
 
 from client.webui.scheduler import SCHED_DIR
+from shared.storage import atomic_write_json
 
 NOTICES_PATH = SCHED_DIR / "notices.json"
 
@@ -67,12 +68,7 @@ class NoticeStore:
 
     def _flush(self) -> None:
         try:
-            tmp = self._path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps([n.to_dict() for n in self._items.values()],
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            tmp.replace(self._path)
+            atomic_write_json(self._path, [n.to_dict() for n in self._items.values()])
         except Exception:
             pass
 

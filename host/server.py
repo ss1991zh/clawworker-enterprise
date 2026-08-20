@@ -14,59 +14,55 @@ gateway 在同一进程中提供本机 HTTP :8442 与局域网 HTTPS :8443。
 from __future__ import annotations
 
 import os
+import logging
 import secrets
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from host.admin_ui import build_admin_router
-from host.cert_manager import AuthorizationManager
-from host.dispatcher import Dispatcher
 from host.llm_configs import (
-    CallStatStore,
-    LLMConfigStore,
-    ProviderManager,
     estimate_cost,
 )
 from host.llm_proxy import LLMProvider, make_provider
-from host.user_manager import UserManager
-from host.data_sources import DataSourceStore
-from host.db_connectors import ConnectorRegistry
-from host.data_access import DataAccessStore
-from host.query_gateway import QueryDenied, QueryGateway
-from host.query_tasks import QueryControlDenied, QueryTaskManager
+from host.query_gateway import QueryDenied
+from host.query_tasks import QueryControlDenied
+from host.runtime import HostRuntime
+from shared.version import __version__
+from shared.http_observability import (
+    attach_response_headers, request_id_from_header, reset_request_id, set_request_id,
+)
+from shared.errors import classify_exception
 
 
 # ---------------------------------------------------------------------------
 # 全局组件(MVP 单进程)
 # ---------------------------------------------------------------------------
 
-auth_manager = AuthorizationManager()
-user_manager = UserManager(auth_manager)
+_runtime = HostRuntime()
+auth_manager = _runtime.auth_manager
+user_manager = _runtime.user_manager
 # 向后兼容别名
 cert_manager = auth_manager
-dispatcher = Dispatcher()
+dispatcher = _runtime.dispatcher
+llm_config_store = _runtime.llm_config_store
+provider_manager = _runtime.provider_manager
+call_stats = _runtime.call_stats
+data_source_store = _runtime.data_source_store
+connector_registry = _runtime.connector_registry
+data_access_store = _runtime.data_access_store
+query_gateway = _runtime.query_gateway
+query_task_manager = _runtime.query_task_manager
 
-llm_config_store = LLMConfigStore()
-provider_manager = ProviderManager(llm_config_store)
-call_stats = CallStatStore()
-data_source_store = DataSourceStore()
-connector_registry = ConnectorRegistry()
-data_access_store = DataAccessStore(data_source_store.db_path)
-query_gateway = QueryGateway(data_source_store, data_access_store, connector_registry)
-query_task_manager = QueryTaskManager(
-    query_gateway, data_source_store, data_access_store,
-)
-
-from host.admin_auth import AdminAuth, COOKIE as _ADMIN_COOKIE
-from host.login_throttle import LoginThrottle
-admin_auth = AdminAuth()
-_login_throttle = LoginThrottle()   # 用户登录 + admin 登录共用
+from host.admin_auth import COOKIE as _ADMIN_COOKIE
+admin_auth = _runtime.admin_auth
+_login_throttle = _runtime.login_throttle   # 用户登录 + admin 登录共用
 
 
 def _bootstrap_legacy_env_config() -> None:
@@ -110,7 +106,46 @@ def _bootstrap_legacy_env_config() -> None:
 # FastAPI app
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="agent-system host", version="0.2.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    _runtime.startup()
+    _bootstrap_legacy_env_config()
+    # 1 张证书 ↔ 1 个账户:清理任何"无对应账户"的证书,以及磁盘上残留的孤儿 .auth
+    released = auth_manager.cleanup_unbound(set(user_manager._accounts.keys()))
+    if released:
+        print(f"[startup] 释放 {len(released)} 张无主证书: {released}")
+    try:
+        yield
+    finally:
+        _runtime.shutdown()
+
+
+app = FastAPI(title="Clawworker Enterprise Host", version=__version__, lifespan=_lifespan)
+
+
+@app.middleware("http")
+async def _request_observability(request: Request, call_next):
+    request_id = request_id_from_header(request.headers.get("x-request-id", ""))
+    request.state.request_id = request_id
+    token = set_request_id(request_id)
+    try:
+        response = await call_next(request)
+        if response.status_code >= 500:
+            logging.getLogger("clawworker").error(
+                "request_id=%s code=internal_error status=%s path=%s",
+                request_id, response.status_code, request.url.path,
+            )
+        return attach_response_headers(response, request_id)
+    except Exception as exc:
+        classified = classify_exception(exc)
+        logging.getLogger("clawworker").exception(
+            "request_id=%s code=%s category=%s path=%s",
+            request_id, classified.code, classified.category.value, request.url.path,
+        )
+        raise
+    finally:
+        reset_request_id(token)
 
 # Admin UI 路由 + 静态文件
 from pathlib import Path as _P
@@ -135,6 +170,19 @@ app.include_router(
 )
 
 
+@app.get("/healthz")
+def healthz():
+    """进程存活探针；不读取业务数据。"""
+    return {"status": "ok", "service": "host"}
+
+
+@app.get("/readyz")
+def readyz():
+    """启动完成且控制库可打开时才返回 200。"""
+    status = _runtime.readiness()
+    return JSONResponse(status, status_code=200 if status["status"] == "ready" else 503)
+
+
 # 根路径 → 管理后台（本机 :8442 或局域网 :8443 裸访问时不再 404；
 # 登录闸门交给下面中间件）
 @app.get("/")
@@ -154,15 +202,6 @@ async def _admin_login_gate(request, call_next):
             from fastapi.responses import RedirectResponse
             return RedirectResponse("/admin/login", status_code=303)
     return await call_next(request)
-
-
-@app.on_event("startup")
-def startup():
-    _bootstrap_legacy_env_config()
-    # 1 张证书 ↔ 1 个账户:清理任何"无对应账户"的证书,以及磁盘上残留的孤儿 .auth
-    released = auth_manager.cleanup_unbound(set(user_manager._accounts.keys()))
-    if released:
-        print(f"[startup] 释放 {len(released)} 张无主证书: {released}")
 
 
 # ----- 鉴权依赖 -----

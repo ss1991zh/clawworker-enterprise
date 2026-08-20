@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from host import service_manager as sm
+from shared.storage import atomic_write_json, atomic_write_text
 
 PROJECT_DIR = sm.PROJECT_DIR
 CLIENT_SUP_PY = PROJECT_DIR / "client_supervisor.py"
@@ -38,10 +39,7 @@ def _read_state() -> dict:
 
 
 def _write_state(d: dict) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = STATE_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(d, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(STATE_FILE)
+    atomic_write_json(STATE_FILE, d)
 
 
 def supervisor_running() -> tuple[bool, Optional[int]]:
@@ -162,7 +160,7 @@ def install_autostart() -> str:
     if plat == "darwin":
         p = _launchd_plist_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(_mac_plist_xml(), encoding="utf-8")
+        atomic_write_text(p, _mac_plist_xml())
         sm._run(["launchctl", "unload", str(p)])
         r = sm._run(["launchctl", "load", "-w", str(p)])
         if r.returncode != 0:
@@ -171,7 +169,7 @@ def install_autostart() -> str:
     if plat == "linux":
         p = _systemd_unit_path()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(_systemd_unit_text(), encoding="utf-8")
+        atomic_write_text(p, _systemd_unit_text())
         sm._run(["systemctl", "--user", "daemon-reload"])
         r = sm._run(["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.service"])
         if r.returncode != 0:

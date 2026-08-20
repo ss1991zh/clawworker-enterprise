@@ -1,6 +1,6 @@
 ﻿<#
   Clawworker Windows 安装脚本
-  作用:建 venv → 装依赖 → 装 4 个 HE 库 → 在桌面生成图标(双击即开界面)。
+  作用:建 venv → 按角色装依赖 → 用户端装 4 个 HE 库 → 在桌面生成图标。
 
   用法(在 PowerShell 7 / Windows Terminal 里,项目根目录执行):
       # 管理端机器:
@@ -33,6 +33,8 @@ $Icon    = Join-Path $Here "clawworker.ico"
 $HeLibs  = Join-Path $Here "he_libs"
 $Wheels  = Join-Path $Here "wheels"                    # 离线 wheel 目录(离线包会带上)
 $PyBundle = Join-Path $Here "python-3.11.9-amd64.exe"   # 随包 Python 安装器(离线包会带上)
+$RequirementsName = if ($Role -eq "both") { "requirements.txt" } else { "requirements-$Role.txt" }
+$RoleRequirements = Join-Path $Here $RequirementsName
 $DesktopRequirements = Join-Path $Here "requirements-desktop.txt"
 $WebView2Installer = Join-Path $Here "webview2\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"
 $SqlServerOdbcInstaller = Join-Path $Here "db_drivers\msodbcsql18-x64.msi"
@@ -101,18 +103,32 @@ if (-not $pyExe) {
 }
 Write-Host "使用 Python: $pyExe $pyArg"
 
-# ---- 2. 建 venv(PS 自动处理含空格/中文的路径)----
-if (-not (Test-Path $Py)) {
+# ---- 2. 建/修复 venv(覆盖安装时不复用损坏或已被移动的旧环境)----
+$venvReady = (Test-Path $Py) -and (Test-PyCmd $Py $null)
+if (-not $venvReady) {
+    if (Test-Path $Venv) {
+        $resolvedVenv = (Resolve-Path -LiteralPath $Venv).Path
+        $resolvedProject = (Resolve-Path -LiteralPath $Project).Path
+        if ((Split-Path -Parent $resolvedVenv) -ne $resolvedProject -or
+            (Split-Path -Leaf $resolvedVenv) -ne ".venv") {
+            throw "拒绝清理项目范围外的虚拟环境:$resolvedVenv"
+        }
+        Write-Host "检测到旧虚拟环境不可用，正在安全重建..." -ForegroundColor Yellow
+        Remove-Item -LiteralPath $resolvedVenv -Recurse -Force
+    }
     Write-Host "创建虚拟环境 .venv ..." -ForegroundColor Yellow
     if ($pyArg) { & $pyExe $pyArg -m venv $Venv } else { & $pyExe -m venv $Venv }
-    if (-not (Test-Path $Py)) { throw "创建 venv 失败:$Venv" }
+    if (-not ((Test-Path $Py) -and (Test-PyCmd $Py $null))) { throw "创建 venv 失败:$Venv" }
 }
 & $Py -m pip install --upgrade pip @PipArgs --quiet
 if ($LASTEXITCODE -ne 0) { throw "初始化 pip 失败(退出码 $LASTEXITCODE)。" }
 
 # ---- 3. 装依赖 ----
-Write-Host "安装依赖(requirements.txt)..." -ForegroundColor Yellow
-& $Py -m pip install -r (Join-Path $Here "requirements.txt") @PipArgs --quiet
+if (-not (Test-Path $RoleRequirements)) {
+    throw "缺少角色依赖清单:$RoleRequirements"
+}
+Write-Host "安装角色依赖($RequirementsName)..." -ForegroundColor Yellow
+& $Py -m pip install -r $RoleRequirements @PipArgs --quiet
 if ($LASTEXITCODE -ne 0) { throw "Python 依赖安装失败(退出码 $LASTEXITCODE)。" }
 
 # 仅用户端安装原生桌面窗口依赖；管理端仍使用浏览器，不引入 pywebview/pythonnet。
@@ -125,18 +141,20 @@ if ($Role -eq "client" -or $Role -eq "both") {
     if ($LASTEXITCODE -ne 0) { throw "用户端桌面窗口依赖安装失败(退出码 $LASTEXITCODE)。" }
 }
 
-# ---- 4. 装 4 个 HE 库 ----
-$libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev")
-if (Test-Path $HeLibs) {
-    foreach ($l in $libs) {
-        $d = Join-Path $HeLibs $l
-        if (-not (Test-Path $d)) { throw "缺少 HE 库目录: $d" }
-        Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow
-        & $Py -m pip install -e $d @PipArgs --quiet
-        if ($LASTEXITCODE -ne 0) { throw "HE 库 $l 安装失败(退出码 $LASTEXITCODE)。" }
+# ---- 4. 用户端装 4 个 HE 库；管理端不携带、不安装密态计算运行库 ----
+if ($Role -eq "client" -or $Role -eq "both") {
+    $libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev")
+    if (Test-Path $HeLibs) {
+        foreach ($l in $libs) {
+            $d = Join-Path $HeLibs $l
+            if (-not (Test-Path $d)) { throw "缺少 HE 库目录: $d" }
+            Write-Host "安装 HE 库 $l ..." -ForegroundColor Yellow
+            & $Py -m pip install -e $d @PipArgs --quiet
+            if ($LASTEXITCODE -ne 0) { throw "HE 库 $l 安装失败(退出码 $LASTEXITCODE)。" }
+        }
+    } else {
+        throw "未找到 $HeLibs,无法安装用户端密态运行环境。"
     }
-} else {
-    throw "未找到 $HeLibs,无法安装密态运行环境。"
 }
 
 # 安装后冒烟检查:基础 Web/TLS 依赖与当前角色入口必须能导入,否则拒绝带病完成。
@@ -239,6 +257,22 @@ if ($Role -eq "admin" -or $Role -eq "both") {
         Write-Host "局域网 HTTPS 证书已就位。" -ForegroundColor Green
     } catch {
         throw "局域网 HTTPS 证书生成失败:$_"
+    }
+}
+
+# ---- 4.75 真实启动自检。----
+# 仅能 import 不代表 lifespan、控制库、调度器和本地存储真正可用；用随机 loopback
+# 端口启动一次角色服务并等待 /readyz，失败就拒绝完成安装并给出日志路径。
+$PostInstallSmoke = Join-Path $Here "post_install_smoke.py"
+if (-not (Test-Path $PostInstallSmoke)) {
+    throw "缺少安装后启动自检脚本:$PostInstallSmoke"
+}
+$SmokeRoles = if ($Role -eq "both") { @("admin", "client") } else { @($Role) }
+foreach ($SmokeRole in $SmokeRoles) {
+    Write-Host "执行 $SmokeRole 真实启动自检..." -ForegroundColor Yellow
+    & $Py $PostInstallSmoke --role $SmokeRole --project $Project --timeout 60
+    if ($LASTEXITCODE -ne 0) {
+        throw "$SmokeRole 安装后启动自检失败，请查看 ~/.agent-system/supervisor/install-smoke-$SmokeRole.log"
     }
 }
 

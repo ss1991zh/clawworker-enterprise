@@ -1,51 +1,245 @@
 {% extends "base.html" %}
-{% block title %}数据权限 · Admin{% endblock %}
+{% block title %}数据授权 · Admin{% endblock %}
 {% block content %}
-  <h1 class="page-title">数据访问权限</h1>
-  <p class="page-subtitle">默认拒绝。支持个人与用户组授权、行级范围和字段脱敏；所有策略由管理端查询网关强制执行，数据库密码始终不会下发。</p>
-  <div class="panel"><div class="panel-header"><h3>用户组</h3></div><div class="panel-body">
-    <form method="post" action="/admin/data-permissions/groups" class="inline-form permission-group-create">
-      <input name="name" placeholder="用户组名称，如：华东销售" required>
-      <input name="description" placeholder="用途说明（可选）">
-      <button class="btn btn-primary" type="submit">创建用户组</button>
-    </form>
-    {% if groups %}<div class="permission-groups">{% for g in groups %}<div class="permission-group-card">
-      <div><strong>{{ g.name }}</strong>{% if g.description %}<span class="muted"> · {{ g.description }}</span>{% endif %}</div>
-      <div class="group-members">{% for member in g.members %}<form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members/{{ member }}/remove"><button class="pill member-pill" title="点击移出用户组">{{ member }} ×</button></form>{% else %}<span class="muted">暂无成员</span>{% endfor %}</div>
-      <div class="group-actions"><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members" class="inline-form"><select name="username" required>{% for u in users %}<option value="{{ u }}">{{ u }}</option>{% endfor %}</select><button class="btn btn-sm">添加成员</button></form><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/delete" onsubmit="return confirm('删除用户组及其全部组权限？');"><button class="btn btn-danger btn-sm">删除组</button></form></div>
-    </div>{% endfor %}</div>{% else %}<div class="empty compact-empty">尚未创建用户组，可继续使用个人直授权。</div>{% endif %}
-  </div></div>
-  <div class="panel"><div class="panel-header"><h3>现有授权</h3></div><div class="panel-body compact">
-    {% if policies %}<table class="table"><thead><tr><th>授权对象</th><th>数据源</th><th>表 / 视图</th><th>字段</th><th>行范围 / 脱敏</th><th>操作</th><th>行数上限</th><th></th></tr></thead><tbody>
-    {% for p in policies %}<tr><td><strong>{{ p.username }}</strong><div class="muted">{{ '用户组' if p.subject_kind == 'group' else '个人' }}</div></td><td>{{ p.source_name }}</td><td class="mono">{{ p.schema_name }}.{{ p.table_name }}</td><td class="mono ds-columns">{{ p.allowed_columns|join(', ') }}</td><td><div class="mono policy-rule">{{ p.row_filter_sql or '全部授权行' }}</div>{% if p.masked_columns %}<div class="muted">脱敏：{% for col,strategy in p.masked_columns.items() %}{{ col }}={{ {'partial':'部分隐藏','hash':'哈希','null':'置空'}[strategy] }}{% if not loop.last %}、{% endif %}{% endfor %}</div>{% endif %}</td><td>{% for op in p.operations %}<span class="pill muted">{{ {'browse':'浏览','query':'查询','analyze':'分析','export':'导出'}[op] }}</span>{% endfor %}</td><td>{{ p.max_rows }}</td><td><form method="post" action="{{ '/admin/data-permissions/group-policies/' ~ p.id ~ '/revoke' if p.subject_kind == 'group' else '/admin/data-permissions/' ~ p.id ~ '/revoke' }}" onsubmit="return confirm('立即撤销这条权限？');"><button class="btn btn-danger btn-sm">撤销</button></form></td></tr>{% endfor %}
-    </tbody></table>{% else %}<div class="empty">尚未授权任何用户访问数据库。</div>{% endif %}
-  </div></div>
+  <div class="permission-page-head">
+    <div>
+      <h1 class="page-title">数据授权</h1>
+      <p class="page-subtitle">给用户或用户组选择可使用的数据表和字段。未勾选的内容对用户不可见，也不能查询。</p>
+    </div>
+    <div class="permission-safe-note"><span>✓</span> 必选字段自动保护</div>
+  </div>
 
-  <div class="panel"><div class="panel-header"><h3>授予数据访问权限</h3></div><div class="panel-body">
-    {% if not users %}<div class="alert warning">请先创建企业用户。</div>{% elif not catalog %}<div class="alert warning">请先在“数据源”页面测试连接并同步结构。</div>{% else %}
-    <form method="post" action="/admin/data-permissions" id="permission-form">
-      <div class="form-grid">
-        <div class="field"><label>授权对象</label><select name="subject" required><optgroup label="个人用户">{% for u in users %}<option value="user:{{ u }}">{{ u }}</option>{% endfor %}</optgroup>{% if groups %}<optgroup label="用户组">{% for g in groups %}<option value="group:{{ g.id }}">组：{{ g.name }}</option>{% endfor %}</optgroup>{% endif %}</select></div>
-        <div class="field"><label>数据源</label><select name="data_source_id" id="perm-source" required>{% for s in sources %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select></div>
-        <div class="field"><label>Schema</label><select name="schema_name" id="perm-schema" required></select></div>
-        <div class="field"><label>表 / 视图</label><select name="table_name" id="perm-table" required></select></div>
-        <div class="field"><label>允许字段（逗号分隔，* 表示全部字段）</label><input type="text" name="allowed_columns" id="perm-columns" required><div class="muted" id="perm-hint"></div></div>
-        <div class="field"><label>最大返回行数</label><input type="number" name="max_rows" value="10000" min="1" max="1000000"></div>
-        <div class="field"><label>行级范围（可选）</label><input type="text" name="row_filter_sql" placeholder="如：region = '华东'"><div class="muted">仅允许列、常量、比较、IN/BETWEEN、IS NULL、AND/OR；不允许函数和子查询。</div></div>
-        <div class="field"><label>字段脱敏（可选）</label><input type="text" name="masked_columns" placeholder="如：phone:partial,id_card:hash"><div class="muted">策略：partial 部分隐藏、hash 不可逆哈希、null 置空。</div></div>
-      </div>
-      <div class="field" style="margin-top:18px;"><label>允许操作</label><div class="check-row"><label><input type="checkbox" name="operations" value="browse" checked> 浏览结构</label><label><input type="checkbox" name="operations" value="query" checked> 查询</label><label><input type="checkbox" name="operations" value="analyze"> 数据分析</label><label><input type="checkbox" name="operations" value="export"> 导出文件</label></div></div>
-      <button class="btn btn-primary" type="submit">保存授权</button>
-    </form>
-    {% endif %}
-  </div></div>
-  {% if catalog %}<script>
-    const catalog={{ catalog|tojson }};
-    const source=document.getElementById('perm-source'), schema=document.getElementById('perm-schema'), table=document.getElementById('perm-table'), columns=document.getElementById('perm-columns'), hint=document.getElementById('perm-hint');
-    function uniq(a){return [...new Set(a)];} function fill(el,values){el.innerHTML=values.map(v=>`<option value="${v}">${v}</option>`).join('');}
-    function sourceChanged(){fill(schema,uniq(catalog.filter(c=>c.source_id===source.value).map(c=>c.schema_name))); schemaChanged();}
-    function schemaChanged(){fill(table,uniq(catalog.filter(c=>c.source_id===source.value&&c.schema_name===schema.value).map(c=>c.table_name))); tableChanged();}
-    function tableChanged(){const a=catalog.filter(c=>c.source_id===source.value&&c.schema_name===schema.value&&c.table_name===table.value).map(c=>c.column_name); columns.value=a.join(','); hint.textContent='可用字段：'+a.join('、');}
-    source.addEventListener('change',sourceChanged); schema.addEventListener('change',schemaChanged); table.addEventListener('change',tableChanged); sourceChanged();
-  </script>{% endif %}
+  <div class="panel permission-editor" id="permission-editor">
+    <div class="panel-header permission-panel-title">
+      <div><h3>按用户管理数据权限</h3><p>先选用户，再选数据库。每个用户、每个数据库的权限相互独立。</p></div>
+    </div>
+    <div class="panel-body">
+      {% if not users %}<div class="alert warning">请先创建企业用户。</div>
+      {% elif not catalog %}<div class="alert warning">暂无可授权的数据表，请先到“数据源”页面测试连接并同步结构。</div>
+      {% else %}
+      <form method="post" action="/admin/data-permissions/batch" id="permission-form">
+        <select name="subject" id="perm-subject" class="permission-hidden-select" required><optgroup label="个人用户">{% for u in users %}<option value="user:{{ u }}" data-kind="user">{{ u }}</option>{% endfor %}</optgroup>{% if groups %}<optgroup label="用户组">{% for g in groups %}<option value="group:{{ g.id }}" data-kind="group">{{ g.name }}</option>{% endfor %}</optgroup>{% endif %}</select>
+        <select name="data_source_id" id="perm-source" class="permission-hidden-select" required>{% for s in sources %}<option value="{{ s.id }}">{{ s.name }}</option>{% endfor %}</select>
+
+        <div class="permission-workspace">
+          <aside class="permission-subject-pane">
+            <div class="permission-pane-head"><div><span class="permission-step-no">1</span><strong>选择用户</strong></div><span id="perm-subject-total">{{ users|length }} 个账号</span></div>
+            <div class="permission-search permission-subject-search"><span>⌕</span><input type="search" id="perm-subject-search" placeholder="搜索用户或用户组"></div>
+            <div id="perm-subject-list" class="permission-subject-list"></div>
+          </aside>
+          <section class="permission-config-pane">
+            <div class="permission-context-head">
+              <div><span class="permission-step-no">2</span><div><strong id="perm-context-title">选择数据库</strong><p id="perm-context-subtitle">该用户可分别获得多个数据库的权限</p></div></div>
+            </div>
+            <div id="perm-source-list" class="permission-source-list"></div>
+            <div class="permission-table-section-title"><span class="permission-step-no">3</span><div><strong id="perm-table-title">配置表和字段</strong><p>当前保存只更新上方选中的用户和数据库，不影响其他用户或其他数据库。</p></div></div>
+
+            <div class="permission-table-toolbar">
+              <div class="permission-search"><span>⌕</span><input type="search" id="perm-search" placeholder="搜索表名、字段名或说明"></div>
+              <button class="btn btn-sm" type="button" id="perm-select-visible">选择当前结果</button>
+              <button class="btn btn-sm" type="button" id="perm-clear-visible">取消当前结果</button>
+            </div>
+            <div id="permission-table-list" class="permission-table-list"></div>
+            <div id="permission-empty-search" class="empty compact-empty" hidden>没有找到匹配的表或字段。</div>
+          </section>
+        </div>
+
+        <div class="permission-options">
+          <div class="field"><label>允许用户进行</label><div class="check-row permission-operation-row">
+            <label><input type="checkbox" name="operations" value="browse" checked> 查看结构</label>
+            <label><input type="checkbox" name="operations" value="query" checked> 查询数据</label>
+            <label><input type="checkbox" name="operations" value="analyze" checked> 数据分析</label>
+            <label><input type="checkbox" name="operations" value="export"> 导出文件</label>
+          </div><div class="muted">以上权限应用到本次选择的所有表。</div></div>
+          <details class="permission-more"><summary>更多设置</summary><div class="field"><label for="perm-max-rows">单次最多返回行数</label><input id="perm-max-rows" type="number" name="max_rows" value="10000" min="1" max="1000000"></div></details>
+        </div>
+
+        <div class="permission-savebar">
+          <div><strong id="perm-selected-summary">尚未选择表</strong><span id="perm-mode-summary">请选择需要授权的数据表</span></div>
+          <button class="btn btn-primary" type="submit" id="perm-save-button">保存当前用户的数据库权限</button>
+        </div>
+      </form>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-header permission-panel-title"><div><h3>已授权概览</h3><p>相同用户和数据源的权限已合并显示，便于检查和调整。</p></div><span class="pill" id="permission-policy-count">{{ policies|length }} 张表</span></div>
+    <div class="panel-body"><div id="permission-overview" class="permission-overview"></div>
+      <div class="permission-policy-accessible-data">{% for p in policies %}<div>{{ p.username }} · {{ p.source_name }} · {{ p.schema_name }}.{{ p.table_name }} · {{ p.allowed_columns|join(', ') }} · {{ p.row_filter_sql or '全部授权行' }}{% if p.masked_columns %} · 脱敏：{% for col,strategy in p.masked_columns.items() %}{{ col }}={{ {'partial':'部分隐藏','hash':'哈希','null':'置空'}[strategy] }}{% if not loop.last %}、{% endif %}{% endfor %}{% endif %}</div>{% endfor %}</div>
+    </div>
+  </div>
+
+  <details class="panel permission-group-panel">
+    <summary class="panel-header permission-group-summary"><div><h3>用户组管理</h3><p>把经常使用相同数据的用户放进一个组，只需授权一次。</p></div><span>{{ groups|length }} 个用户组</span></summary>
+    <div class="panel-body">
+      <form method="post" action="/admin/data-permissions/groups" class="inline-form permission-group-create">
+        <input name="name" placeholder="用户组名称，如：华东销售" required>
+        <input name="description" placeholder="用途说明（可选）">
+        <button class="btn btn-primary" type="submit">创建用户组</button>
+      </form>
+      {% if groups %}<div class="permission-groups">{% for g in groups %}<div class="permission-group-card">
+        <div><strong>{{ g.name }}</strong>{% if g.description %}<span class="muted"> · {{ g.description }}</span>{% endif %}</div>
+        <div class="group-members">{% for member in g.members %}<form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members/{{ member }}/remove"><button class="pill member-pill" title="点击移出用户组">{{ member }} ×</button></form>{% else %}<span class="muted">暂无成员</span>{% endfor %}</div>
+        <div class="group-actions"><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/members" class="inline-form"><select name="username" required>{% for u in users %}<option value="{{ u }}">{{ u }}</option>{% endfor %}</select><button class="btn btn-sm">添加成员</button></form><form method="post" action="/admin/data-permissions/groups/{{ g.id }}/delete" onsubmit="return confirm('删除用户组及其全部组权限？');"><button class="btn btn-danger btn-sm">删除组</button></form></div>
+      </div>{% endfor %}</div>{% else %}<div class="empty compact-empty">尚未创建用户组，可直接给个人用户授权。</div>{% endif %}
+    </div>
+  </details>
+
+  <script>
+  (() => {
+    const catalog = {{ catalog|tojson }};
+    const policies = {{ policies|tojson }};
+    const sources = {{ source_data|tojson }};
+    const form = document.getElementById('permission-form');
+    const overview = document.getElementById('permission-overview');
+    const opNames = {browse:'查看结构', query:'查询', analyze:'分析', export:'导出'};
+    const make = (tag, cls, text) => { const node=document.createElement(tag); if(cls) node.className=cls; if(text!==undefined) node.textContent=text; return node; };
+
+    function renderOverview() {
+      if (!policies.length) { overview.append(make('div','empty','尚未给任何用户授权数据库。')); return; }
+      const groups = new Map();
+      policies.forEach(policy => {
+        const key = `${policy.subject_value}|${policy.data_source_id}`;
+        if (!groups.has(key)) groups.set(key, {subject:policy.username, kind:policy.subject_kind, source:policy.source_name, subjectValue:policy.subject_value, sourceId:policy.data_source_id, items:[]});
+        groups.get(key).items.push(policy);
+      });
+      groups.forEach(group => {
+        const card=make('section','permission-overview-card');
+        const head=make('div','permission-overview-head');
+        const title=make('div'); title.append(make('strong','',group.subject), make('span','pill muted',group.kind==='group'?'用户组':'个人用户'), make('span','permission-source-name',group.source));
+        const edit=make('button','btn btn-sm','调整授权'); edit.type='button'; edit.addEventListener('click',()=>{
+          const subject=document.getElementById('perm-subject'), source=document.getElementById('perm-source');
+          if(subject && [...subject.options].some(item=>item.value===group.subjectValue)) subject.value=group.subjectValue;
+          if(source && [...source.options].some(item=>item.value===group.sourceId)) source.value=group.sourceId;
+          if(form){ renderSubjects(); renderSources(); loadSelection(); document.getElementById('permission-editor').scrollIntoView({behavior:'smooth',block:'start'}); }
+        });
+        head.append(title,edit); card.append(head);
+        const rows=make('div','permission-overview-tables');
+        group.items.forEach(policy=>{
+          const row=make('div','permission-overview-row');
+          const info=make('div'); info.append(make('strong','permission-table-name',policy.table_name),make('span','muted',policy.schema_name));
+          const allFields=policy.allowed_columns.includes('*');
+          const details=make('div','permission-overview-detail',(allFields?'全部字段':`${policy.allowed_columns.length} 个字段`)+' · '+policy.operations.map(op=>opNames[op]||op).join('、'));
+          const revoke=document.createElement('form'); revoke.method='post'; revoke.action=policy.subject_kind==='group'?`/admin/data-permissions/group-policies/${policy.id}/revoke`:`/admin/data-permissions/${policy.id}/revoke`; revoke.addEventListener('submit',event=>{if(!confirm(`撤销 ${policy.table_name} 的访问权限？`)) event.preventDefault();});
+          const button=make('button','btn btn-danger btn-sm','撤销'); button.type='submit'; revoke.append(button);
+          row.append(info,details,revoke); rows.append(row);
+        });
+        card.append(rows); overview.append(card);
+      });
+    }
+    renderOverview();
+    if (!form) return;
+
+    const subject=document.getElementById('perm-subject'), source=document.getElementById('perm-source'), search=document.getElementById('perm-search'), subjectSearch=document.getElementById('perm-subject-search');
+    const list=document.getElementById('permission-table-list'), empty=document.getElementById('permission-empty-search');
+    const state=new Map();
+    const keyOf=(schema,table)=>`${schema}.${table}`;
+    const subjectOptions=()=>[...subject.options].map(option=>({value:option.value,label:option.textContent,kind:option.dataset.kind||'user'}));
+    const policyCount=(subjectValue,sourceId='')=>policies.filter(item=>item.subject_value===subjectValue&&(!sourceId||item.data_source_id===sourceId)).length;
+    const sourceCount=subjectValue=>new Set(policies.filter(item=>item.subject_value===subjectValue).map(item=>item.data_source_id)).size;
+    function renderSubjects(){
+      const query=subjectSearch.value.trim().toLocaleLowerCase(); document.getElementById('perm-subject-list').replaceChildren();
+      subjectOptions().filter(item=>!query||item.label.toLocaleLowerCase().includes(query)).forEach(item=>{
+        const button=make('button','permission-subject-item'+(item.value===subject.value?' active':'')); button.type='button'; button.dataset.value=item.value;
+        const avatar=make('span','permission-subject-avatar',item.kind==='group'?'组':item.label.slice(0,1).toUpperCase());
+        const info=make('span'); info.append(make('strong','',item.kind==='group'?`用户组：${item.label}`:item.label),make('small','',sourceCount(item.value)?`已授权 ${sourceCount(item.value)} 个数据库 · ${policyCount(item.value)} 张表`:'尚未授权数据库'));
+        button.append(avatar,info); button.addEventListener('click',()=>{subject.value=item.value; renderSubjects(); renderSources(); loadSelection();});
+        document.getElementById('perm-subject-list').append(button);
+      });
+    }
+    function renderSources(){
+      const pane=document.getElementById('perm-source-list'); pane.replaceChildren();
+      const currentLabel=subject.selectedOptions[0]?.textContent||'';
+      document.getElementById('perm-context-title').textContent=`${currentLabel} 的数据库权限`;
+      document.getElementById('perm-context-subtitle').textContent=`已配置 ${sourceCount(subject.value)} 个数据库，可继续选择其他数据库分别授权`;
+      sources.forEach(item=>{
+        const count=policyCount(subject.value,item.id), button=make('button','permission-source-card'+(item.id===source.value?' active':'')); button.type='button';
+        const icon=make('span','permission-source-icon','DB'); const info=make('span'); info.append(make('strong','',item.name),make('small','',count?`已授权 ${count} 张表`:'未授权'));
+        const status=make('em',count?'configured':'',count?'已配置':'可配置'); button.append(icon,info,status);
+        button.addEventListener('click',()=>{source.value=item.id; renderSources(); loadSelection();}); pane.append(button);
+      });
+      const sourceLabel=source.selectedOptions[0]?.textContent||'';
+      document.getElementById('perm-table-title').textContent=`配置「${sourceLabel}」的表和字段`;
+      document.getElementById('perm-save-button').textContent=`保存 ${currentLabel} · ${sourceLabel}`;
+    }
+    function sourceTables() {
+      const tables=new Map();
+      catalog.filter(item=>item.source_id===source.value).forEach(item=>{
+        const key=keyOf(item.schema_name,item.table_name);
+        if(!tables.has(key)) tables.set(key,{key,schema:item.schema_name,table:item.table_name,type:item.table_type,columns:[]});
+        tables.get(key).columns.push(item);
+      });
+      tables.forEach(table=>table.columns.sort((a,b)=>a.ordinal_position-b.ordinal_position));
+      return [...tables.values()].sort((a,b)=>a.schema.localeCompare(b.schema)||a.table.localeCompare(b.table));
+    }
+    function loadSelection() {
+      state.clear();
+      const current=policies.filter(item=>item.subject_value===subject.value && item.data_source_id===source.value);
+      const byTable=new Map(current.map(item=>[keyOf(item.schema_name,item.table_name),item]));
+      const tables=sourceTables();
+      tables.forEach(table=>{
+        const policy=byTable.get(table.key), allNames=table.columns.map(item=>item.column_name), required=table.columns.filter(item=>item.required).map(item=>item.column_name);
+        let selected=new Set(allNames), mode='all';
+        if(policy && !policy.allowed_columns.includes('*')) { selected=new Set(policy.allowed_columns.filter(name=>allNames.includes(name))); required.forEach(name=>selected.add(name)); mode=selected.size===allNames.length?'all':'partial'; }
+        state.set(table.key,{selected:!!policy,mode,columns:selected});
+      });
+      document.querySelectorAll('input[name="operations"]').forEach(input=>input.checked=current.length?current[0].operations.includes(input.value):input.value!=='export');
+      document.getElementById('perm-max-rows').value=current.length?current[0].max_rows:10000;
+      document.getElementById('perm-table-title').textContent=`配置「${source.selectedOptions[0]?.textContent||''}」的表和字段`;
+      document.getElementById('perm-save-button').textContent=`保存 ${subject.selectedOptions[0]?.textContent||''} · ${source.selectedOptions[0]?.textContent||''}`;
+      renderTables();
+    }
+    function renderTables() {
+      list.replaceChildren(); let visible=0;
+      const query=search.value.trim().toLocaleLowerCase();
+      sourceTables().forEach(table=>{
+        const itemState=state.get(table.key); if(!itemState) return;
+        const haystack=[table.schema,table.table,...table.columns.flatMap(column=>[column.column_name,column.comment||''])].join(' ').toLocaleLowerCase();
+        const card=make('section','permission-table-card'+(itemState.selected?' selected':'')); card.dataset.table=table.key;
+        if(query && !haystack.includes(query)) card.hidden=true; else visible++;
+        const head=make('div','permission-table-head');
+        const choose=make('label','permission-table-choice'); const checkbox=document.createElement('input'); checkbox.type='checkbox'; checkbox.name='tables'; checkbox.value=table.key; checkbox.checked=itemState.selected;
+        checkbox.addEventListener('change',()=>{itemState.selected=checkbox.checked; renderTables();});
+        const identity=make('div'); identity.append(make('strong','',table.table),make('span','muted',`${table.schema} · ${table.type==='VIEW'?'视图':'数据表'} · ${table.columns.length} 个字段`)); choose.append(checkbox,identity);
+        const summary=make('div','permission-table-summary',itemState.selected?(itemState.mode==='all'?'全部字段':`已选 ${itemState.columns.size}/${table.columns.length} 个字段`):'未授权');
+        head.append(choose,summary); card.append(head);
+        if(itemState.selected){
+          const body=make('div','permission-table-body'); const modes=make('div','permission-field-modes');
+          [['all','全部字段'],['partial','选择部分字段']].forEach(([value,labelText])=>{const label=make('label',itemState.mode===value?'active':''); const radio=document.createElement('input'); radio.type='radio'; radio.name=`mode::${table.key}`; radio.value=value; radio.checked=itemState.mode===value; radio.addEventListener('change',()=>{itemState.mode=value; if(value==='all') table.columns.forEach(column=>itemState.columns.add(column.column_name)); renderTables();}); label.append(radio,document.createTextNode(labelText)); modes.append(label);});
+          body.append(modes);
+          if(itemState.mode==='all'){
+            table.columns.forEach(column=>{const hidden=document.createElement('input'); hidden.type='hidden'; hidden.name=`columns::${table.key}`; hidden.value=column.column_name; body.append(hidden);});
+            body.append(make('p','permission-all-note','该表的全部字段都可以使用。以后同步新增字段时，需要管理员再次确认授权。'));
+          } else {
+            const help=make('div','permission-required-help','带“必选”的标识字段用于识别和关联数据，不能取消。'); body.append(help);
+            const fields=make('div','permission-field-grid');
+            table.columns.forEach(column=>{
+              const label=make('label','permission-field'+(column.required?' required':'')); const input=document.createElement('input'); input.type='checkbox'; input.name=`columns::${table.key}`; input.value=column.column_name; input.checked=column.required||itemState.columns.has(column.column_name); input.disabled=!!column.required;
+              if(column.required){const hidden=document.createElement('input'); hidden.type='hidden'; hidden.name=input.name; hidden.value=input.value; label.append(hidden);}
+              input.addEventListener('change',()=>{input.checked?itemState.columns.add(column.column_name):itemState.columns.delete(column.column_name); summary.textContent=`已选 ${itemState.columns.size}/${table.columns.length} 个字段`; updateSummary();});
+              const text=make('span'); text.append(make('strong','',column.column_name)); if(column.comment) text.append(make('small','',column.comment));
+              label.append(input,text); if(column.required) label.append(make('em','','必选')); fields.append(label);
+            }); body.append(fields);
+          }
+          card.append(body);
+        }
+        list.append(card);
+      });
+      empty.hidden=visible!==0; updateSummary();
+    }
+    function updateSummary(){
+      const selected=[...state.values()].filter(item=>item.selected), partial=selected.filter(item=>item.mode==='partial').length;
+      document.getElementById('perm-selected-summary').textContent=selected.length?`已选择 ${selected.length} 张表`:'未选择表（保存后将撤销该数据源的全部权限）';
+      document.getElementById('perm-mode-summary').textContent=selected.length?(partial?`其中 ${partial} 张按部分字段授权`:'全部按完整字段授权'):'如需清空权限，可直接保存';
+    }
+    function setVisible(value){document.querySelectorAll('.permission-table-card:not([hidden])').forEach(card=>{const item=state.get(card.dataset.table); if(item) item.selected=value;}); renderTables();}
+    document.getElementById('perm-select-visible').addEventListener('click',()=>setVisible(true));
+    document.getElementById('perm-clear-visible').addEventListener('click',()=>setVisible(false));
+    search.addEventListener('input',renderTables); subjectSearch.addEventListener('input',renderSubjects);
+    subject.addEventListener('change',()=>{renderSubjects();renderSources();loadSelection();}); source.addEventListener('change',()=>{renderSources();loadSelection();});
+    form.addEventListener('submit',event=>{if(![...state.values()].some(item=>item.selected) && !confirm('当前没有选择任何表。保存后会撤销该对象在此数据源上的全部权限，确定继续吗？')) event.preventDefault();});
+    renderSubjects(); renderSources(); loadSelection();
+  })();
+  </script>
 {% endblock %}

@@ -18,6 +18,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+from shared.paths import HOST_AUTH_DIR
+from shared.storage import atomic_write_json
+
 
 class AccountStatus(str, Enum):
     ACTIVE = "active"
@@ -75,7 +78,7 @@ class UserManager:
         if accounts_path is None:
             base = getattr(auth_manager, "_storage_root", None)
             if base is None:
-                base = Path.home() / ".agent-system" / "host-auth"
+                base = HOST_AUTH_DIR
             accounts_path = Path(base) / "accounts.json"
         self._accounts_path = accounts_path
         self._accounts_path.parent.mkdir(parents=True, exist_ok=True)
@@ -116,9 +119,7 @@ class UserManager:
                 "created_at": acct.created_at.isoformat(),
                 "llm_config_id": acct.llm_config_id or "",
             })
-        tmp = self._accounts_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._accounts_path)
+        atomic_write_json(self._accounts_path, data)
 
     # 兼容旧名
     @property

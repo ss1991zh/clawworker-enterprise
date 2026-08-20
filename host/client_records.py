@@ -13,10 +13,11 @@ import json
 from pathlib import Path
 from typing import Optional
 
-_BASE = Path.home() / ".agent-system"
-SESSIONS_DIR = _BASE / "sessions"
-TASKS_FILE = _BASE / "scheduler" / "tasks.json"
-HIDDEN_FILE = _BASE / "admin" / "hidden_records.json"
+from shared.paths import ADMIN_DIR, SCHEDULER_DIR, SESSIONS_DIR
+from shared.storage import atomic_write_json
+
+TASKS_FILE = SCHEDULER_DIR / "tasks.json"
+HIDDEN_FILE = ADMIN_DIR / "hidden_records.json"
 
 
 # ---- admin 侧"隐藏集"(只影响 admin 视图)----
@@ -29,10 +30,7 @@ def _load_hidden() -> set[str]:
 
 
 def _save_hidden(ids: set[str]) -> None:
-    HIDDEN_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = HIDDEN_FILE.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(sorted(ids), ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(HIDDEN_FILE)
+    atomic_write_json(HIDDEN_FILE, sorted(ids))
 
 
 def hide(rid: str) -> None:

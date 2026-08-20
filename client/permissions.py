@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from shared.paths import DOWNLOADS_DIR
+
 
 # ===========================================================================
 # 规则 1:解密授权
@@ -90,9 +92,6 @@ class DenyAuthorizer(DecryptionAuthorizer):
 # ===========================================================================
 # 规则 2:Excel 写入路径白名单
 # ===========================================================================
-
-
-DOWNLOADS_DIR = Path.home() / "Downloads"
 
 
 def is_path_in_downloads(path: str | Path) -> bool:

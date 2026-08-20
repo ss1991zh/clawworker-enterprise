@@ -15,6 +15,8 @@ import ctypes
 import os
 from ctypes import wintypes
 
+from shared.paths import HOST_CONFIG_DIR
+
 _PREFIX = "dpapi:"
 
 
@@ -47,8 +49,7 @@ def _blob_bytes(blob: "_DATA_BLOB") -> bytes:
 # 应用级 entropy:绑定到本应用 + 本次安装 —— 同用户下的通用木马即便调 DPAPI
 # 也解不开(它不知道这份 entropy)。= 固定 app 常量 + 每安装随机密钥(ACL 保护的边文件)。
 _APP_ENTROPY_CONST = b"clawworker-enterprise/llm-key/v1"
-_ENTROPY_FILE = os.path.join(os.path.expanduser("~"), ".agent-system",
-                             "host-config", ".secret_entropy")
+_ENTROPY_FILE = str(HOST_CONFIG_DIR / ".secret_entropy")
 _entropy_cache: bytes | None = None
 
 
@@ -131,6 +132,60 @@ def is_protected(stored: str) -> bool:
     return bool(stored) and stored.startswith(_PREFIX)
 
 
+def _windows_current_user_sid() -> str:
+    """读取当前进程令牌的真实 SID，避免 USERNAME/USERDOMAIN 与服务账户不一致。"""
+    if os.name != "nt":
+        return ""
+
+    class _SID_AND_ATTRIBUTES(ctypes.Structure):
+        _fields_ = [("Sid", ctypes.c_void_p), ("Attributes", wintypes.DWORD)]
+
+    class _TOKEN_USER(ctypes.Structure):
+        _fields_ = [("User", _SID_AND_ATTRIBUTES)]
+
+    token = wintypes.HANDLE()
+    advapi32 = ctypes.WinDLL("advapi32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                          ctypes.POINTER(wintypes.HANDLE)]
+    advapi32.OpenProcessToken.restype = wintypes.BOOL
+    advapi32.GetTokenInformation.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    advapi32.GetTokenInformation.restype = wintypes.BOOL
+    advapi32.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p,
+                                                ctypes.POINTER(ctypes.c_wchar_p)]
+    advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel32.CloseHandle.restype = wintypes.BOOL
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(), 0x0008, ctypes.byref(token)):
+        return ""
+    try:
+        size = wintypes.DWORD()
+        advapi32.GetTokenInformation(token, 1, None, 0, ctypes.byref(size))
+        if not size.value:
+            return ""
+        buffer = ctypes.create_string_buffer(size.value)
+        if not advapi32.GetTokenInformation(
+            token, 1, buffer, size.value, ctypes.byref(size),
+        ):
+            return ""
+        token_user = ctypes.cast(buffer, ctypes.POINTER(_TOKEN_USER)).contents
+        sid_text = ctypes.c_wchar_p()
+        if not advapi32.ConvertSidToStringSidW(token_user.User.Sid, ctypes.byref(sid_text)):
+            return ""
+        try:
+            return sid_text.value or ""
+        finally:
+            kernel32.LocalFree(ctypes.cast(sid_text, ctypes.c_void_p))
+    finally:
+        kernel32.CloseHandle(token)
+
+
 def harden_file(path) -> bool:
     """把文件权限收紧到仅当前用户可读(与密钥沙盒同法);best-effort。"""
     import subprocess
@@ -138,9 +193,12 @@ def harden_file(path) -> bool:
         if os.name != "nt":
             os.chmod(path, 0o600)
             return True
-        user = os.environ.get("USERNAME") or ""
-        domain = os.environ.get("USERDOMAIN") or ""
-        principal = f"{domain}\\{user}" if domain and user else user
+        sid = _windows_current_user_sid()
+        principal = f"*{sid}" if sid else ""
+        if not principal:
+            user = os.environ.get("USERNAME") or ""
+            domain = os.environ.get("USERDOMAIN") or ""
+            principal = f"{domain}\\{user}" if domain and user else user
         if not principal:
             return False
         r = subprocess.run(["icacls", str(path), "/inheritance:r", "/grant:r", f"{principal}:F"],

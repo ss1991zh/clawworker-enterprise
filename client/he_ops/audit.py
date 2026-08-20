@@ -1,10 +1,11 @@
 """
 可信审计日志(append-only)—— Phase A:把"明文不出本机、LLM 只见 schema"从声称变成可核查的证据。
 
-记两类事件,按用户写 append-only JSONL(~/.agent-system/audit/<user>.jsonl):
+记三类事件,按用户写 append-only JSONL(~/.agent-system/audit/<user>.jsonl):
   · llm_exposure   每次分析发给 LLM 的内容:只有 schema 字段名(+ 类型),并附"零明文断言"
                    (结构校验:发送内容不含任何数据行/单元值)。
   · decrypt_auth   每次解密授权门触发:谁、何时、哪个会话、授权/拒绝/保留密文。
+  · document_exposure  用户确认后发送文档正文时，只记录文件名与字符数，不记录正文。
 
 用途:合规审计、客户尽调、出事自证清白。日志只追加不改写,可导出合规报告。
 隐私:审计日志本身**不含任何明文数据值**,只记字段名 + 行为元数据。
@@ -20,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-AUDIT_DIR = Path(os.path.expanduser("~/.agent-system/audit"))
+from shared.paths import AUDIT_DIR
 
 _GENESIS = "0" * 64                       # 链首 prev_hash
 _chain_lock = threading.Lock()
@@ -194,7 +195,7 @@ def assert_no_plaintext(schema: dict, query: str) -> dict:
 
 def record_llm_exposure(schema: dict, query: str, purpose: str = "analyze",
                         user: Optional[str] = None, session_id: Optional[str] = None) -> None:
-    """记录一次"LLM 只见 schema"事件 + 零明文断言。user/session 缺省取请求上下文。"""
+    """记录一次结构化数据分析暴露事件；数值数据行不得进入 LLM。"""
     user, session_id = _ctx_user_session(user, session_id)
     a = assert_no_plaintext(schema, query)
     _append(user, {
@@ -206,6 +207,32 @@ def record_llm_exposure(schema: dict, query: str, purpose: str = "analyze",
         "no_plaintext": a["no_plaintext"],
         "suspicious_fields": a["suspicious_fields"],
         "query_preview": (query or "")[:120],
+    })
+
+
+def record_document_exposure(attachments: list[dict], purpose: str = "document_context",
+                             user: Optional[str] = None,
+                             session_id: Optional[str] = None) -> None:
+    """记录经用户确认后发送给所配置 LLM 的文档正文元数据，不记录正文内容。"""
+    user, session_id = _ctx_user_session(user, session_id)
+    documents = [
+        {
+            "name": str(item.get("name") or "attachment")[:255],
+            "chars": len(str(item.get("content") or "")),
+        }
+        for item in attachments
+        if isinstance(item, dict) and item.get("content")
+    ]
+    if not documents:
+        return
+    _append(user, {
+        "type": "document_exposure",
+        "session": session_id,
+        "purpose": purpose,
+        "documents": documents,
+        "document_count": len(documents),
+        "total_chars": sum(item["chars"] for item in documents),
+        "explicit_consent": True,
     })
 
 
@@ -248,12 +275,14 @@ def summary(user: Optional[str]) -> dict:
     """合规摘要:事件计数、零明文是否始终成立、最近解密授权。"""
     evs = read_events(user, limit=100000)
     exposures = [e for e in evs if e.get("type") == "llm_exposure"]
+    document_exposures = [e for e in evs if e.get("type") == "document_exposure"]
     decrypts = [e for e in evs if e.get("type") == "decrypt_auth"]
     breaches = [e for e in exposures if not e.get("no_plaintext", True)]
     return {
         "user": user or "default",
         "total_events": len(evs),
         "llm_exposures": len(exposures),
+        "document_exposures": len(document_exposures),
         "decrypt_authorizations": len(decrypts),
         "decrypt_granted": sum(1 for e in decrypts if e.get("decision") == "granted"),
         "decrypt_denied": sum(1 for e in decrypts if e.get("decision") in ("denied", "keep_encrypted")),
@@ -261,8 +290,9 @@ def summary(user: Optional[str]) -> dict:
         "plaintext_breaches": len(breaches),
         "first_event": evs[0]["ts"] if evs else None,
         "last_event": evs[-1]["ts"] if evs else None,
-        "statement": ("✓ 全程满足:LLM 仅接收字段名 schema,明文数据值从未外发;"
-                      "所有解密均经用户本机授权,可追溯。"
+        "statement": ("✓ 结构化数值数据全程保持加密，LLM 仅接收字段结构；"
+                      f"文档正文经明确确认后发送 {len(document_exposures)} 次；"
+                      "所有结果解密均经用户本机授权，可追溯。"
                       if not breaches else
                       f"⚠ 检出 {len(breaches)} 次疑似明文外发,需复核。"),
     }

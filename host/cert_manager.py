@@ -24,6 +24,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from shared.paths import HOST_AUTH_DIR
+from shared.storage import atomic_write_bytes, atomic_write_json
+
 
 @dataclass
 class UserAuthorization:
@@ -68,7 +71,7 @@ class AuthorizationManager:
     """
 
     def __init__(self, storage_root: Optional[Path] = None):
-        self._storage_root = storage_root or (Path.home() / ".agent-system" / "host-auth")
+        self._storage_root = storage_root or HOST_AUTH_DIR
         self._storage_root.mkdir(parents=True, exist_ok=True)
         self._index_path = self._storage_root / "index.json"
         self._lock = threading.Lock()
@@ -145,10 +148,7 @@ class AuthorizationManager:
                     if auth.sdk_init_failed_at else None
                 ),
             })
-        # 原子写入:先写 .tmp 再 rename
-        tmp = self._index_path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._index_path)
+        atomic_write_json(self._index_path, data)
 
     # ----- 导入(强制 1 证书 1 用户)-----
     def import_authorization(self, *, username: str, source: Path) -> UserAuthorization:
@@ -182,7 +182,7 @@ class AuthorizationManager:
             )
 
         dst = self._storage_root / f"{username}.{digest}.auth"
-        dst.write_bytes(source.read_bytes())
+        atomic_write_bytes(dst, source.read_bytes())
 
         with self._lock:
             auth = UserAuthorization(

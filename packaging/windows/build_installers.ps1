@@ -6,14 +6,18 @@
       powershell -ExecutionPolicy Bypass -File packaging\windows\build_installers.ps1
 
   产物:packaging\windows\dist\
-      Clawworker-admin-Setup-1.6.1.exe   ← 装在管理端机器
-      Clawworker-client-Setup-1.6.1.exe  ← 装在每台用户机器
+      Clawworker-admin-Setup-1.7.0.exe   ← 装在管理端机器
+      Clawworker-client-Setup-1.7.0.exe  ← 装在每台用户机器
 #>
 $ErrorActionPreference = "Stop"
 try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}
 
 $Here = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Iss  = Join-Path $Here "clawworker-setup.iss"
+$VersionFile = Join-Path $Here "..\..\shared\version.py"
+$VersionMatch = Select-String -LiteralPath $VersionFile -Pattern '^__version__\s*=\s*"([^"]+)"$'
+if (-not $VersionMatch) { throw "无法从 $VersionFile 读取产品版本。" }
+$AppVersion = $VersionMatch.Matches[0].Groups[1].Value
 
 # 找 Inno Setup 编译器 ISCC.exe
 $iscc = $null
@@ -26,7 +30,7 @@ foreach ($p in @(
 if (-not $iscc -and (Get-Command iscc -ErrorAction SilentlyContinue)) { $iscc = "iscc" }
 if (-not $iscc) { throw "未找到 Inno Setup(ISCC.exe)。请先安装 Inno Setup 6+:https://jrsoftware.org/isdl.php" }
 
-# 自包含安装包硬闸:Python 安装器、4 个 HE 库和所需 DLL 缺一不可。
+# 自包含安装包硬闸:Python、管理端数据库驱动、用户端 HE 库缺一不可。
 $pyBundle = Join-Path $Here "python-3.11.9-amd64.exe"
 if (-not (Test-Path $pyBundle)) {
     throw "缺少随包 Python 3.11 安装器: $pyBundle"
@@ -64,48 +68,86 @@ foreach ($lib in @("crypto_toolkit-64_dev", "henumpy-dev")) {
     }
 }
 
-# 离线 wheel 包完整性硬闸:目标机用 --no-index 纯离线装,漏一个包就装不起来
-# (真实事故:漏了 cryptography → 目标机生成不了证书、服务起不来、点图标无反应)。
-# 打包前用 pip 离线解析核对一遍,缺件直接中止,绝不产出装完用不了的安装包。
+# 从完整 wheel 仓按角色解析并生成两个最小离线 wheel 目录。这样管理端不再携带
+# pandas/xgboost/密态计算依赖，用户端也不再携带数据库驱动绑定。
 $wheels = Join-Path $Here "wheels"
-$reqs   = Join-Path $Here "requirements.txt"
-if ((Test-Path $wheels) -and (Test-Path $reqs)) {
-    $py = $env:CLAWWORKER_BUILD_PY
-    if (-not $py) {
-        foreach ($c in @("$PSScriptRoot\..\..\.venv\Scripts\python.exe", "python", "py")) {
-            try {
-                if ((Test-Path $c) -or (Get-Command $c -ErrorAction SilentlyContinue)) {
-                    & $c --version *> $null
-                    if ($LASTEXITCODE -eq 0) { $py = $c; break }
-                }
-            } catch {}
-        }
+if (-not (Test-Path $wheels)) { throw "缺少完整离线 wheel 仓:$wheels" }
+$py = $env:CLAWWORKER_BUILD_PY
+if (-not $py) {
+    foreach ($c in @("$PSScriptRoot\..\..\.venv\Scripts\python.exe", "python", "py")) {
+        try {
+            if ((Test-Path $c) -or (Get-Command $c -ErrorAction SilentlyContinue)) {
+                & $c --version *> $null
+                if ($LASTEXITCODE -eq 0) { $py = $c; break }
+            }
+        } catch {}
     }
-    if ($py) {
-        Write-Host "==== 校验离线 wheel 包完整性 ====" -ForegroundColor Cyan
-        $tmp = Join-Path $env:TEMP ("cw_wheelcheck_" + [Guid]::NewGuid().ToString("N"))
-        & $py -m pip install --dry-run --no-index --find-links $wheels -r $reqs --target $tmp `
-            --platform win_amd64 --python-version 3.11 --implementation cp --abi cp311 `
-            --only-binary=:all: 2>&1 | Out-Null
-        $ok = ($LASTEXITCODE -eq 0)
-        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-        if (-not $ok) {
-            throw "离线 wheel 包无法满足 requirements.txt —— 目标机装完会缺依赖、程序起不来。" +
-                  "请先补齐缺失的 wheel(如 pip download <pkg> --dest wheels)再打包。"
+}
+if (-not $py) { throw "未找到 Python，无法解析并验证角色离线依赖。" }
+
+foreach ($role in @("admin", "client")) {
+    $roleReq = Join-Path $Here "requirements-$role.txt"
+    if (-not (Test-Path $roleReq)) { throw "缺少角色依赖清单:$roleReq" }
+    $roleWheelDir = Join-Path $Here "wheels-$role"
+    if (Test-Path $roleWheelDir) {
+        $resolved = (Resolve-Path -LiteralPath $roleWheelDir).Path
+        $expectedParent = (Resolve-Path -LiteralPath $Here).Path
+        if ((Split-Path -Parent $resolved) -ne $expectedParent) {
+            throw "拒绝清理非打包目录:$resolved"
         }
-        Write-Host "wheel 包完整(可离线满足全部 requirements)。" -ForegroundColor Green
-    } else {
-        Write-Warning "未找到 python,跳过 wheel 完整性校验(强烈建议在有 python 的机器上打包)。"
+        Remove-Item -LiteralPath $resolved -Recurse -Force
     }
+    New-Item -ItemType Directory -Path $roleWheelDir | Out-Null
+
+    Write-Host "==== 生成 $role 最小离线依赖 ====" -ForegroundColor Cyan
+    $downloadArgs = @(
+        "download", "--no-index", "--find-links", $wheels,
+        "--dest", $roleWheelDir, "--platform", "win_amd64",
+        "--python-version", "3.11", "--implementation", "cp", "--abi", "cp311",
+        "--only-binary=:all:", "-r", $roleReq
+    )
+    if ($role -eq "client") {
+        $downloadArgs += @("-r", (Join-Path $Here "requirements-desktop.txt"))
+    }
+    & $py -m pip @downloadArgs --quiet
+    if ($LASTEXITCODE -ne 0) {
+        throw "$role 离线依赖不完整。请先补齐 packaging\windows\wheels 后再打包。"
+    }
+
+    $tmp = Join-Path $env:TEMP ("cw_wheelcheck_" + [Guid]::NewGuid().ToString("N"))
+    $checkArgs = @(
+        "install", "--dry-run", "--no-index", "--find-links", $roleWheelDir,
+        "--target", $tmp, "--platform", "win_amd64", "--python-version", "3.11",
+        "--implementation", "cp", "--abi", "cp311", "--only-binary=:all:", "-r", $roleReq
+    )
+    if ($role -eq "client") {
+        $checkArgs += @("-r", (Join-Path $Here "requirements-desktop.txt"))
+    }
+    & $py -m pip @checkArgs --quiet
+    $ok = ($LASTEXITCODE -eq 0)
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not $ok) { throw "$role 角色 wheel 自检失败，拒绝生成安装包。" }
 }
 
 foreach ($role in @("admin", "client")) {
     Write-Host "==== 编译 $role 安装包 ====" -ForegroundColor Cyan
-    & $iscc "/DMyRole=$role" $Iss
+    & $iscc "/Qp" "/DMyRole=$role" "/DMyVersion=$AppVersion" $Iss
     if ($LASTEXITCODE -ne 0) { throw "$role 安装包编译失败(ISCC 退出码 $LASTEXITCODE)" }
 }
 
+$dist = Join-Path $Here "dist"
+$built = @(Get-ChildItem -LiteralPath $dist -Filter "Clawworker-*-Setup-$AppVersion.exe")
+if ($built.Count -ne 2) { throw "预期生成 2 个 $AppVersion 安装包，实际为 $($built.Count) 个。" }
+$hashLines = @()
+foreach ($file in ($built | Sort-Object Name)) {
+    $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    $hashLines += "$hash *$($file.Name)"
+}
+$hashFile = Join-Path $dist "SHA256SUMS-$AppVersion.txt"
+[IO.File]::WriteAllLines($hashFile, $hashLines, [Text.UTF8Encoding]::new($false))
+
 Write-Host ""
 Write-Host "==== 完成 ====" -ForegroundColor Green
-Write-Host "安装包在: $(Join-Path $Here 'dist')"
-Get-ChildItem (Join-Path $Here "dist") -Filter "*.exe" | ForEach-Object { Write-Host "  $($_.Name)" }
+Write-Host "安装包在: $dist"
+$built | Sort-Object Name | ForEach-Object { Write-Host "  $($_.Name)" }
+Write-Host "  $(Split-Path -Leaf $hashFile)"

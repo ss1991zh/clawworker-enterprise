@@ -30,13 +30,16 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from shared.paths import SUPERVISOR_DIR
+from shared.storage import atomic_write_text
+
 # ---------------------------------------------------------------------------
 # 路径 / 常量
 # ---------------------------------------------------------------------------
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent          # agent-system/
 SUPERVISOR_PY = PROJECT_DIR / "supervisor.py"
-STATE_DIR = Path.home() / ".agent-system" / "supervisor"
+STATE_DIR = SUPERVISOR_DIR
 STATE_FILE = STATE_DIR / "state.json"
 # 期望托管的角色集合(并集)。supervisor 是单例,但启动它的人可能只想要某一个角色
 # (桌面「管理端」图标只要 host、「用户端」图标只要 client)。没有这个并集文件时,
@@ -452,7 +455,7 @@ def _mac_plist_xml() -> str:
 def _mac_install() -> str:
     p = _launchd_plist_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(_mac_plist_xml(), encoding="utf-8")
+    atomic_write_text(p, _mac_plist_xml())
     _run(["launchctl", "unload", str(p)])            # 幂等:先卸再装
     r = _run(["launchctl", "load", "-w", str(p)])
     if r.returncode != 0:
@@ -493,7 +496,7 @@ WantedBy=default.target
 def _linux_install() -> str:
     p = _systemd_unit_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(_systemd_unit_text(), encoding="utf-8")
+    atomic_write_text(p, _systemd_unit_text())
     _run(["systemctl", "--user", "daemon-reload"])
     r = _run(["systemctl", "--user", "enable", "--now", f"{SYSTEMD_UNIT}.service"])
     if r.returncode != 0:

@@ -10,8 +10,9 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
-APP_DATA_DIR = Path.home() / ".agent-system"
-CIPHERTEXT_DIR = APP_DATA_DIR / "ciphertexts"
+from shared.paths import APP_DATA_DIR, CIPHERTEXT_DIR
+from shared.storage import atomic_write_bytes
+
 HISTORY_DIR = APP_DATA_DIR / "history"
 
 
@@ -31,7 +32,7 @@ class LocalStorage:
 
     def save_ciphertext(self, name: str, blob: bytes) -> Path:
         path = self._ciphertext_dir / name
-        path.write_bytes(blob)
+        atomic_write_bytes(path, blob)
         return path
 
     def load_ciphertext(self, name: str) -> bytes:

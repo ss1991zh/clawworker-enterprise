@@ -18,6 +18,7 @@ v4 客户端 Web UI 主入口 — skill-only 架构,无 LangGraph。
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import secrets
@@ -25,12 +26,14 @@ import tempfile
 import threading
 import time
 import traceback
+from collections import OrderedDict
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import parse_qs, quote
 
 import ssl
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -39,13 +42,21 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 from client.keystore import Keystore
+from client.host_client import (
+    HostClient,
+    HostConnectionError,
+    HostResponseError,
+    HostSession,
+)
 from client.local_storage import LocalStorage
 from client.tools.crypto import ZFHE
 from client.webui import pipeline as pipeline_mod
 from client.webui import text_extract
 from client.webui import writer as writer_mod
+from client.webui.background_tasks import BackgroundTaskManager, BackgroundTaskRejected
 from client.webui.notices import NoticeStore
 from client.webui.sessions import ChatSession, Message, SessionStore
+from client.webui.state import ThreadSafeState, atomic_write_json
 from client.webui.scheduler import (
     EncryptedResultStore,
     HistoryStore,
@@ -57,9 +68,16 @@ from client.webui.scheduler import (
 from client.webui.skills_store import (
     CustomSkillStore,
     build_custom_skills_prompt_block,
-    builtin_skills,
 )
+from client.webui.settings_routes import build_settings_router as build_security_router
 from shared.prompts import load_system_prompt
+from shared.paths import APP_DATA_DIR, DOWNLOADS_DIR
+from shared.storage import atomic_write_bytes, atomic_write_json
+from shared.version import __version__
+from shared.http_observability import (
+    attach_response_headers, request_id_from_header, reset_request_id, set_request_id,
+)
+from shared.errors import classify_exception
 
 # ----------------------------------------------------------------------------
 # 路径 / 配置
@@ -68,11 +86,27 @@ from shared.prompts import load_system_prompt
 _WEBUI_DIR = Path(__file__).resolve().parent
 templates = Jinja2Templates(directory=str(_WEBUI_DIR / "templates"))
 
-APP_DATA_DIR = Path.home() / ".agent-system"
 CLIENT_CONFIG_FILE = APP_DATA_DIR / "client-config.json"
 
 _lock = threading.Lock()
-_session_state: dict[str, Any] = {"host_url": "", "username": "", "token": "", "expires_at": ""}
+_session_state = ThreadSafeState(
+    {"host_url": "", "username": "", "token": "", "expires_at": ""}
+)
+
+
+def _current_host_session() -> HostSession:
+    state = (
+        _session_state.snapshot()
+        if isinstance(_session_state, ThreadSafeState)
+        else dict(_session_state)
+    )
+    return HostSession(
+        base_url=str(state.get("host_url") or ""),
+        token=str(state.get("token") or ""),
+    )
+
+
+_host_client = HostClient(_current_host_session)
 
 # 用户取消标记 —— pipeline 线程在检查点读取此 set
 _cancelled_msgs: set[str] = set()
@@ -101,14 +135,14 @@ def _load_config() -> dict[str, Any]:
     return defaults
 
 
-def _save_config(cfg: dict[str, Any]) -> None:
-    CLIENT_CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CLIENT_CONFIG_FILE.write_text(
-        json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+def _save_config(cfg) -> None:
+    atomic_write_json(
+        CLIENT_CONFIG_FILE,
+        cfg.snapshot() if isinstance(cfg, ThreadSafeState) else dict(cfg),
     )
 
 
-_config = _load_config()
+_config = ThreadSafeState(_load_config())
 _storage = LocalStorage()
 _keystore = Keystore()
 _sessions = SessionStore()
@@ -119,19 +153,59 @@ _run_history = HistoryStore()
 _enc_results = EncryptedResultStore()
 _missed_store = MissedRunStore()
 _notice_store = NoticeStore()
-
-# 启动时登记所有已存在任务的输出文件夹根 → Excel 白名单(每任务专属输出夹)
-for _t in _task_store.all_enabled():
-    if getattr(_t, "output_folder", ""):
-        writer_mod.register_output_root(_t.output_folder)
-
+_background_tasks = BackgroundTaskManager(max_workers=4, max_pending=24)
 
 # ----------------------------------------------------------------------------
 # FastAPI app
 # ----------------------------------------------------------------------------
 
-app = FastAPI(title="agent-system client", version="0.4.0")
+
+@asynccontextmanager
+async def _lifespan(_app: FastAPI):
+    # 路由模块导入时不启动后台线程；只有真正启动 Web 应用才恢复
+    # 调度任务与输出目录白名单，关闭时等待调度线程退出。
+    for task in _task_store.all_enabled():
+        if getattr(task, "output_folder", ""):
+            writer_mod.register_output_root(task.output_folder)
+    scheduler = globals().get("_scheduler")
+    _background_tasks.start()
+    if scheduler is not None:
+        scheduler.start()
+    try:
+        yield
+    finally:
+        if scheduler is not None:
+            scheduler.stop()
+        _background_tasks.close()
+        _host_client.close()
+
+
+app = FastAPI(title="Clawworker Enterprise Client", version=__version__, lifespan=_lifespan)
 app.mount("/static", StaticFiles(directory=str(_WEBUI_DIR / "static")), name="static")
+
+
+@app.middleware("http")
+async def _request_observability(request: Request, call_next):
+    request_id = request_id_from_header(request.headers.get("x-request-id", ""))
+    request.state.request_id = request_id
+    token = set_request_id(request_id)
+    try:
+        response = await call_next(request)
+        if response.status_code >= 500:
+            logging.getLogger("clawworker").error(
+                "request_id=%s code=internal_error status=%s path=%s",
+                request_id, response.status_code, request.url.path,
+            )
+        return attach_response_headers(response, request_id)
+    except Exception as exc:
+        classified = classify_exception(exc)
+        logging.getLogger("clawworker").exception(
+            "request_id=%s code=%s category=%s path=%s",
+            request_id, classified.code, classified.category.value, request.url.path,
+        )
+        raise
+    finally:
+        reset_request_id(token)
 
 # ---- CSRF / DNS-rebinding 防护 ----------------------------------------------
 # 客户端只监听 127.0.0.1,鉴权是进程内全局 session。恶意网页可对 127.0.0.1:8444
@@ -285,6 +359,7 @@ def _need_revalidate() -> JSONResponse:
 def _clear_local_session() -> None:
     with _lock:
         _session_state.update({"host_url": "", "username": "", "token": "", "expires_at": ""})
+    _host_client.reset()
 
 
 def _flash_redirect(url: str, *messages: tuple[str, str]) -> RedirectResponse:
@@ -305,12 +380,11 @@ def _pop_messages(request: Request) -> list[tuple[str, str]]:
 
 def _asset_version() -> str:
     try:
-        mtimes = [
-            (_WEBUI_DIR / "static" / "app.js").stat().st_mtime,
-            (_WEBUI_DIR / "static" / "app.css").stat().st_mtime,
-        ]
+        static_dir = _WEBUI_DIR / "static"
+        mtimes = [path.stat().st_mtime for pattern in ("*.js", "*.css")
+                  for path in static_dir.glob(pattern)]
         return str(int(max(mtimes)))
-    except OSError:
+    except (OSError, ValueError):
         return "0"
 
 
@@ -351,6 +425,7 @@ def host_trust_repin():
     host_url = _config.get("host_url", "") or "https://127.0.0.1:8443"
     try:
         host_trust.repin(host_url)
+        _host_client.reset(host_url)
         return _flash_redirect("/login", ("info", "已重新信任主机证书,请重新登录。"))
     except Exception as e:  # noqa: BLE001
         return _flash_redirect("/host-trust", ("error", f"重新信任失败:{e}"))
@@ -365,6 +440,27 @@ def host_trust_repin():
 def healthz():
     """供本机桌面启动器探测；不渲染模板，也不访问管理端。"""
     return {"status": "ok", "service": "client"}
+
+
+@app.get("/readyz")
+def readyz():
+    """用户端页面、本地存储与调度线程的就绪探针。"""
+    scheduler = globals().get("_scheduler")
+    scheduler_ready = bool(
+        scheduler is not None
+        and scheduler._thread is not None
+        and scheduler._thread.is_alive()
+    )
+    storage_ready = _storage.ciphertext_dir.exists()
+    ready = scheduler_ready and storage_ready
+    body = {
+        "status": "ready" if ready else "starting",
+        "service": "client",
+        "scheduler": "ok" if scheduler_ready else "starting",
+        "storage": "ok" if storage_ready else "unavailable",
+        "logged_in": _is_logged_in(),
+    }
+    return JSONResponse(body, status_code=200 if ready else 503)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -459,6 +555,7 @@ def login_submit(
         )
 
     body = r.json()
+    _host_client.reset()
     with _lock:
         _session_state.update({
             "host_url": host_url, "username": username,
@@ -507,6 +604,7 @@ def api_host_repin():
     host_url = _session_state.get("host_url", "") or _config.get("host_url", "")
     try:
         fp = host_trust.repin(host_url)
+        _host_client.reset(host_url)
         return {"ok": True, "fingerprint": fp}
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"重新信任失败(取证书):{type(e).__name__}: {e}")
@@ -527,214 +625,24 @@ def _host_api(method: str, path: str, *, json_body=None, timeout: float = 60.0):
     """把用户端数据库请求转发给已登录的管理端；不接触数据库凭据。"""
     if not _is_logged_in():
         return _need_login()
-    host_url = _session_state["host_url"]
     try:
-        response = httpx.request(
-            method, f"{host_url}{path}", json=json_body,
-            headers={"Authorization": f"Bearer {_session_state['token']}"},
-            timeout=timeout, verify=host_trust.verify_for(host_url), trust_env=False,
+        return _host_client.request_json(
+            method, path, json_body=json_body, timeout=timeout,
         )
-    except httpx.RequestError as exc:
-        raise HTTPException(502, f"无法连接管理端：{type(exc).__name__}") from exc
-    try:
-        body = response.json()
-    except Exception:
-        body = {"detail": "管理端返回了无法识别的响应"}
-    if response.status_code >= 400:
-        detail = body.get("detail", "数据库请求失败") if isinstance(body, dict) else "数据库请求失败"
-        raise HTTPException(response.status_code, detail)
-    return body
+    except HostConnectionError as exc:
+        raise HTTPException(502, str(exc)) from exc
+    except HostResponseError as exc:
+        raise HTTPException(exc.status_code, exc.detail) from exc
 
 
-@app.get("/api/data/sources")
-def api_data_sources():
-    return _host_api("GET", "/data/sources")
-
-
-@app.get("/api/data/sources/{source_id}/catalog")
-def api_data_catalog(source_id: str):
-    return _host_api("GET", f"/data/sources/{quote(source_id, safe='')}/catalog")
-
-
-@app.post("/api/data/query/preview")
-async def api_data_query_preview(request: Request):
-    if not _is_logged_in():
-        return _need_login()
-    payload = await request.json()
-    return _host_api("POST", "/data/query/preview", json_body=payload)
-
-
-@app.post("/api/data/query/plan")
-async def api_data_query_plan(request: Request):
-    if not _is_logged_in():
-        return _need_login()
-    payload = await request.json()
-    return _host_api("POST", "/data/query/plan", json_body=payload, timeout=120.0)
-
-
-@app.post("/api/data/query/execute")
-async def api_data_query_execute(request: Request):
-    if not _is_logged_in():
-        return _need_login()
-    payload = await request.json()
-    return _host_api("POST", "/data/query/tasks", json_body=payload)
-
-
-@app.get("/api/data/query/tasks/{task_id}")
-def api_data_query_task(task_id: str):
-    return _host_api("GET", f"/data/query/tasks/{quote(task_id, safe='')}")
-
-
-@app.delete("/api/data/query/tasks/{task_id}")
-def api_data_query_cancel(task_id: str):
-    return _host_api("DELETE", f"/data/query/tasks/{quote(task_id, safe='')}")
-
-
-@app.post("/api/data/query/tasks/{task_id}/result")
-def api_data_query_result(task_id: str):
-    result = _host_api(
-        "POST", f"/data/query/tasks/{quote(task_id, safe='')}/result", timeout=300.0,
-    )
-    if not isinstance(result, dict):
-        raise HTTPException(502, "管理端返回的查询结果格式无效")
-    return _encrypt_database_result(result, {"data_source_id": result.get("data_source_id", "db")})
-
-
-def _encrypt_database_result(result: dict, payload: dict) -> dict:
-    """将管理端返回的数据行在本机立即加密；调用方只能获得密文元数据。
-
-    明文行不会返回浏览器。受控临时 Excel 仅在本函数内存在，并且无论加密成功
-    还是失败都会删除。后续模型分析接收的是密文文件与 schema，而不是这里的 rows。
-    """
-    # 明文结果只存在于当前请求内存与受控临时文件。返回浏览器前立即走现有摄取/加密
-    # 流程，浏览器只得到密文文件路径和列概要，不得到数据行正文。
-    import pandas as pd
-    columns = result.get("columns") or []
-    rows = result.pop("rows", []) or []
-    frame = pd.DataFrame(rows, columns=columns)
-    source_id = re.sub(r"[^A-Za-z0-9_-]+", "_", str(payload.get("data_source_id", "db")))[:24]
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".xlsx") as tmp:
-        tmp_path = Path(tmp.name)
-    try:
-        frame.to_excel(tmp_path, index=False)
-        max_result_bytes = int(result.get("max_result_bytes", 0) or 0)
-        if max_result_bytes and tmp_path.stat().st_size > max_result_bytes:
-            raise ValueError(
-                f"本地 Excel 文件超过管理员设置的 {max_result_bytes // 1048576} MB 限制"
-            )
-        encrypted = _ingest_plaintext_path(
-            tmp_path, f"数据库提取_{source_id}_{stamp}.xlsx",
-            dst_stem=f"db_{source_id}_{stamp}",
-        )
-    except ValueError as exc:
-        raise HTTPException(400, f"查询成功但自动加密失败：{exc}") from exc
-    finally:
-        tmp_path.unlink(missing_ok=True)
-        frame = None
-        rows = None
-    response = {
-        "request_id": result.get("request_id", ""),
-        "row_count": result.get("row_count", encrypted.get("row_count", 0)),
-        "duration_ms": result.get("duration_ms", 0),
-        "columns": columns,
-        "encrypted": encrypted,
-    }
-    assert "rows" not in response
-    return response
-
-
-@app.get("/api/me")
-def api_me():
-    if not _is_logged_in():
-        return _need_login()
-    return {
-        "username": _session_state["username"],
-        "host_url": _session_state["host_url"],
-        "expires_at": _session_state["expires_at"],
-    }
-
-
-@app.get("/api/config")
-def api_config_get():
-    if not _is_logged_in():
-        return _need_login()
-    return _config
-
-
-@app.post("/api/config")
-async def api_config_set(request: Request):
-    if not _is_logged_in():
-        return _need_login()
-    data = await request.json()
+def _update_client_config(data: dict) -> dict:
     with _lock:
         if "host_url" in data:
-            try:
-                _config["host_url"] = _validate_host_url(str(data["host_url"]))
-            except ValueError as e:
-                raise HTTPException(400, str(e))
+            _config["host_url"] = _validate_host_url(str(data["host_url"]))
         if "backend" in data and data["backend"] in ("stub", "real"):
             _config["backend"] = data["backend"]
         _save_config(_config)
-    return _config
-
-
-# ----------------------------------------------------------------------------
-# 客户端自启 / 崩溃自愈(设置 · 自启)—— 仅管本机的 client(:8444),独立于 host 守护
-# ----------------------------------------------------------------------------
-
-@app.get("/api/ops/status")
-def api_ops_status():
-    if not _is_logged_in():
-        return _need_login()
-    from client.webui import client_ops
-    try:
-        return client_ops.status_snapshot()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"{type(e).__name__}: {e}")
-
-
-@app.post("/api/ops/autostart/enable")
-def api_ops_autostart_enable():
-    if not _is_logged_in():
-        return _need_login()
-    from client.webui import client_ops
-    try:
-        msg = client_ops.install_autostart()
-        client_ops.ensure_supervisor_running()
-        return {"ok": True, "msg": msg}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"启用失败:{e}")
-
-
-@app.post("/api/ops/autostart/disable")
-def api_ops_autostart_disable():
-    if not _is_logged_in():
-        return _need_login()
-    from client.webui import client_ops
-    try:
-        msg = client_ops.uninstall_autostart()
-        client_ops.stop_supervisor()   # 停守护但保留客户端进程(界面不掉线)
-        return {"ok": True, "msg": msg}
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"停用失败:{e}")
-
-
-@app.post("/api/ops/supervisor/start")
-def api_ops_supervisor_start():
-    if not _is_logged_in():
-        return _need_login()
-    from client.webui import client_ops
-    started = client_ops.ensure_supervisor_running()
-    return {"ok": True, "msg": "守护已启动" if started else "守护已在运行"}
-
-
-@app.post("/api/ops/supervisor/stop")
-def api_ops_supervisor_stop():
-    if not _is_logged_in():
-        return _need_login()
-    from client.webui import client_ops
-    return {"ok": True, "msg": client_ops.stop_supervisor()}
+    return _config.snapshot()
 
 
 def _bind_runtime_vault() -> None:
@@ -748,194 +656,19 @@ def _bind_runtime_vault() -> None:
         pass
 
 
-@app.get("/api/keys")
-def api_keys_get():
-    if not _is_logged_in():
-        return _need_login()
-    vault = _keystore.vault_path(_session_state["username"])
-
-    def _info(name: str):
-        p = vault / name
-        return p.exists(), (str(p) if p.exists() else "")
-
-    sk_present, sk_path = _info("sk.bin")
-    evk_present, evk_path = _info("evk.bin")
-    auth_present, auth_path = _info("user_authorization")
-    dict_present, dict_path = _info("dictf")
-    return {
-        "sk_present": sk_present, "sk_path": sk_path,
-        "evk_present": evk_present, "evk_path": evk_path,
-        "user_auth_present": auth_present, "user_auth_path": auth_path,
-        "dict_present": dict_present, "dict_path": dict_path,
-    }
-
-
-@app.post("/api/keys/sk")
-async def api_keys_upload_sk(file: UploadFile = File(...)):
-    if not _is_logged_in():
-        return _need_login()
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "文件为空")
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        t.write(data); tmp = Path(t.name)
-    try:
-        dst = _keystore.import_sk(username=_session_state["username"], source=tmp)
-        _bind_runtime_vault()
-        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-@app.post("/api/keys/evk")
-async def api_keys_upload_evk(file: UploadFile = File(...)):
-    if not _is_logged_in():
-        return _need_login()
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "文件为空")
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        t.write(data); tmp = Path(t.name)
-    try:
-        dst = _keystore.import_evk(username=_session_state["username"], source=tmp)
-        _bind_runtime_vault()
-        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-@app.post("/api/keys/dict")
-async def api_keys_upload_dict(file: UploadFile = File(...)):
-    if not _is_logged_in():
-        return _need_login()
-    data = await file.read()
-    if not data:
-        raise HTTPException(400, "文件为空")
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        t.write(data); tmp = Path(t.name)
-    try:
-        dst = _keystore.import_dict(username=_session_state["username"], source=tmp)
-        _bind_runtime_vault()
-        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-@app.post("/api/keys/fetch_auth")
-def api_keys_fetch_auth():
-    if not _is_logged_in():
-        return _need_login()
-    host_url = _session_state["host_url"]
-    token = _session_state["token"]
-    from client import host_trust
-    try:
-        r = httpx.get(
-            f"{host_url}/auth/user_authorization",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=30,
-            verify=host_trust.verify_for(host_url),   # 校验主机 TLS 证书(TOFU 锁定)
-            trust_env=False,   # 局域网连主机不走系统代理
-        )
-    except httpx.HTTPError as e:
-        raise HTTPException(502, f"无法连接主机:{type(e).__name__}: {e}")
-    if r.status_code == 401:
-        _clear_local_session()
-        raise HTTPException(502, "主机拒绝(session 已过期)· 请退出后重新登录")
-    if r.status_code != 200:
-        raise HTTPException(502, f"主机拒绝({r.status_code}):{r.text[:200]}")
-    with tempfile.NamedTemporaryFile(delete=False) as t:
-        t.write(r.content); tmp = Path(t.name)
-    try:
-        dst = _keystore.import_user_authorization(username=_session_state["username"], source=tmp)
-        _bind_runtime_vault()
-        return {"ok": True, "path": str(dst), "size_bytes": dst.stat().st_size}
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
-@app.get("/api/keycheck")
-def api_keycheck(quick: bool = True):
-    """导入密钥体检:在**当前用户密钥**上跑 he_ops 对拍套件,返回能力清单 + 精度 + 规模档位。
-    用途:用户导入 SK/EVK+字典后一键验证「这套 key 能算什么、精度多少、哪些算子/模型不可用、
-    能平稳跑多大规模」;若密钥/字典不配套或损坏,初始化即报错,当场暴露(而非分析时才失败)。
-    同步端点 → FastAPI 自动跑在线程池,不阻塞事件循环。quick=True 跑快子集(秒级),
-    quick=False 跑全量(含模型体检/深度/有效域,约数十秒)。"""
-    if not _is_logged_in():
-        return _need_login()
-    keys = _keystore.get_paths(_session_state["username"])
-    if not (keys and keys.sk_path.exists()):
-        raise HTTPException(400, "尚未导入密钥(SK)。请先导入密钥与字典,再做体检。")
-    try:
-        from client.tools.runtime import Runtime
-        Runtime.get().ensure_all_initialized()
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(400, f"密钥/字典初始化失败(可能不配套或损坏):{type(e).__name__}: {e}")
-    try:
-        from client.he_ops.selfcheck import health_report
-        return health_report(quick=quick)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"体检执行失败:{type(e).__name__}: {e}")
-
-
-@app.get("/api/audit")
-def api_audit(limit: int = 200):
-    """可信审计:合规摘要 + 审计事件(LLM 只见 schema 的零明文断言 + 解密授权台账)。
-    用于合规审计/客户尽调:证明"明文不出本机、LLM 只见字段名、解密均经授权"。"""
-    if not _is_logged_in():
-        return _need_login()
-    from client.he_ops import audit
-    user = _session_state["username"]
-    return {"summary": audit.summary(user), "events": audit.read_events(user, limit=limit)}
-
-
-@app.get("/api/audit/export")
-def api_audit_export():
-    """导出合规报告(Word/.docx,大白话排版,非技术人员可读)。"""
-    if not _is_logged_in():
-        return _need_login()
-    from fastapi.responses import Response
-    from client.he_ops import audit_report
-    user = _session_state["username"]
-    try:
-        data = audit_report.build_docx(user)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"生成报告失败:{type(e).__name__}: {e}")
-    fname = f"数据隐私合规报告_{datetime.now().strftime('%Y%m%d')}.docx"
-    return Response(
-        content=data,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{quote(fname)}"},
-    )
-
+app.include_router(build_security_router(
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+    keystore=_keystore,
+    session_state=_session_state,
+    host_client=_host_client,
+    bind_runtime_vault=_bind_runtime_vault,
+    clear_local_session=_clear_local_session,
+))
 
 # ----------------------------------------------------------------------------
 # /api/files
 # ----------------------------------------------------------------------------
-
-
-@app.get("/api/files")
-def api_files_list():
-    if not _is_logged_in():
-        return _need_login()
-    out = []
-    try:
-        all_paths = _storage.list_ciphertexts()
-    except Exception:
-        all_paths = []
-    for p in all_paths:
-        if p.name.endswith(".meta.csv") or p.name.endswith(".schema.json"):
-            continue
-        size = p.stat().st_size if p.exists() else 0
-        meta_p = p.with_suffix(p.suffix + ".meta.csv")
-        out.append({
-            "name": p.name,
-            "path": str(p),
-            "size_kb": round(size / 1024, 1),
-            "mtime": datetime.fromtimestamp(p.stat().st_mtime).isoformat(timespec="seconds"),
-            "has_meta": meta_p.exists(),
-        })
-    out.sort(key=lambda f: f["mtime"], reverse=True)
-    return out
 
 
 def _smart_read(path: Path, suffix: str):
@@ -1091,7 +824,7 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         finally:
             num_tmp.unlink(missing_ok=True)
     else:
-        dst.write_bytes(b"")
+        atomic_write_bytes(dst, b"")
 
     meta_path = ""
     if string_cols:
@@ -1110,7 +843,7 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
         "primary_key": string_cols[0] if string_cols else (numeric_cols[0] if numeric_cols else ""),
     }
     schema_dst = dst.with_suffix(dst.suffix + ".schema.json")
-    schema_dst.write_text(json.dumps(schema, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(schema_dst, schema)
 
     # 多 sheet 工作簿只加密了 sheet_name 这一张 —— 显式告知用户其余表未入库,避免静默丢数据
     multi_sheet_warning = ""
@@ -1138,387 +871,63 @@ def _ingest_plaintext_path(src_path: Path, original_name: str, *, dst_stem: Opti
     }
 
 
-@app.post("/api/files/upload")
-async def api_files_upload(raw_file: UploadFile = File(...)):
-    if not _is_logged_in():
-        return _need_login()
+# 企业数据库接口和本地明文收口从主入口拆出。注册位置不影响 URL；依赖通过工厂注入，
+# 路由模块不会反向导入 app.py，也不会形成循环依赖。
+from client.webui.routers.database import build_database_router
+from client.webui.routers.files import build_files_router
+from client.webui.routers.ops import build_ops_router
+from client.webui.routers.sessions import build_sessions_router
+from client.webui.routers.settings import build_settings_router
+from client.webui.routers.skills import build_skills_router
+from client.webui.services.database import (
+    DatabaseAnalysisService,
+)
 
-    raw_bytes = await raw_file.read()
-    if not raw_bytes:
-        raise HTTPException(400, "数据文件为空")
-    raw_suffix = Path(raw_file.filename or "data").suffix.lower() or ".csv"
-    if raw_suffix not in (".csv", ".xlsx", ".xls"):
-        raise HTTPException(400, f"暂不支持的格式:{raw_suffix} · 仅 CSV / XLSX")
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=raw_suffix) as tmp:
-        tmp.write(raw_bytes); tmp_path = Path(tmp.name)
-    try:
-        return _ingest_plaintext_path(tmp_path, raw_file.filename or "data")
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-def _win_foreground_dialog(inner: str) -> str:
-    """构造 PowerShell,保证对话框弹到浏览器网页最上层。
-    客户端由 pythonw(后台/无窗口)拉起,直接弹的 WinForms 对话框会被 Windows 前台锁
-    压到后面/最小化(表现为"点了没反应"或藏在浏览器后面)。两道保证:
-      1) 隐形置顶 owner + SetForegroundWindow 抢到前台,并以它为父弹对话框;
-      2) 定时器在对话框出现后(#32770 对话框类)把它自身提升为 HWND_TOPMOST 并抢焦点,
-         确保稳稳盖在浏览器上层。
-    inner 需定义 $d 并 $d.ShowDialog($o),OK 时 Write-Output 结果。"""
-    return (
-        'Add-Type -AssemblyName System.Windows.Forms\n'
-        'Add-Type @"\n'
-        'using System;using System.Runtime.InteropServices;using System.Text;\n'
-        'public class U{\n'
-        ' [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);\n'
-        ' [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h,IntPtr a,int x,int y,int cx,int cy,uint f);\n'
-        ' [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);\n'
-        ' [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);\n'
-        ' [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);\n'
-        ' [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);\n'
-        ' public delegate bool EnumProc(IntPtr h, IntPtr l);\n'
-        ' public static IntPtr Find(uint pid){ IntPtr r=IntPtr.Zero; EnumWindows(new EnumProc((h,l)=>{\n'
-        '   uint p; GetWindowThreadProcessId(h, out p);\n'
-        '   if(p==pid && IsWindowVisible(h)){ var sb=new StringBuilder(64); GetClassName(h,sb,64);\n'
-        '     if(sb.ToString()=="#32770"){ r=h; return false; } } return true; }), IntPtr.Zero); return r; }\n'
-        '}\n'
-        '"@\n'
-        '$mypid = [System.Diagnostics.Process]::GetCurrentProcess().Id\n'
-        '$o = New-Object System.Windows.Forms.Form\n'
-        '$o.TopMost=$true; $o.ShowInTaskbar=$false; $o.Opacity=0;'
-        ' $o.StartPosition="CenterScreen"; $o.Size=New-Object System.Drawing.Size(500,400);'
-        ' $o.Show(); $o.Activate()\n'
-        '[U]::SetForegroundWindow($o.Handle) | Out-Null\n'
-        # 只置顶一次:HWND_TOPMOST 是粘性的,设一次就永久保持在最上层;找到本进程的
-        # 对话框(#32770)后立即 $t.Stop(),避免反复 SetForegroundWindow 造成闪烁。
-        '$t = New-Object System.Windows.Forms.Timer; $t.Interval=120\n'
-        '$t.add_Tick({ $h=[U]::Find([uint32]$mypid);'
-        ' if ($h -ne [IntPtr]::Zero) { $t.Stop();'
-        ' [U]::SetWindowPos($h,[IntPtr](-1),0,0,0,0,3) | Out-Null;'
-        ' [U]::SetForegroundWindow($h) | Out-Null } })\n'
-        '$t.Start()\n'
-        + inner + '\n'
-        '$t.Stop(); $t.Dispose(); $o.Close()\n'
-    )
-
-
-# Windows 弹对话框的 PowerShell 参数。搭配 CREATE_NO_WINDOW 使用:
-# client 由 pythonw(无控制台)拉起,若不加 CREATE_NO_WINDOW,Windows 会给子 powershell
-# 新分配一个可见的黑色终端窗口;加了它则无黑窗。而对话框弹不到前台的问题,由
-# _win_foreground_dialog 里的隐形置顶 owner + SetForegroundWindow 解决 —— 两者缺一不可。
-_WIN_PS_DIALOG_ARGS = ["powershell", "-NoProfile", "-STA", "-Command"]
-
-
-def _native_pick_folder() -> tuple[Optional[str], bool, str]:
-    """
-    调系统原生「选择文件夹」对话框(跨平台)。
-    返回 (path 或 None, cancelled, error)。浏览器拿不到绝对路径,只能走系统对话框。
-    """
-    import subprocess
-    import sys
-
-    prompt = "选择数据文件夹(每次取最新文件分析)"
-    plat = sys.platform
-
-    try:
-        if plat == "darwin":
-            script = f'POSIX path of (choose folder with prompt "{prompt}")'
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=300)
-            if r.returncode != 0:
-                if "-128" in (r.stderr or "") or "User canceled" in (r.stderr or ""):
-                    return None, True, ""
-                return None, False, (r.stderr or "").strip()[:120]
-            return (r.stdout or "").strip().rstrip("/"), False, ""
-
-        if plat == "win32":
-            ps = _win_foreground_dialog(
-                "$d = New-Object System.Windows.Forms.FolderBrowserDialog;"
-                f"$d.Description = '{prompt}';"
-                "$r = $d.ShowDialog($o);"
-                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath };"
-            )
-            r = subprocess.run(
-                [*_WIN_PS_DIALOG_ARGS, ps],
-                capture_output=True, text=True, timeout=300,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),  # 无黑窗;前台由 owner 保证
-            )
-            path = (r.stdout or "").strip()
-            if not path:
-                return None, True, ""   # 取消 = 空输出
-            return path.rstrip("\\/"), False, ""
-
-        # Linux:zenity / kdialog
-        for cmd in (
-            ["zenity", "--file-selection", "--directory", f"--title={prompt}"],
-            ["kdialog", "--getexistingdirectory", os.path.expanduser("~")],
-        ):
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            except FileNotFoundError:
-                continue
-            if r.returncode != 0:
-                return None, True, ""   # 取消
-            path = (r.stdout or "").strip()
-            if path:
-                return path.rstrip("/"), False, ""
-            return None, True, ""
-        return None, False, "未找到 zenity/kdialog · 请手动粘贴路径"
-
-    except subprocess.TimeoutExpired:
-        return None, False, "选择超时"
-    except FileNotFoundError:
-        return None, False, "未找到系统文件选择器 · 请手动粘贴路径"
-
-
-def _native_pick_file() -> tuple[Optional[str], bool, str]:
-    """原生「选择文件」对话框(跨平台)—— 用于漏跑补救时指定该轮数据文件。"""
-    import subprocess
-    import sys
-
-    prompt = "选择该轮要处理的数据文件(CSV / Excel)"
-    plat = sys.platform
-    try:
-        if plat == "darwin":
-            script = f'POSIX path of (choose file with prompt "{prompt}")'
-            r = subprocess.run(["osascript", "-e", script],
-                               capture_output=True, text=True, timeout=300)
-            if r.returncode != 0:
-                if "-128" in (r.stderr or "") or "User canceled" in (r.stderr or ""):
-                    return None, True, ""
-                return None, False, (r.stderr or "").strip()[:120]
-            return (r.stdout or "").strip(), False, ""
-        if plat == "win32":
-            ps = _win_foreground_dialog(
-                "$d = New-Object System.Windows.Forms.OpenFileDialog;"
-                f"$d.Title = '{prompt}';"
-                "$d.Filter = 'data (*.csv;*.xlsx;*.xls)|*.csv;*.xlsx;*.xls|all|*.*';"
-                "$r = $d.ShowDialog($o);"
-                "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName };"
-            )
-            r = subprocess.run([*_WIN_PS_DIALOG_ARGS, ps],
-                               capture_output=True, text=True, timeout=300,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))  # 无黑窗;前台由 owner 保证
-            path = (r.stdout or "").strip()
-            return (path, False, "") if path else (None, True, "")
-        for cmd in (["zenity", "--file-selection", f"--title={prompt}"],
-                    ["kdialog", "--getopenfilename", os.path.expanduser("~")]):
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-            except FileNotFoundError:
-                continue
-            if r.returncode != 0:
-                return None, True, ""
-            path = (r.stdout or "").strip()
-            return (path, False, "") if path else (None, True, "")
-        return None, False, "未找到 zenity/kdialog · 请手动粘贴路径"
-    except subprocess.TimeoutExpired:
-        return None, False, "选择超时"
-    except FileNotFoundError:
-        return None, False, "未找到系统文件选择器 · 请手动粘贴路径"
-
-
-@app.post("/api/pick_folder")
-def api_pick_folder():
-    """原生「选择文件夹」对话框(macOS / Windows / Linux),返回绝对路径。"""
-    if not _is_logged_in():
-        return _need_login()
-    path, cancelled, err = _native_pick_folder()
-    if cancelled:
-        return {"cancelled": True}
-    if err:
-        raise HTTPException(500, err)
-    return {"path": path, "cancelled": False}
-
-
-@app.post("/api/pick_file")
-def api_pick_file():
-    """原生「选择文件」对话框,返回绝对路径(漏跑补救指定该轮数据文件)。"""
-    if not _is_logged_in():
-        return _need_login()
-    path, cancelled, err = _native_pick_file()
-    if cancelled:
-        return {"cancelled": True}
-    if err:
-        raise HTTPException(500, err)
-    return {"path": path, "cancelled": False}
-
-
-@app.post("/api/files/text_extract")
-async def api_files_text_extract(raw_file: UploadFile = File(...)):
-    """明文文本附件:在内存里抽文本,不落沙盒,直接随消息发给 LLM。"""
-    if not _is_logged_in():
-        return _need_login()
-    name = raw_file.filename or "attachment"
-    if not text_extract.is_text_attachment(name):
-        raise HTTPException(
-            400,
-            f"不支持该文本格式 · 支持:{', '.join(sorted(text_extract.SUPPORTED_EXTS))}",
-        )
-    data = await raw_file.read()
-    if not data:
-        raise HTTPException(400, "文件为空")
-    # 最大 10 MB(防止巨型 PDF/docx 把内存撑爆)
-    if len(data) > 10 * 1024 * 1024:
-        raise HTTPException(413, "文本文件超过 10 MB,请拆分后再传")
-
-    # 落到临时文件让 extractor 按路径工作
-    suffix = Path(name).suffix.lower()
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(data); tmp_path = Path(tmp.name)
-    try:
-        try:
-            text = text_extract.extract(tmp_path)
-        except Exception as e:
-            raise HTTPException(400, f"提取失败:{type(e).__name__}: {e}")
-        if not text.strip():
-            raise HTTPException(400, "文件解析后为空文本")
-        return {
-            "name": name,
-            "kind": "text",
-            "chars": len(text),
-            "preview": text[:300],
-            "content": text,
-            "size_kb": round(len(data) / 1024, 1),
-        }
-    finally:
-        tmp_path.unlink(missing_ok=True)
-
-
-@app.delete("/api/files/{name}")
-def api_files_delete(name: str):
-    if not _is_logged_in():
-        return _need_login()
-    target = _storage.ciphertext_dir / name
-    if not target.exists() or not target.is_relative_to(_storage.ciphertext_dir):
-        raise HTTPException(404, "文件不存在或路径非法")
-    target.unlink()
-    target.with_suffix(target.suffix + ".meta.csv").unlink(missing_ok=True)
-    target.with_suffix(target.suffix + ".schema.json").unlink(missing_ok=True)
-    return {"ok": True}
-
-
-@app.get("/api/files/{name}/preview")
-def api_files_preview(name: str):
-    if not _is_logged_in():
-        return _need_login()
-    target = _storage.ciphertext_dir / name
-    if not target.exists() or not target.is_relative_to(_storage.ciphertext_dir):
-        raise HTTPException(404, "文件不存在或路径非法")
-    info: dict[str, Any] = {
-        "name": target.name, "path": str(target),
-        "size_kb": round(target.stat().st_size / 1024, 1),
-    }
-    meta_p = target.with_suffix(target.suffix + ".meta.csv")
-    if meta_p.exists():
-        try:
-            import pandas as pd
-            meta_df = pd.read_csv(meta_p)
-            info["meta_columns"] = list(meta_df.columns)
-            info["meta_row_count"] = len(meta_df)
-            info["meta_preview"] = meta_df.head(8).fillna("").astype(str).values.tolist()
-        except Exception as e:
-            info["meta_error"] = str(e)
-    else:
-        info.update({"meta_columns": [], "meta_preview": [], "meta_row_count": 0})
-    schema_p = target.with_suffix(target.suffix + ".schema.json")
-    if schema_p.exists():
-        try:
-            info["schema"] = json.loads(schema_p.read_text(encoding="utf-8"))
-        except Exception as e:
-            info["schema_error"] = str(e)
-    else:
-        info["schema"] = None
-    return info
-
-
-# ----------------------------------------------------------------------------
-# /api/skills —— 内置(只读) + 自定义(可增删)
-# ----------------------------------------------------------------------------
-
-
-@app.get("/api/skills")
-def api_skills_list():
-    if not _is_logged_in():
-        return _need_login()
-    from client import skills_loader
-    return {
-        "skill_md": skills_loader.list_meta(),   # SKILL.md 教学技能(代码生成主路径)
-        "builtin": builtin_skills(),             # 固化 skill(兜底)
-        "custom": _custom_skills.list_all(),     # 用户自定义指标
-    }
-
-
-@app.get("/api/skills/md/{slug}")
-def api_skill_md_body(slug: str):
-    """读某个 SKILL.md 的正文(给 UI「查看」用)。"""
-    if not _is_logged_in():
-        return _need_login()
-    from client import skills_loader
-    body = skills_loader.get_body(slug)
-    if body is None:
-        raise HTTPException(404, "skill 不存在")
-    return {"slug": slug, "body": body}
-
-
-@app.post("/api/skills/upload")
-async def api_skills_upload(
-    files: list[UploadFile] = File(...),
-    paths: list[str] = Form(default=[]),
-):
-    """
-    拖拽添加技能包(支持多文件嵌套):
-      - 单个 .md      → 当 SKILL.md
-      - 单个 .zip     → 解压整包
-      - 多文件 + paths → 保留目录结构(SKILL.md + INDEX.md + docs/ + examples/)
-    """
-    if not _is_logged_in():
-        return _need_login()
-    from client import skills_loader
-
-    if not files:
-        raise HTTPException(400, "没有文件")
-
-    try:
-        # 单 zip
-        if len(files) == 1 and (files[0].filename or "").lower().endswith(".zip"):
-            data = await files[0].read()
-            doc = skills_loader.add_user_skill_zip(data)
-        # 单 md
-        elif len(files) == 1 and (files[0].filename or "").lower().endswith(".md") and not paths:
-            data = await files[0].read()
-            doc = skills_loader.add_user_skill_md(
-                data.decode("utf-8", errors="replace"),
-                fallback_name=Path(files[0].filename or "skill").stem,
-            )
-        # 多文件嵌套包
-        else:
-            collected: list[tuple] = []
-            for i, f in enumerate(files):
-                data = await f.read()
-                rel = paths[i] if i < len(paths) and paths[i] else (f.filename or f"file_{i}")
-                collected.append((rel, data))
-            doc = skills_loader.add_user_skill_files(collected)
-    except ValueError as e:
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        raise HTTPException(400, f"技能包解析失败:{type(e).__name__}: {e}")
-
-    return doc.to_meta()
-
-
-@app.delete("/api/skills/md/{slug}")
-def api_skills_md_delete(slug: str):
-    """删除用户拖拽添加的 SKILL.md 技能(内置不可删)。"""
-    if not _is_logged_in():
-        return _need_login()
-    from client import skills_loader
-    if not skills_loader.delete_user_skill(slug):
-        raise HTTPException(404, "用户技能不存在(内置技能不可删)")
-    return {"ok": True}
+_database_service = DatabaseAnalysisService(
+    _host_api,
+    _ingest_plaintext_path,
+    named_temporary_file=tempfile.NamedTemporaryFile,
+)
+app.include_router(build_database_router(
+    host_api=_host_api,
+    service=_database_service,
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
+app.include_router(build_files_router(
+    storage=_storage,
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
+app.include_router(build_ops_router(
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
+app.include_router(build_skills_router(
+    custom_skills=_custom_skills,
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
+app.include_router(build_sessions_router(
+    sessions=_sessions,
+    task_store=_task_store,
+    missed_store=_missed_store,
+    session_for_user=lambda sid: _sess_for_user(sid),
+    current_username=lambda: str(_session_state.get("username") or ""),
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
+app.include_router(build_settings_router(
+    session_snapshot=lambda: (
+        _session_state.snapshot()
+        if isinstance(_session_state, ThreadSafeState)
+        else dict(_session_state)
+    ),
+    config_snapshot=_config.snapshot,
+    update_config=_update_client_config,
+    is_logged_in=_is_logged_in,
+    need_login=_need_login,
+))
 
 
 # ----------------------------------------------------------------------------
@@ -1533,96 +942,32 @@ def _sess_for_user(sid: str) -> ChatSession:
     return sess
 
 
-@app.get("/api/sessions")
-def api_sessions_list():
-    if not _is_logged_in():
-        return _need_login()
-    out = []
-    for s in _sessions.list_for(_session_state["username"]):
-        if getattr(s, "hidden", False):
-            continue   # 软隐藏的定时任务会话不在侧栏列出(数据仍在,「查看会话」可恢复)
-        tid = getattr(s, "task_id", "")
-        # 定时会话:带上其任务是否"有数据绑定"(决定是否显示「待解密文件」入口)+ 漏跑条数(侧栏红警示)
-        task_needs_data = False
-        missed_count = 0
-        if tid:
-            t = _task_store.get(tid)
-            if t:
-                task_needs_data = bool(t.needs_approval)
-            missed_count = sum(
-                1 for mr in _missed_store.list_pending(_session_state["username"])
-                if mr.task_id == tid
-            )
-        running = any(
-            m.role == "assistant" and m.status in ("pending", "running", "awaiting_decrypt")
-            for m in s.messages
+def _validated_text_attachments(data: dict) -> list[dict[str, str]]:
+    """校验文本附件及用户对“文档正文将发送给所配置模型”的明确同意。"""
+    raw_text_atts = data.get("text_attachments") or []
+    if not isinstance(raw_text_atts, list):
+        raise HTTPException(400, "文本附件格式无效")
+    has_content = any(
+        isinstance(item, dict) and str(item.get("content") or "").strip()
+        for item in raw_text_atts
+    )
+    if has_content and data.get("text_attachment_llm_consent") is not True:
+        raise HTTPException(
+            400,
+            "发送 Word/PDF/TXT 正文前需要明确同意；Excel、CSV 和企业数据库数值仍保持加密。",
         )
-        out.append({
-            "id": s.id, "title": s.title,
-            "kind": getattr(s, "kind", "normal"),
-            "task_id": tid, "task_needs_data": task_needs_data,
-            "missed_count": missed_count,
-            "running": running,
-            "created_at": s.created_at, "updated_at": s.updated_at,
-            "message_count": len(s.messages),
+    attachments: list[dict[str, str]] = []
+    for item in raw_text_atts:
+        if not isinstance(item, dict):
+            continue
+        content = str(item.get("content") or "").strip()
+        if not content:
+            continue
+        attachments.append({
+            "name": str(item.get("name") or "attachment")[:255],
+            "content": content[:30_000],
         })
-    return out
-
-
-@app.post("/api/sessions")
-async def api_sessions_create():
-    if not _is_logged_in():
-        return _need_login()
-    sess = _sessions.create(username=_session_state["username"])
-    return {"id": sess.id, "title": sess.title}
-
-
-@app.delete("/api/sessions/{sid}")
-def api_sessions_delete(sid: str):
-    if not _is_logged_in():
-        return _need_login()
-    sess = _sess_for_user(sid)
-    # 定时任务会话:软隐藏(任务还在跑,历次运行继续累积)——「查看会话」可恢复全部内容。
-    # 普通会话:照常彻底删除。
-    if getattr(sess, "kind", "normal") == "scheduled" and getattr(sess, "task_id", ""):
-        _sessions.set_hidden(sid, True)
-        return {"ok": True, "hidden": True}
-    _sessions.delete(sid)
-    return {"ok": True, "hidden": False}
-
-
-@app.post("/api/sessions/{sid}/title")
-async def api_sessions_rename(sid: str, request: Request):
-    if not _is_logged_in():
-        return _need_login()
-    _sess_for_user(sid)
-    data = await request.json()
-    _sessions.rename(sid, data.get("title", ""))
-    return {"ok": True}
-
-
-@app.get("/api/sessions/{sid}/messages")
-def api_messages_list(sid: str):
-    if not _is_logged_in():
-        return _need_login()
-    sess = _sess_for_user(sid)
-    return {
-        "session": {"id": sess.id, "title": sess.title,
-                    "kind": getattr(sess, "kind", "normal"),
-                    "updated_at": sess.updated_at},
-        "messages": [m.to_dict() for m in sess.messages],
-    }
-
-
-@app.get("/api/sessions/{sid}/messages/{mid}")
-def api_messages_get(sid: str, mid: str):
-    if not _is_logged_in():
-        return _need_login()
-    sess = _sess_for_user(sid)
-    for m in sess.messages:
-        if m.id == mid:
-            return m.to_dict()
-    raise HTTPException(404, "消息不存在")
+    return attachments
 
 
 @app.post("/api/sessions/{sid}/messages")
@@ -1635,16 +980,13 @@ async def api_messages_send(sid: str, request: Request):
     if not content:
         raise HTTPException(400, "消息为空")
     attached_cipher = (data.get("attached_cipher") or "").strip()
+    database_source_id = (data.get("database_source_id") or "").strip()[:160]
+    database_source_name = (data.get("database_source_name") or "").strip()[:200]
+    if database_source_id and attached_cipher:
+        raise HTTPException(400, "企业数据库与 Excel/CSV 数据附件不能在同一条消息中同时使用")
     web_search = bool(data.get("web_search"))  # 用户在输入框开了「联网搜索」
-    # 明文文本附件(每条 {name, content})— 客户端已通过 /api/files/text_extract 抽好文本
-    raw_text_atts = data.get("text_attachments") or []
-    text_attachments: list[dict[str, str]] = []
-    for t in raw_text_atts:
-        if isinstance(t, dict) and t.get("content"):
-            text_attachments.append({
-                "name": str(t.get("name") or "attachment"),
-                "content": str(t.get("content"))[:30_000],
-            })
+    # 文本正文会进入所配置的 LLM 上下文，服务端强制要求显式同意，不能只依赖前端提示。
+    text_attachments = _validated_text_attachments(data)
 
     # 0) 抓"最近历史"作为上下文 —— 最多 6 条(3 轮 user/assistant 对)
     history_for_llm: list[dict[str, str]] = []
@@ -1658,6 +1000,8 @@ async def api_messages_send(sid: str, request: Request):
     user_msg = Message(
         id=secrets.token_hex(6), role="user",
         content=content, attached_cipher=attached_cipher,
+        database_source_id=database_source_id,
+        database_source_name=database_source_name,
         text_attachment_names=[t["name"] for t in text_attachments],
     )
     _sessions.append_message(sid, user_msg)
@@ -1665,12 +1009,16 @@ async def api_messages_send(sid: str, request: Request):
     _sessions.append_message(sid, asst)
 
     # 2) 后台跑 pipeline
-    threading.Thread(
-        target=_run_pipeline,
-        args=(sid, asst.id, content, attached_cipher, history_for_llm, text_attachments),
-        kwargs={"web_search": web_search},
-        daemon=True, name=f"ask-{sid}-{asst.id}",
-    ).start()
+    try:
+        _background_tasks.submit(
+            f"ask-{sid}-{asst.id}", _run_pipeline,
+            sid, asst.id, content, attached_cipher, history_for_llm, text_attachments,
+            web_search=web_search,
+            database_source_id=database_source_id,
+            user_mid=user_msg.id,
+        )
+    except BackgroundTaskRejected as exc:
+        _sessions.update_message(sid, asst.id, status="failed", error=str(exc))
     return {"user_message": user_msg.to_dict(), "assistant_message": asst.to_dict()}
 
 
@@ -1752,12 +1100,16 @@ async def api_clarify(sid: str, mid: str, request: Request):
             elif m.role == "assistant" and m.status == "done" and m.summary:
                 history.append({"role": "assistant", "content": m.summary})
         _sessions.update_message(sid, mid, status="pending", summary="", error="")
-        threading.Thread(
-            target=_run_pipeline,
-            args=(sid, mid, query, cipher, history, []),
-            kwargs={"skip_intent": True},
-            daemon=True, name=f"clarify-{sid}-{mid}",
-        ).start()
+        try:
+            _background_tasks.submit(
+                f"clarify-{sid}-{mid}", _run_pipeline,
+                sid, mid, query, cipher, history, [],
+                skip_intent=True,
+                database_source_id=getattr(umsg, "database_source_id", ""),
+                user_mid=umsg.id,
+            )
+        except BackgroundTaskRejected as exc:
+            _sessions.update_message(sid, mid, status="failed", error=str(exc))
         return {"ok": True, "action": "analyze", "rerun": True}
 
     return {"ok": True, "action": "free"}
@@ -1819,6 +1171,8 @@ def _run_pipeline(
     sched_task: Optional[Any] = None,   # 定时密态任务对象(用于回填 EncryptedResult)
     web_search: bool = False,           # 用户开了「联网搜索」
     skip_intent: bool = False,          # 跳过意图识别(歧义澄清后用户已明确选择,直接按选择跑)
+    database_source_id: str = "",       # 本条会话选择的企业数据库数据源
+    user_mid: str = "",                 # 生成数据库密文后回填到对应 user message
 ) -> None:
     t0 = time.time()
     _sessions.update_message(sid, asst_mid, status="running")
@@ -1851,7 +1205,9 @@ def _run_pipeline(
             and not skip_intent):
         # 歧义只看**本条消息**是否带了附件(沿用的旧密文不算)——否则做过分析的会话里
         # 再说排程会被误判成"定时 vs 只算这个附件",把创建向导卡挡掉。
-        this_msg_attached = bool(attached_cipher and Path(attached_cipher).exists())
+        this_msg_attached = bool(
+            (attached_cipher and Path(attached_cipher).exists()) or database_source_id
+        )
         amb = pipeline_mod.detect_intent_ambiguity(user_query, has_attachment=this_msg_attached)
         if amb:
             _sessions.update_message(
@@ -1917,6 +1273,27 @@ def _run_pipeline(
 
     run_id = secrets.token_hex(6)
     try:
+        if database_source_id:
+            db_cipher = _database_service.prepare_cipher(
+                data_source_id=database_source_id,
+                intent=user_query,
+                on_step=on_step,
+                should_cancel=_should_cancel,
+            )
+            if db_cipher.get("cancelled"):
+                _sessions.update_message(
+                    sid, asst_mid, status="cancelled", summary="已停止 · 数据库查询已取消",
+                    duration_sec=round(time.time() - t0, 2),
+                )
+                return
+            cipher_path = Path(db_cipher["path"])
+            used_cipher = str(cipher_path)
+            if user_mid:
+                _sessions.update_message(sid, user_mid, attached_cipher=used_cipher)
+            on_step(
+                "encrypt",
+                f"数据库数据已在本机加密（{db_cipher.get('row_count', 0)} 行），开始密态分析",
+            )
         result = pipeline_mod.ask(
             user_query=user_query,
             cipher_path=cipher_path,
@@ -2081,16 +1458,19 @@ def _launch_run(*, username: str, task_name: str, question: str,
     asst = Message(id=secrets.token_hex(6), role="assistant", status="pending",
                    remediation_note=note or "")
     _sessions.append_message(session_id, asst)
-    threading.Thread(
-        target=_run_pipeline,
-        args=(session_id, asst.id, question, cipher_path or "", history_for_llm, []),
-        kwargs={"output_mode": output_mode, "sched_task": sched_task, "web_search": web_search},
-        daemon=True, name=f"sched-{session_id}-{asst.id}",
-    ).start()
+    try:
+        _background_tasks.submit(
+            f"sched-{session_id}-{asst.id}", _run_pipeline,
+            session_id, asst.id, question, cipher_path or "", history_for_llm, [],
+            output_mode=output_mode, sched_task=sched_task, web_search=web_search,
+        )
+    except BackgroundTaskRejected as exc:
+        _sessions.update_message(session_id, asst.id, status="failed", error=str(exc))
 
 
 # 源文件夹加密入库缓存:同一文件(路径+mtime)只加密一次,供同文件夹的多个任务复用
-_folder_ingest_cache: dict[tuple, str] = {}
+_FOLDER_INGEST_CACHE_MAX = 128
+_folder_ingest_cache: OrderedDict[tuple, str] = OrderedDict()
 _folder_ingest_lock = threading.Lock()
 
 
@@ -2123,6 +1503,8 @@ def _resolve_task_cipher(task) -> tuple[Optional[str], str]:
         key = (str(latest.resolve()), latest.stat().st_mtime)
         with _folder_ingest_lock:
             cached = _folder_ingest_cache.get(key)
+            if cached:
+                _folder_ingest_cache.move_to_end(key)
         if cached and Path(cached).exists():
             return cached, f"复用已加密的最新文件:{latest.name}"
         try:
@@ -2131,6 +1513,9 @@ def _resolve_task_cipher(task) -> tuple[Optional[str], str]:
             return None, f"最新文件加密入库失败:{e}"
         with _folder_ingest_lock:
             _folder_ingest_cache[key] = info["path"]
+            _folder_ingest_cache.move_to_end(key)
+            while len(_folder_ingest_cache) > _FOLDER_INGEST_CACHE_MAX:
+                _folder_ingest_cache.popitem(last=False)
         return info["path"], f"已加密最新文件:{latest.name}"
     if task.cipher_path:
         return task.cipher_path, ""
@@ -2317,11 +1702,6 @@ def _on_scheduler_fire(task) -> None:
 
 _scheduler = Scheduler(_task_store, _on_scheduler_fire, poll_seconds=30,
                        on_miss=_on_scheduler_miss, miss_grace_seconds=600)
-
-
-@app.on_event("startup")
-def _arm_scheduler():
-    _scheduler.start()
 
 
 @app.get("/api/scheduled_tasks")
@@ -2773,7 +2153,7 @@ def api_excel_download(path: str):
         raise HTTPException(403, "只允许下载电子表格文件(.xlsx/.xls/.csv)")
     # 根目录收窄:仅 Downloads + 产出暂存目录 outputs —— 不再放行整个 ~/.agent-system
     # (那里有密钥沙盒 keystore/、账户 host-auth/、审计 audit/ 等敏感数据)。
-    allowed_roots = [Path.home() / "Downloads", APP_DATA_DIR / "outputs"]
+    allowed_roots = [DOWNLOADS_DIR, APP_DATA_DIR / "outputs"]
     rp = p.resolve()
     if not any(rp.is_relative_to(r.resolve()) for r in allowed_roots if r.exists()):
         raise HTTPException(403, "拒绝下载白名单外的文件")

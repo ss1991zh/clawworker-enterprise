@@ -89,6 +89,7 @@ def build_docx(user: str) -> bytes:
     evs = audit.read_events(user, limit=100000)
     s = audit.summary(user)
     exposures = [e for e in evs if e.get("type") == "llm_exposure"]
+    document_exposures = [e for e in evs if e.get("type") == "document_exposure"]
     decrypts = [e for e in evs if e.get("type") == "decrypt_auth"]
 
     doc = Document()
@@ -109,10 +110,9 @@ def build_docx(user: str) -> bytes:
     # ---- 一、这份报告说明什么 ----
     doc.add_heading("一、这份报告说明什么", level=1)
     doc.add_paragraph(
-        "本系统用「同态加密」技术帮您分析数据。它最关键的保证是:您的原始数据"
-        "(具体的数字、金额、名单)从头到尾都留在您自己的电脑上,从不上传;"
-        "连帮忙写分析逻辑的 AI,也只能看到字段的「名称」(比如「销售额」「客户名」),"
-        "看不到任何一个具体数值。")
+        "本系统用「同态加密」技术分析 Excel、CSV 和企业数据库中的结构化数值。"
+        "具体数字和金额先在本机加密，AI 只看到字段结构。Word、PDF、TXT 等文档"
+        "属于另一条明确边界：只有用户确认后，正文才会发送给所配置的 AI 阅读。")
     doc.add_paragraph(
         "这份报告把「确实做到了这件事」的证据列出来——每次分析时 AI 收到了哪些字段名、"
         "每次把结果解密给您看时是否经过您授权——供合规检查与留档。")
@@ -120,8 +120,8 @@ def build_docx(user: str) -> bytes:
     # ---- 二、核心结论 ----
     doc.add_heading("二、核心结论", level=1)
     ok = s.get("zero_plaintext_holds", True)
-    _callout(doc, ("✓ 全程满足:分析过程中,AI 只接收了字段名称,您的明文数据值从未离开本机;"
-                   "所有解密都经过您本人在本机授权,全程可追溯。") if ok else
+    _callout(doc, ("✓ 结构化数值数据未以明文发送给 AI；文档正文发送均要求明确确认；"
+                   "所有结果解密都经过您本人在本机授权，全程可追溯。") if ok else
                   ("⚠ 检出疑似数据外发,需复核(详见第四节)。"),
              color=_GREEN if ok else _RED)
 
@@ -133,6 +133,7 @@ def build_docx(user: str) -> bytes:
                  else f"⚠ 第 {chain['broken_at']} 条起异常:{chain['reason']}")
     _kv_table(doc, [
         ("分析次数(AI 参与写逻辑)", s.get("llm_exposures", 0)),
+        ("经确认发送文档正文", f"{s.get('document_exposures', 0)} 次"),
         ("AI 看到具体数据值的次数", "0(AI 只看到字段名)" if ok else f"疑似 {s.get('plaintext_breaches',0)} 次"),
         ("解密授权次数", f"{s.get('decrypt_authorizations',0)}　"
                        f"(您批准 {s.get('decrypt_granted',0)} 次 / 拒绝或保留密文 {s.get('decrypt_denied',0)} 次)"),

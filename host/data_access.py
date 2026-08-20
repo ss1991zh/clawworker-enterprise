@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 from host import secret_store
+from shared.paths import HOST_DATA_DIR
 
 
 OPERATIONS = ("browse", "query", "analyze", "export")
@@ -79,7 +80,7 @@ class AccessGroup:
 class DataAccessStore:
     def __init__(self, db_path: Optional[Path] = None, *, harden=secret_store.harden_file) -> None:
         self.db_path = Path(db_path or os.environ.get("CLAWWORKER_CONTROL_DB", "")
-                            or Path.home() / ".agent-system" / "host-data" / "control.db")
+                            or HOST_DATA_DIR / "control.db")
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._harden = harden
         self._lock = threading.RLock()

@@ -15,6 +15,8 @@
   #define RoleArg "client"
 #endif
 
+; 1.7.0:完成 P0/P1/P2 稳定性优化；明确文档正文披露边界；启动器等待 readyz；安装后真实启动自检。
+; 1.6.2:企业数据库需求逐项判断；支持直接/间接参数推导、部分成功、缺参指标说明后跳过；修复同比查询与数据库重连。
 ; 1.6.1:数据库查询任务化；支持主动取消、超时、并发/频率限制、结果大小保护与独立审计状态。
 ; 1.6.0:数据库授权后免逐次审批；未授权结构隐藏且后端拒绝；管理端新增使用记录；用户端结果先本地加密再分析。
 ; 1.5.0:管理端新增远程企业数据库、结构目录、表/字段权限、安全只读查询与审计；用户端新增授权数据提取入口。
@@ -32,7 +34,11 @@
 ;      导致目标机装完生成不了 TLS 证书、服务起不来、点图标无反应。已补齐并全量离线自检。
 ; 1.1:SPKI 公钥指纹信任(换网重签不再误报中间人)、登录页扫描内网、
 ;      supervisor 角色接管、证书信任步骤改可见、20+ 项口径/安全修复
-#define AppVersion "1.6.1"
+#ifdef MyVersion
+  #define AppVersion MyVersion
+#else
+  #define AppVersion "1.7.0"
+#endif
 #define Pub "Clawworker"
 
 [Setup]
@@ -78,8 +84,9 @@ Source: "..\..\client_supervisor.py"; DestDir: "{app}"
 ; ---- 打包工具(启动器 / 图标 / 依赖 / 安装脚本)----
 Source: "clawworker_launch.py";      DestDir: "{app}\packaging\windows"
 Source: "clawworker.ico";            DestDir: "{app}\packaging\windows"
-Source: "requirements.txt";          DestDir: "{app}\packaging\windows"
+Source: "requirements*.txt";         DestDir: "{app}\packaging\windows"
 Source: "install.ps1";               DestDir: "{app}\packaging\windows"
+Source: "post_install_smoke.py";     DestDir: "{app}\packaging\windows"
 #if MyRole == "admin"
 Source: "db_drivers\vc_redist.x64.exe"; DestDir: "{app}\packaging\windows\db_drivers"
 Source: "db_drivers\msodbcsql18-x64.msi"; DestDir: "{app}\packaging\windows\db_drivers"
@@ -89,15 +96,17 @@ Source: "clawworker_desktop.py";     DestDir: "{app}\packaging\windows"
 Source: "requirements-desktop.txt";  DestDir: "{app}\packaging\windows"
 Source: "webview2\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; DestDir: "{app}\packaging\windows\webview2"
 #endif
-; ---- HE 库(含 win64 DLL,装包前放进 he_libs\)----
+; ---- HE 库只属于用户端；管理端不执行本地密态计算 ----
 ; 密钥/证书/字典类文件绝不打进安装包(skf / user_authorization / dictf / evk / sk.bin)
-Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Excludes: "skf,*user_authorization*,dictf*,evk*,sk.bin"; Flags: recursesubdirs createallsubdirs
+#if MyRole == "client"
+Source: "he_libs\*";                 DestDir: "{app}\packaging\windows\he_libs"; Excludes: "skf,*user_authorization*,dictf*,evk*,sk.bin,*.pyc,__pycache__\*,*.egg-info\*,*.so,*.dylib,*.h,*\tests\*,*\benchmarks\*,*\examples\*,*\tools\*"; Flags: recursesubdirs createallsubdirs
+#endif
 ; ---- 完全离线包:随包 Python 安装器 + 全部依赖 wheel(目标机无需装 Python、无需联网)----
 Source: "python-3.11.9-amd64.exe";   DestDir: "{app}\packaging\windows"; Flags: skipifsourcedoesntexist
 #if MyRole == "client"
-Source: "wheels\*";                  DestDir: "{app}\packaging\windows\wheels"; Flags: recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "wheels-client\*";           DestDir: "{app}\packaging\windows\wheels"; Flags: recursesubdirs createallsubdirs
 #else
-Source: "wheels\*";                  DestDir: "{app}\packaging\windows\wheels"; Excludes: "pywebview-*,pythonnet-*,clr_loader-*,proxy_tools-*,bottle-*"; Flags: recursesubdirs createallsubdirs skipifsourcedoesntexist
+Source: "wheels-admin\*";            DestDir: "{app}\packaging\windows\wheels"; Flags: recursesubdirs createallsubdirs
 #endif
 
 [Icons]
@@ -109,7 +118,7 @@ Name: "{group}\Clawworker 用户端（浏览器诊断）"; Filename: "{app}\.ven
 #endif
 
 [Run]
-; 安装后用随包 Python 3.11 建 venv + 离线装依赖 + HE 库;不重复建快捷方式
+; 安装后用随包 Python 3.11 建 venv + 离线装角色依赖;用户端再装 HE 库
 Filename: "powershell.exe"; \
   Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\packaging\windows\install.ps1"" -Role {#RoleArg} -NoShortcut"; \
   StatusMsg: "正在安装依赖与密态库(可能需要几分钟)..."; Flags: runhidden waituntilterminated

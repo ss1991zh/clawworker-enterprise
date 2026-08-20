@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from client.tools.runtime import Runtime
+from shared.storage import atomic_write_bytes, atomic_write_text
 
 STUB_MARKER = "STUB_CIPHER"
 
@@ -215,7 +216,7 @@ class CryptoToolkit:
             return _real_encrypt_file(src, dst)
         raw = src.read_bytes()
         cipher = _stub_encrypt({"_filename": src.name, "_raw_b64": raw.hex()})
-        dst.write_bytes(cipher)
+        atomic_write_bytes(dst, cipher)
         return dst
 
     # ----- 解密 -----
@@ -232,9 +233,9 @@ class CryptoToolkit:
             return _real_decrypt_file(src, dst)
         obj = _stub_decrypt(src.read_bytes())
         if isinstance(obj, dict) and "_raw_b64" in obj:
-            dst.write_bytes(bytes.fromhex(obj["_raw_b64"]))
+            atomic_write_bytes(dst, bytes.fromhex(obj["_raw_b64"]))
         else:
-            dst.write_text(json.dumps(obj, ensure_ascii=False, default=str), encoding="utf-8")
+            atomic_write_text(dst, json.dumps(obj, ensure_ascii=False, default=str))
         return dst
 
 

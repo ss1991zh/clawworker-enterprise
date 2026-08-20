@@ -15,7 +15,10 @@ import socket
 from pathlib import Path
 from typing import Optional
 
-CERT_DIR = Path(os.path.expanduser("~/.agent-system/host-config"))
+from shared.paths import HOST_CONFIG_DIR
+from shared.storage import atomic_write_bytes
+
+CERT_DIR = HOST_CONFIG_DIR
 CERT_FILE = CERT_DIR / "host_cert.pem"
 KEY_FILE = CERT_DIR / "host_key.pem"
 
@@ -138,8 +141,8 @@ def generate(cert_dir: Path = CERT_DIR) -> tuple[Path, Path, str]:
 
     cert_path = cert_dir / "host_cert.pem"
     key_path = cert_dir / "host_key.pem"
-    cert_path.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
-    key_path.write_bytes(key.private_bytes(
+    atomic_write_bytes(cert_path, cert.public_bytes(serialization.Encoding.PEM))
+    atomic_write_bytes(key_path, key.private_bytes(
         serialization.Encoding.PEM,
         serialization.PrivateFormat.TraditionalOpenSSL,
         serialization.NoEncryption(),

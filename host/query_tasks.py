@@ -60,6 +60,24 @@ class QueryTaskManager:
         self._tasks: dict[str, QueryTask] = {}
         self._recent: dict[tuple[str, str], deque[float]] = defaultdict(deque)
         self._lock = threading.RLock()
+        self._closed = threading.Event()
+        self._janitor = threading.Thread(
+            target=self._cleanup_loop, daemon=True, name="db-query-cleanup",
+        )
+        self._janitor.start()
+
+    def close(self) -> None:
+        """服务关闭时取消待执行/运行中查询并释放线程池。"""
+        with self._lock:
+            for task in self._tasks.values():
+                if task.status not in TERMINAL:
+                    task.signal.cancel("cancelled")
+                    if task.future:
+                        task.future.cancel()
+        self._closed.set()
+        if self._janitor.is_alive():
+            self._janitor.join(timeout=2.0)
+        self._pool.shutdown(wait=False, cancel_futures=True)
 
     def create(self, *, username: str, data_source_id: str, sql: str,
                operation: str = "query") -> dict:
@@ -161,9 +179,6 @@ class QueryTaskManager:
                 task.row_count = int(result.get("row_count", 0))
                 task.result_bytes = int(result.get("result_bytes", 0))
                 task.status = "success"
-            expiry = threading.Timer(self._ttl, self._expire, args=(task.id,))
-            expiry.daemon = True
-            expiry.start()
         except QueryCancelled as exc:
             with self._lock:
                 task.status, task.error, task.error_code = "cancelled", str(exc), "cancelled"
@@ -194,13 +209,12 @@ class QueryTaskManager:
         for task_id in expired:
             del self._tasks[task_id]
 
-    def _expire(self, task_id: str) -> None:
-        """即使服务空闲且没有后续请求，也按时清掉管理端内存中的结果。"""
-        with self._lock:
-            task = self._tasks.get(task_id)
-            if task and task.finished_at and task.finished_at <= time.time() - self._ttl:
-                task.result = None
-                del self._tasks[task_id]
+    def _cleanup_loop(self) -> None:
+        """单一清理线程替代“每个查询结果一个 Timer”，避免线程随查询量增长。"""
+        interval = max(0.05, min(60.0, self._ttl / 4))
+        while not self._closed.wait(interval):
+            with self._lock:
+                self._cleanup_locked(time.time())
 
     def _audit_denied(self, username: str, source_id: str, operation: str,
                       sql: str, code: str) -> None:

@@ -30,14 +30,14 @@ ROLES = {
         "svc": "host",
         "port": 8442,
         "url": "http://127.0.0.1:8442/admin",
-        "ready_url": "http://127.0.0.1:8442/admin/login",
+        "ready_url": "http://127.0.0.1:8442/readyz",
         "label": "管理端",
     },
     "client": {
         "svc": "client",
         "port": 8444,
         "url": "http://127.0.0.1:8444",
-        "ready_url": "http://127.0.0.1:8444/healthz",
+        "ready_url": "http://127.0.0.1:8444/readyz",
         "label": "用户端",
     },
 }
@@ -86,7 +86,8 @@ def _http_ready(url: str) -> bool:
     try:
         connection.request("GET", path, headers={"Connection": "close"})
         response = connection.getresponse()
-        return 200 <= response.status < 500
+        # 只有真正就绪才允许打开页面；503 必须继续等待，而不是误判为可用。
+        return 200 <= response.status < 300
     except (OSError, http.client.HTTPException):
         return False
     finally:

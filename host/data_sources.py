@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 from host import secret_store
+from shared.paths import HOST_DATA_DIR
 
 
 SUPPORTED_ENGINES = ("mysql", "postgresql", "sqlserver")
@@ -88,7 +89,7 @@ class DataSourceStore:
         self.db_path = Path(
             db_path
             or os.environ.get("CLAWWORKER_CONTROL_DB", "")
-            or Path.home() / ".agent-system" / "host-data" / "control.db"
+            or HOST_DATA_DIR / "control.db"
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._protect = protect

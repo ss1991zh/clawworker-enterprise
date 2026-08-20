@@ -19,8 +19,10 @@ import secrets
 from pathlib import Path
 from typing import Any, Optional
 
+from shared.paths import DOWNLOADS_DIR, SCHEDULER_DIR
+from shared.storage import atomic_write_json
 
-ENC_RESULTS_DIR = Path.home() / ".agent-system" / "scheduler" / "enc_results"
+ENC_RESULTS_DIR = SCHEDULER_DIR / "enc_results"
 
 
 def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
@@ -102,8 +104,7 @@ def persist_results_encrypted(results: list[dict], run_id: str) -> list[dict]:
         manifest.append(entry)
 
     # manifest 也落一份(方便排查)
-    (run_dir / "manifest.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(run_dir / "manifest.json", manifest)
     return manifest
 
 
@@ -264,7 +265,7 @@ def decrypt_runs_to_folder(runs: list[dict], folder_name: str,
     if output_folder:
         _, out_dir = task_output_subdirs(output_folder)   # <folder>/明文/
     else:
-        downloads = Path.home() / "Downloads"
+        downloads = DOWNLOADS_DIR
         out_dir = downloads / safe
         if out_dir.exists():
             out_dir = downloads / f"{safe}_{datetime.now().strftime('%H%M%S')}"

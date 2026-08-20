@@ -18,7 +18,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
-_PIN_DIR = Path(os.path.expanduser("~/.agent-system/host-trust"))
+from shared.paths import HOST_TRUST_DIR
+from shared.storage import atomic_write_bytes
+
+_PIN_DIR = HOST_TRUST_DIR
 LAN_HOST_PORT = int(os.environ.get("CLAWWORKER_HOST_LAN_PORT", "8443"))
 
 
@@ -130,22 +133,33 @@ def repin(host_url: str) -> str:
     _PIN_DIR.mkdir(parents=True, exist_ok=True)
     pem = fetch_server_cert_pem(host_url)
     p = _pin_file(host_url)
-    p.write_bytes(pem)
+    atomic_write_bytes(p, pem)
     return _fp_of_pem(pem)
 
 
-def verify_for(host_url: str) -> str:
+def verify_for(host_url: str) -> ssl.SSLContext:
     """
-    返回给 httpx verify= 用的锁定证书路径。
-    - 已锁定:直接返回(httpx 会校验主机出示的正是这张 + SAN 匹配)。
-    - 未锁定:TOFU 首次抓取并锁定(记录指纹),返回。
+    返回给 httpx verify= 用的锁定证书 SSLContext。
+    - 已锁定:以这张自签证书作为唯一信任锚，同时保留 SAN 主机名校验。
+    - 未锁定:TOFU 首次抓取并锁定(记录指纹),再构造 context。
     抓不到证书(主机没起/网络问题)则抛异常由上层处理。
     """
     p = _pin_file(host_url)
-    if p.exists():
-        return str(p)
-    repin(host_url)
-    return str(p)
+    if not p.exists():
+        repin(host_url)
+    context = ssl.create_default_context(cafile=str(p))
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+def trust_revision(host_url: str) -> str:
+    """返回锁定证书的稳定修订标识，供 HTTP 连接池判断是否需重建。"""
+    path = _pin_file(host_url)
+    if not path.exists():
+        repin(host_url)
+    stat = path.stat()
+    return f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
 def heal_if_same_host(host_url: str) -> bool:
@@ -160,7 +174,7 @@ def heal_if_same_host(host_url: str) -> bool:
     if server_spki(host_url) != p_spki:
         return False
     try:
-        _pin_file(host_url).write_bytes(fetch_server_cert_pem(host_url))
+        atomic_write_bytes(_pin_file(host_url), fetch_server_cert_pem(host_url))
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -184,7 +198,7 @@ def check_cert_unchanged(host_url: str) -> None:
     if p_spki and s_spki and p_spki == s_spki:
         # 同一把私钥签出来的新证书 —— 合法重签,静默续锁
         try:
-            _pin_file(host_url).write_bytes(fetch_server_cert_pem(host_url))
+            atomic_write_bytes(_pin_file(host_url), fetch_server_cert_pem(host_url))
         except Exception:  # noqa: BLE001 —— 刷新失败不升级为"疑似中间人"
             pass
         return

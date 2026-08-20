@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import importlib
 from pathlib import Path
-
 import pytest
 
 
@@ -59,3 +58,25 @@ def test_login_failure_names_actual_host_and_explains_client_account():
     assert "192.168.3.146:8443" in message
     assert "用户管理" in message
     assert "不是管理端登录账号" in message
+
+
+def test_database_proxy_uses_pinned_host_certificate(monkeypatch):
+    """数据库页的代理请求必须加载 TLS 信任模块，不能因缺失变量返回 500。"""
+    seen = {}
+
+    def fake_request(method, path, **kwargs):
+        seen.update(method=method, path=path, **kwargs)
+        return [{"id": "erp", "name": "ERP"}]
+
+    monkeypatch.setattr(app_mod, "_session_state", {
+        "host_url": "https://192.168.3.169:8443",
+        "username": "alice", "token": "session-token", "expires_at": "",
+    })
+    monkeypatch.setattr(app_mod._host_client, "request_json", fake_request)
+
+    result = app_mod._host_api("GET", "/data/sources")
+
+    assert result == [{"id": "erp", "name": "ERP"}]
+    assert seen["path"] == "/data/sources"
+    assert app_mod._current_host_session().base_url == "https://192.168.3.169:8443"
+    assert app_mod._current_host_session().token == "session-token"

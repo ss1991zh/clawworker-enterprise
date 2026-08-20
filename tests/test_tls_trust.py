@@ -88,6 +88,21 @@ def test_to_https():
     assert host_trust.to_https("https://h:8443") == "https://h:8443"
 
 
+def test_verify_for_returns_pinned_ssl_context(tmp_path, monkeypatch):
+    monkeypatch.setattr(host_trust, "_PIN_DIR", tmp_path / "pins")
+    cert, _, _ = tls_cert.generate(tmp_path / "certificate")
+    url = "https://127.0.0.1:8443"
+    pin = host_trust._pin_file(url)
+    pin.parent.mkdir(parents=True, exist_ok=True)
+    pin.write_bytes(cert.read_bytes())
+
+    context = host_trust.verify_for(url)
+
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is True
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
 def test_client_host_url_is_forced_to_lan_https_port():
     assert host_trust.to_lan_https("http://192.168.1.5:8442") == "https://192.168.1.5:8443"
     assert host_trust.to_lan_https("http://192.168.1.5:8443/admin") == "https://192.168.1.5:8443"

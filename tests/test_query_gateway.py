@@ -42,6 +42,40 @@ def test_authorized_select_is_limited(tmp_path):
     assert "LIMIT 500" in plan.sql.upper()
 
 
+def test_authorized_derived_table_aliases_are_validated_and_allowed(tmp_path):
+    gateway, source, _ = setup_gateway(tmp_path)
+    sql = (
+        "SELECT cur.amount AS current_amount, prev.amount AS previous_amount "
+        "FROM (SELECT id, amount FROM erp.orders ORDER BY id DESC LIMIT 1) cur "
+        "LEFT JOIN (SELECT id, amount FROM erp.orders WHERE id = 1) prev ON 1 = 1"
+    )
+
+    plan = gateway.plan(
+        username="alice", data_source_id=source.id, sql=sql, operation="query",
+    )
+
+    assert "cur.amount" in plan.sql
+    assert "prev.amount" in plan.sql
+    assert "LIMIT 500" in plan.sql.upper()
+
+
+def test_derived_table_cannot_expose_unprojected_or_unauthorized_column(tmp_path):
+    gateway, source, _ = setup_gateway(tmp_path)
+    with pytest.raises(QueryDenied) as missing:
+        gateway.plan(
+            username="alice", data_source_id=source.id,
+            sql="SELECT cur.amount FROM (SELECT id FROM erp.orders) cur",
+        )
+    assert missing.value.code == "column_denied"
+
+    with pytest.raises(QueryDenied) as unauthorized:
+        gateway.plan(
+            username="alice", data_source_id=source.id,
+            sql="SELECT cur.secret_note FROM (SELECT secret_note FROM erp.orders) cur",
+        )
+    assert unauthorized.value.code == "column_denied"
+
+
 @pytest.mark.parametrize("sql,code", [
     ("SELECT * FROM orders", "star_denied"),
     ("SELECT secret_note FROM orders", "column_denied"),

@@ -20,8 +20,10 @@ from pathlib import Path
 from typing import Optional
 
 from host.user_manager import _hash_password
+from shared.paths import ADMIN_DIR
+from shared.storage import atomic_write_json
 
-STORE = Path.home() / ".agent-system" / "admin" / "admin_auth.json"
+STORE = ADMIN_DIR / "admin_auth.json"
 SESSION_TTL = 8 * 3600     # 登录态 8 小时
 CODE_TTL = 600             # 验证码 10 分钟
 COOKIE = "admin_session"
@@ -61,9 +63,7 @@ class AdminAuth:
             return {}
 
     def _save(self) -> None:
-        tmp = self._path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(self._d, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(self._path)
+        atomic_write_json(self._path, self._d)
 
     def _init_default(self) -> None:
         salt = secrets.token_hex(16)

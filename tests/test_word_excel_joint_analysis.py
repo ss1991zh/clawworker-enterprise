@@ -126,6 +126,52 @@ def test_required_inventory_turnover_column_validation():
     ) == []
 
 
+def test_revenue_gross_profit_and_yoy_are_all_required_and_nonempty():
+    required = pipeline._required_output_metrics("计算公司收入、毛利和同比增长")
+
+    assert required == ["毛利", "收入", "收入同比增长率", "毛利同比增长率"]
+    incomplete = pd.DataFrame({
+        "营业收入": [100.0, 120.0],
+        "毛利": [40.0, 48.0],
+        "营业收入同比增长率": [float("nan"), float("nan")],
+        "毛利同比增长率": [float("nan"), float("inf")],
+    })
+    assert pipeline._missing_required_metrics(
+        [{"df": incomplete}], required,
+    ) == ["收入同比增长率", "毛利同比增长率"]
+
+    complete = incomplete.copy()
+    complete.loc[1, "营业收入同比增长率"] = 20.0
+    complete.loc[1, "毛利同比增长率"] = 20.0
+    assert pipeline._missing_required_metrics([{"df": complete}], required) == []
+
+
+def test_raw_gross_profit_cannot_be_satisfied_by_growth_column():
+    required = pipeline._required_output_metrics("计算毛利和同比增长")
+    result = pd.DataFrame({"毛利同比增长率": [12.5]})
+
+    assert "毛利" in pipeline._missing_required_metrics([{"df": result}], required)
+
+
+def test_missing_metric_can_be_explained_and_skipped_without_losing_other_results():
+    summary = "缺少成本及毛利字段，无法计算毛利同比增长率，已跳过该指标。收入分析已完成。"
+    assert pipeline._summary_acknowledges_metric_skip(summary, "毛利同比增长率") is True
+    assert pipeline._summary_acknowledges_metric_skip(summary, "收入同比增长率") is False
+
+    results = [{"df": pd.DataFrame({
+        "营业收入": [100.0, 120.0],
+        "收入同比增长率": [float("nan"), 0.2],
+        "毛利同比增长率": [float("nan"), float("nan")],
+    })}]
+    pipeline._drop_empty_metric_columns(results, ["毛利同比增长率"])
+    assert "收入同比增长率" in results[0]["df"].columns
+    assert "毛利同比增长率" not in results[0]["df"].columns
+
+    final_summary = pipeline._append_skipped_metrics_summary("收入分析已完成。", ["毛利同比增长率"])
+    assert "部分指标已跳过：毛利同比增长率" in final_summary
+    assert "其余可计算任务已继续完成" in final_summary
+
+
 def test_fixed_inventory_skill_outputs_turnover_rate(monkeypatch):
     from client.tools import skills
 

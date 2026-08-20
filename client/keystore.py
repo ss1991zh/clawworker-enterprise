@@ -26,7 +26,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-DEFAULT_KEYSTORE_DIR = Path.home() / ".agent-system" / "keystore"
+from shared.paths import KEYSTORE_DIR
+
+DEFAULT_KEYSTORE_DIR = KEYSTORE_DIR
 VAULT_SUBDIR = "vault"   # 每用户子目录:keystore/<username>/vault/
 
 

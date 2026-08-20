@@ -19,6 +19,15 @@ def test_healthz_is_fast_unauthenticated_startup_probe():
     assert r.json() == {"status": "ok", "service": "client"}
 
 
+def test_readyz_reports_scheduler_and_storage_after_lifespan_start():
+    with TestClient(app_mod.app) as running:
+        response = running.get("/readyz", headers={"Host": GOOD_HOST})
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "ready"
+    assert response.json()["scheduler"] == "ok"
+
+
 def test_bad_host_header_rejected():
     # DNS-rebinding:浏览器带攻击者域名的 Host
     r = client.get("/api/sessions", headers={"Host": "evil.example.com"})

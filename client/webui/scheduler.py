@@ -29,7 +29,10 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 
-SCHED_DIR = Path.home() / ".agent-system" / "scheduler"
+from shared.paths import SCHEDULER_DIR
+from shared.storage import atomic_write_json
+
+SCHED_DIR = SCHEDULER_DIR
 
 # 单次 tick 里为一个任务最多枚举多少个漏跑期(防长期停机 × 高频任务爆量;约一年每日)
 _MAX_MISS_ENUM = 366
@@ -295,9 +298,7 @@ class _JsonStore:
 
     def _write(self, items: list[dict]) -> None:
         try:
-            tmp = self._path.with_suffix(self._path.suffix + ".tmp")
-            tmp.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-            tmp.replace(self._path)
+            atomic_write_json(self._path, items)
         except Exception:
             pass
 
@@ -632,11 +633,16 @@ class Scheduler:
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        thread = self._thread
+        if thread and thread.is_alive() and thread is not threading.current_thread():
+            thread.join(timeout=min(max(float(self._poll), 0.1), 2.0))
+        self._thread = None
 
     def _loop(self) -> None:
         while not self._stop.is_set():

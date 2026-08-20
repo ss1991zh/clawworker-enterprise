@@ -15,8 +15,9 @@
 
 ## 构建前置
 
-目标电脑不需要预装 Python，也不需要联网。安装包已经内置 Python 3.11、全部依赖
-wheel 和 HE 库。
+目标电脑不需要预装 Python，也不需要联网。两个安装包都内置 Python 3.11，并分别
+携带本角色所需的最小离线依赖。只有用户端包含 HE 密态库和数据分析依赖；管理端
+只包含服务、模型代理和数据库连接依赖。
 
 打包电脑需要:
 
@@ -29,6 +30,8 @@ wheel 和 HE 库。
      helearn-dev\
    ```
 2. **Inno Setup 6+**:https://jrsoftware.org/isdl.php
+3. **可用 Python**:仅用于离线解析和核对角色 wheel；也可通过环境变量
+   `CLAWWORKER_BUILD_PY` 指向具体的 `python.exe`。
 
 ---
 
@@ -45,7 +48,9 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -Role cli
 powershell -ExecutionPolicy Bypass -File packaging\windows\install.ps1 -Role both
 ```
 
-它会:建 `.venv` → 装 `requirements.txt` → 装 4 个 HE 库 → 在**桌面生成图标**(「Clawworker 管理端」/「Clawworker 用户端」)。完成后双击图标即可。
+它会:建 `.venv` → 按角色安装 `requirements-admin.txt` 或
+`requirements-client.txt` → 仅用户端安装 4 个 HE 库 → 在**桌面生成图标**。
+完成后双击图标即可。
 
 ## 方式 B:打成可分发的 .exe 安装包(发给别人)
 
@@ -56,8 +61,9 @@ powershell -ExecutionPolicy Bypass -File packaging\windows\build_installers.ps1
 ```
 
 产物在 `packaging\windows\dist\`:
-- `Clawworker-admin-Setup-1.4.2.exe`
-- `Clawworker-client-Setup-1.4.2.exe`
+- `Clawworker-admin-Setup-1.7.0.exe`
+- `Clawworker-client-Setup-1.7.0.exe`
+- `SHA256SUMS-1.7.0.txt`（两份安装包的完整性校验值）
 
 v1.4.0 起，用户端默认以独立 WebView2 桌面窗口运行，不再打开浏览器标签页。
 管理端仍使用浏览器。用户端开始菜单保留“浏览器诊断”入口，便于排查桌面窗口故障。
@@ -69,9 +75,17 @@ v1.4.0 起，用户端默认以独立 WebView2 桌面窗口运行，不再打开
 - `db_drivers/msodbcsql18-x64.msi`：Microsoft ODBC Driver 18 for SQL Server x64。
 - `db_drivers/vc_redist.x64.exe`：Visual C++ Redistributable x64。
 
-构建脚本会检查文件是否存在，并验证数据库驱动和 VC++ 运行库的 Microsoft 数字签名；缺失或签名无效时拒绝生成安装包。
+构建脚本会检查文件是否存在，并验证数据库驱动和 VC++ 运行库的 Microsoft 数字签名；
+随后从完整 `wheels` 仓库解析出 `wheels-admin` 和 `wheels-client` 两个最小集合。
+任何角色缺少依赖都会停止构建，不会生成装完后打不开的安装包。
 v1.4.1 修复部分较慢电脑上后台已启动、却被启动器误报超时且不打开桌面窗口的问题。
 v1.4.2 进一步修复启用系统代理的电脑上，本机 `127.0.0.1` 就绪探测被代理后误报超时的问题。
+
+v1.7.0 汇总 P0/P1/P2 稳定性优化，明确文档正文发送边界，桌面启动器等待服务真正就绪，并在安装后执行真实启动自检。
+
+v1.6.2 增加企业数据库指标逐项可计算性检查：优先直接字段，其次按可靠公式检查间接参数；
+缺少必要参数且无法推导时只跳过对应指标并说明原因，其余指标继续完成。同时修复收入/毛利
+同比查询、只读子查询别名校验、数据库失败后的重新连接和桌面窗口跳转闪退。
 
 把对应的 `.exe` 拷到目标机器双击安装即可。安装时会自动安装随包 Python 3.11、
 创建隔离 venv、离线安装全部依赖与 HE 库，并建立桌面/开始菜单图标。

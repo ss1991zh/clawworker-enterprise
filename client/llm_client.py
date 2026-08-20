@@ -8,8 +8,7 @@ from __future__ import annotations
 
 from typing import Protocol
 
-import httpx
-
+from client.host_client import HostClient, HostSession
 from shared.contract import LLMResponse
 
 
@@ -31,18 +30,19 @@ class HTTPLLMClient:
         # 60s 经常 timeout。同时 connect 5s 防 host 完全不可达时空等。
         self.host_url = host_url.rstrip("/")
         self.session_token = session_token
-        self._client = httpx.Client(
-            timeout=httpx.Timeout(timeout, connect=5.0),
-            # 局域网内连主机,绝不走系统代理(Clash 等)—— 否则被代理劫持返回空 502,
-            # 且 NO_PROXY 环境变量通常不含 192.168.*,用户侧无从排查
-            trust_env=False,
+        self.timeout = timeout
+        self._client = HostClient(
+            lambda: HostSession(self.host_url, self.session_token),
         )
 
     def chat(self, system: str, user: str) -> LLMResponse:
-        resp = self._client.post(
-            f"{self.host_url}/llm/chat",
-            headers={"Authorization": f"Bearer {self.session_token}"},
-            json={"system": system, "user": user},
+        body = self._client.request_json(
+            "POST",
+            "/llm/chat",
+            json_body={"system": system, "user": user},
+            timeout=self.timeout,
         )
-        resp.raise_for_status()
-        return LLMResponse.model_validate(resp.json())
+        return LLMResponse.model_validate(body)
+
+    def close(self) -> None:
+        self._client.close()

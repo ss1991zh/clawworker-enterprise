@@ -18,7 +18,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-NOTICES_PATH = Path.home() / ".agent-system" / "admin" / "notices.json"
+from shared.paths import ADMIN_DIR
+from shared.storage import atomic_write_json
+
+NOTICES_PATH = ADMIN_DIR / "notices.json"
 
 LEVELS = ("info", "warning", "critical")
 
@@ -64,12 +67,7 @@ class NoticeStore:
 
     def _flush(self) -> None:
         try:
-            tmp = self._path.with_suffix(".json.tmp")
-            tmp.write_text(
-                json.dumps([n.to_dict() for n in self._items.values()],
-                           ensure_ascii=False, indent=2),
-                encoding="utf-8")
-            tmp.replace(self._path)
+            atomic_write_json(self._path, [n.to_dict() for n in self._items.values()])
         except Exception:
             pass
 

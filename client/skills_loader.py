@@ -15,15 +15,56 @@ SKILL.md 加载器(Anthropic Agent Skills 渐进式披露格式)。
 from __future__ import annotations
 
 import re
+import stat
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
+
+from shared.paths import USER_SKILLS_DIR
+from shared.storage import atomic_write_bytes, atomic_write_text
 
 
 # 内置 SKILL.md(仓库内,只读)
 SKILLS_DIR = Path(__file__).resolve().parent / "skills"
 # 用户拖拽添加的 SKILL.md(沙盒,可删)
-USER_SKILLS_DIR = Path.home() / ".agent-system" / "user_skills"
+
+# 用户技能是提示词/文档包，不应携带大体积二进制。限制同时防路径穿越、ZIP炸弹和
+# 低配置电脑被超大技能包拖死。内置技能不受这些“上传”限制影响。
+MAX_SKILL_ARCHIVE_BYTES = 20 * 1024 * 1024
+MAX_SKILL_TOTAL_BYTES = 50 * 1024 * 1024
+MAX_SKILL_FILE_BYTES = 5 * 1024 * 1024
+MAX_SKILL_FILES = 500
+
+
+def _safe_relative_path(raw: str) -> str:
+    normalized = (raw or "").replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if (
+        not normalized
+        or normalized.startswith("/")
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or (path.parts and ":" in path.parts[0])
+    ):
+        raise ValueError(f"技能包包含不安全路径:{raw}")
+    return path.as_posix()
+
+
+def _validate_upload_sizes(files: list[tuple[str, bytes]]) -> None:
+    if len(files) > MAX_SKILL_FILES:
+        raise ValueError(f"技能包文件数超过限制（最多 {MAX_SKILL_FILES} 个）")
+    total = 0
+    for relative, data in files:
+        size = len(data)
+        if size > MAX_SKILL_FILE_BYTES:
+            raise ValueError(
+                f"技能文件 {relative} 超过 {MAX_SKILL_FILE_BYTES // 1048576} MB 限制"
+            )
+        total += size
+        if total > MAX_SKILL_TOTAL_BYTES:
+            raise ValueError(
+                f"技能包解压后超过 {MAX_SKILL_TOTAL_BYTES // 1048576} MB 限制"
+            )
 
 
 @dataclass
@@ -178,6 +219,8 @@ def add_user_skill_md(content: str, fallback_name: str = "") -> SkillDoc:
     用户拖拽一个 SKILL.md 文本 → 解析 frontmatter → 存到 user_skills/<slug>/SKILL.md。
     必须能解析出 name + description(frontmatter),否则报错。
     """
+    if len(content.encode("utf-8")) > MAX_SKILL_FILE_BYTES:
+        raise ValueError(f"SKILL.md 超过 {MAX_SKILL_FILE_BYTES // 1048576} MB 限制")
     fm, _body = parse_frontmatter(content)
     name = fm.get("name") or fallback_name
     if not name:
@@ -191,7 +234,7 @@ def add_user_skill_md(content: str, fallback_name: str = "") -> SkillDoc:
         slug = slug + "-user"
     dst_dir = USER_SKILLS_DIR / slug
     dst_dir.mkdir(parents=True, exist_ok=True)
-    (dst_dir / "SKILL.md").write_text(content, encoding="utf-8")
+    atomic_write_text(dst_dir / "SKILL.md", content)
     doc = _load_one(dst_dir, is_user=True)
     if not doc:
         raise ValueError("SKILL.md 解析失败")
@@ -219,7 +262,8 @@ def add_user_skill_files(files: list[tuple]) -> SkillDoc:
     if not files:
         raise ValueError("没有文件")
     # 规整路径 + 找 SKILL.md
-    norm = [(p.replace("\\", "/").lstrip("/"), d) for p, d in files]
+    norm = [(_safe_relative_path(str(p)), bytes(d)) for p, d in files]
+    _validate_upload_sizes(norm)
     skill_entry = next(((p, d) for p, d in norm if p.rstrip("/").endswith("SKILL.md")), None)
     if not skill_entry:
         raise ValueError("技能包里没有 SKILL.md")
@@ -245,14 +289,12 @@ def add_user_skill_files(files: list[tuple]) -> SkillDoc:
     prefix = _strip_common_prefix([p for p, _ in norm])
     for p, d in norm:
         rel = p[len(prefix):] if prefix and p.startswith(prefix) else p
-        # 路径越权 / 逃逸防御
-        if not rel or rel.startswith("..") or "/.." in rel or rel.startswith("/"):
-            continue
+        rel = _safe_relative_path(rel)
         target = (dst_dir / rel).resolve()
         if not target.is_relative_to(dst_dir.resolve()):
-            continue
+            raise ValueError(f"技能包路径超出目标目录:{p}")
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(d)
+        atomic_write_bytes(target, d)
 
     doc = _load_one(dst_dir, is_user=True)
     if not doc:
@@ -263,14 +305,41 @@ def add_user_skill_files(files: list[tuple]) -> SkillDoc:
 def add_user_skill_zip(zip_bytes: bytes) -> SkillDoc:
     """用户拖拽一个 .zip(完整 skill 包,含 SKILL.md)→ 解压到 user_skills/。"""
     import io
+    import shutil
     import zipfile
+    if len(zip_bytes) > MAX_SKILL_ARCHIVE_BYTES:
+        raise ValueError(
+            f"ZIP 文件超过 {MAX_SKILL_ARCHIVE_BYTES // 1048576} MB 上传限制"
+        )
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
-        names = zf.namelist()
+        infos = [info for info in zf.infolist() if not info.is_dir()]
+        if len(infos) > MAX_SKILL_FILES:
+            raise ValueError(f"技能包文件数超过限制（最多 {MAX_SKILL_FILES} 个）")
+        normalized_infos: list[tuple[str, zipfile.ZipInfo]] = []
+        total_size = 0
+        for info in infos:
+            name = _safe_relative_path(info.filename)
+            mode = (info.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                raise ValueError(f"技能包不允许符号链接:{name}")
+            if info.flag_bits & 0x1:
+                raise ValueError(f"技能包不允许加密文件:{name}")
+            if info.file_size > MAX_SKILL_FILE_BYTES:
+                raise ValueError(
+                    f"技能文件 {name} 超过 {MAX_SKILL_FILE_BYTES // 1048576} MB 限制"
+                )
+            total_size += info.file_size
+            if total_size > MAX_SKILL_TOTAL_BYTES:
+                raise ValueError(
+                    f"技能包解压后超过 {MAX_SKILL_TOTAL_BYTES // 1048576} MB 限制"
+                )
+            normalized_infos.append((name, info))
         # 找 SKILL.md(允许在顶层或单层子目录)
-        skill_md_path = next((n for n in names if n.rstrip("/").endswith("SKILL.md")), None)
-        if not skill_md_path:
+        skill_entries = [item for item in normalized_infos if item[0].endswith("SKILL.md")]
+        if not skill_entries:
             raise ValueError("zip 里没有 SKILL.md")
-        content = zf.read(skill_md_path).decode("utf-8", errors="replace")
+        skill_md_path, skill_info = min(skill_entries, key=lambda item: item[0].count("/"))
+        content = zf.read(skill_info).decode("utf-8", errors="replace")
         fm, _ = parse_frontmatter(content)
         if not fm.get("name") or not fm.get("description"):
             raise ValueError("SKILL.md 缺 name / description")
@@ -279,20 +348,23 @@ def add_user_skill_zip(zip_bytes: bytes) -> SkillDoc:
         if slug in builtin_slugs:
             slug = slug + "-user"
         dst_dir = USER_SKILLS_DIR / slug
+        if dst_dir.exists():
+            shutil.rmtree(dst_dir, ignore_errors=True)
         dst_dir.mkdir(parents=True, exist_ok=True)
         # 计算 zip 内的公共前缀目录
         prefix = skill_md_path[: -len("SKILL.md")]
-        for n in names:
-            if n.endswith("/"):
+        for name, info in normalized_infos:
+            if prefix and not name.startswith(prefix):
                 continue
-            if prefix and not n.startswith(prefix):
-                continue
-            rel = n[len(prefix):] if prefix else n
-            if not rel or rel.startswith("..") or rel.startswith("/"):
-                continue
-            target = dst_dir / rel
+            rel = _safe_relative_path(name[len(prefix):] if prefix else name)
+            target = (dst_dir / rel).resolve()
+            if not target.is_relative_to(dst_dir.resolve()):
+                raise ValueError(f"技能包路径超出目标目录:{name}")
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(zf.read(n))
+            data = zf.read(info)
+            if len(data) != info.file_size or len(data) > MAX_SKILL_FILE_BYTES:
+                raise ValueError(f"技能文件解压大小异常:{name}")
+            atomic_write_bytes(target, data)
     doc = _load_one(dst_dir, is_user=True)
     if not doc:
         raise ValueError("SKILL.md 解析失败")

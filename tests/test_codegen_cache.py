@@ -6,18 +6,26 @@
 """
 from __future__ import annotations
 
+import pytest
+
 from client.webui.pipeline import (
     _codegen_cache_delete,
     _codegen_cache_load,
     _codegen_cache_save,
     _codegen_cache_sig,
 )
+from client.webui import codegen_cache, pipeline
 
 SCHEMA = {"columns": [{"name": "回款金额(元)", "encrypted": True},
                       {"name": "实际销售额(元)", "encrypted": True},
                       {"name": "销售大区", "encrypted": False}]}
 
 KEY = "task_testcache0001"
+
+
+@pytest.fixture(autouse=True)
+def isolated_cache_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(codegen_cache, "CACHE_DIR", tmp_path)
 
 
 def teardown_function(_fn):
@@ -63,3 +71,20 @@ def test_delete_then_miss():
     _codegen_cache_save(KEY, sig, "code", "s")
     _codegen_cache_delete(KEY)
     assert _codegen_cache_load(KEY, sig) is None
+
+
+def test_cache_cleanup_removes_expired_and_excess_files(tmp_path, monkeypatch):
+    monkeypatch.setattr(codegen_cache, "MAX_FILES", 2)
+    monkeypatch.setattr(codegen_cache, "MAX_AGE_SECONDS", 100)
+    for index in range(4):
+        path = tmp_path / f"task-{index}.json"
+        path.write_text("{}", encoding="utf-8")
+        path.touch()
+        # 用明确时间保证排序稳定；最旧的文件同时会命中过期条件。
+        import os
+        os.utime(path, (1000 + index, 1000 + index))
+
+    removed = pipeline._codegen_cache_cleanup(now=1050)
+
+    assert removed == 2
+    assert sorted(path.name for path in tmp_path.glob("*.json")) == ["task-2.json", "task-3.json"]

@@ -28,9 +28,9 @@ _DESKTOP_SPEC.loader.exec_module(desktop)
 
 def test_role_urls_match_local_http_design():
     assert launcher.ROLES["admin"]["url"] == "http://127.0.0.1:8442/admin"
-    assert launcher.ROLES["admin"]["ready_url"].endswith(":8442/admin/login")
+    assert launcher.ROLES["admin"]["ready_url"].endswith(":8442/readyz")
     assert launcher.ROLES["client"]["url"] == "http://127.0.0.1:8444"
-    assert launcher.ROLES["client"]["ready_url"].endswith(":8444/healthz")
+    assert launcher.ROLES["client"]["ready_url"].endswith(":8444/readyz")
     assert "8443" not in launcher.ROLES["admin"]["url"]
 
 
@@ -54,20 +54,38 @@ def test_http_probe_directly_connects_without_system_proxy(monkeypatch):
 
     monkeypatch.setattr(launcher.http.client, "HTTPConnection", FakeConnection)
 
-    assert launcher._http_ready("http://127.0.0.1:8444/healthz") is True
+    assert launcher._http_ready("http://127.0.0.1:8444/readyz") is True
     host, port, timeout, connection = connections[0]
     assert (host, port, timeout) == (
         "127.0.0.1",
         8444,
         launcher.HTTP_PROBE_TIMEOUT_SEC,
     )
-    assert connection.request_args[0] == ("GET", "/healthz")
+    assert connection.request_args[0] == ("GET", "/readyz")
     assert connection.closed is True
     assert launcher.HTTP_PROBE_TIMEOUT_SEC >= 2.0
 
 
 def test_http_probe_rejects_non_loopback_url():
     assert launcher._http_ready("http://192.168.3.169:8444/healthz") is False
+
+
+def test_http_probe_keeps_waiting_on_not_ready(monkeypatch):
+    class FakeConnection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return type("Response", (), {"status": 503})()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(launcher.http.client, "HTTPConnection", FakeConnection)
+    assert launcher._http_ready("http://127.0.0.1:8444/readyz") is False
 
 
 def test_main_waits_for_http_then_opens_browser(monkeypatch, tmp_path):
