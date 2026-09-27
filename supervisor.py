@@ -96,6 +96,7 @@ def main() -> int:
     # 否则角色分片 + 单例锁会互相堵死:先起的只管 client,后来点「管理端」图标起的
     # supervisor 撞锁即退,没人拉 host,表现为点图标毫无反应。
     want = sm.managed_service_keys()
+    explicit_roles = bool(os.environ.get("CLAWWORKER_MANAGED_SERVICES", "").strip())
     try:
         if _handoff_or_replace_existing(want):
             return 0
@@ -108,7 +109,10 @@ def main() -> int:
 
     started_at = _now()
     # 本进程角色 ∪ 历史期望集合(上次别的角色请求过、重启后不该丢)
-    managed = sm.add_desired(want)
+    # 安装版启动器总会显式传角色。此时必须覆盖历史期望集合，避免旧版本留下的
+    # client 角色让管理端安装目录继续占用 :8444。未指定角色的源码/一体化运行
+    # 仍保留动态并集接管能力。
+    managed = sm.set_desired(want) if explicit_roles else sm.add_desired(want)
     _log(f"启动 · pid={os.getpid()} · 托管 {managed}")
 
     # 每个服务的运行态
@@ -142,7 +146,8 @@ def main() -> int:
     while _running:
         # 接管新角色:别的 launcher(如桌面「管理端」图标)撞上单例锁退出前,
         # 会把它想要的角色写进期望集合 —— 这里读到就纳入托管,下一轮即拉起。
-        for key in sm.read_desired():
+        desired = [] if explicit_roles else sm.read_desired()
+        for key in desired:
             if key not in mgr:
                 managed.append(key)
                 mgr[key] = {"proc": None, "restarts": 0, "last_start": 0.0,

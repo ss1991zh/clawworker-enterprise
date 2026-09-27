@@ -117,7 +117,11 @@ def build_settings_router(
             return need_login()
         from client.he_ops import audit
         user = session_state["username"]
-        return {"summary": audit.summary(user), "events": audit.read_events(user, limit=limit)}
+        return {
+            "summary": audit.summary(user),
+            "chain": audit.verify_chain(user),
+            "events": audit.read_events(user, limit=limit),
+        }
 
     @router.get("/api/audit/export")
     def api_audit_export():

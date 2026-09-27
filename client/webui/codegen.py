@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import ast
+import time
 import re
 from typing import Any, Callable, Optional
 
@@ -35,19 +36,56 @@ def _to_ca(x):
     return x.to_cipherarray() if type(x).__name__ == "CipherSeries" else x
 
 
+class _TimedTools:
+    """Per-run timing around exposed HE helpers, not model/decryption/export time.
+
+    Only synth/window/groupby calls are covered. Plain-key count is excluded.
+    Failed calls are timed as well; no global monkeypatching is used.
+    """
+
+    def __init__(self, target, record, *, groupby=False):
+        self._target = target
+        self._record = record
+        self._groupby = groupby
+
+    def __getattr__(self, name):
+        fn = getattr(self._target, name)
+        if not callable(fn):
+            return fn
+
+        def call(*args, **kwargs):
+            agg = kwargs.get("agg", args[2] if len(args) > 2 else "sum")
+            if self._groupby and (name == "count" or (name in {"agg", "pivot", "drilldown"} and agg == "count")):
+                return fn(*args, **kwargs)
+            started = time.perf_counter()
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                self._record(time.perf_counter() - started)
+        return call
+
+
 class _BoundHp:
     """把模块函数的第一个 hp 参数预绑定,并把 CipherSeries 实参自动转 CipherArray,
     生成代码里直接 `synth.sumif_gt(cdf[列], 阈值)` / `window.rolling_mean(cdf[列], 3)`。"""
 
-    def __init__(self, hp, mod):
+    def __init__(self, hp, mod, on_operation: Optional[Callable[[str], None]] = None):
         self._hp = hp
         self._mod = mod
+        self._on_operation = on_operation
 
     def __getattr__(self, name):
         fn = getattr(self._mod, name)
         hp = self._hp
-        return lambda *a, **k: fn(hp, *[_to_ca(x) for x in a],
-                                  **{kk: _to_ca(vv) for kk, vv in k.items()})
+        module_name = "时序" if self._mod is _window_mod else "条件/统计"
+
+        def wrapped(*a, **k):
+            if self._on_operation:
+                self._on_operation(f"同态密文{module_name}运算 · {name}")
+            return fn(hp, *[_to_ca(x) for x in a],
+                      **{kk: _to_ca(vv) for kk, vv in k.items()})
+
+        return wrapped
 
 
 # 兼容旧名:synth 绑定
@@ -60,35 +98,48 @@ class _BoundGroupby:
       groupby.sum(cdf[度量], keys) / .mean / .count(keys) / .max / .min / .agg(度量, keys, "sum")
     keys 取自明文身份列(metadata_rows 的某列)。sum/mean/count 精确,max/min 近似。"""
 
-    def __init__(self, hp):
+    def __init__(self, hp, on_operation: Optional[Callable[[str], None]] = None):
         self._hp = hp
+        self._on_operation = on_operation
+
+    def _notify(self, operation: str) -> None:
+        if self._on_operation:
+            self._on_operation(f"同态密文分组运算 · {operation}")
 
     def sum(self, measure, keys):
+        self._notify("求和")
         return _groupby_mod.groupby_sum(self._hp, _to_ca(measure), keys)
 
     def mean(self, measure, keys):
+        self._notify("平均值")
         return _groupby_mod.groupby_mean(self._hp, _to_ca(measure), keys)
 
     def count(self, keys):
+        self._notify("计数")
         return _groupby_mod.groupby_count(keys)
 
     def max(self, measure, keys):
+        self._notify("最大值（近似）")
         return _groupby_mod.groupby_max(self._hp, _to_ca(measure), keys)
 
     def min(self, measure, keys):
+        self._notify("最小值（近似）")
         return _groupby_mod.groupby_min(self._hp, _to_ca(measure), keys)
 
     def agg(self, measure, keys, agg="sum"):
+        self._notify(str(agg))
         if agg == "count":
             return _groupby_mod.groupby_count(keys)
         return _groupby_mod.groupby_agg(self._hp, _to_ca(measure), keys, agg)
 
     def pivot(self, measure, key_lists, agg="sum"):
         """多维透视:key_lists=[大区列, 品类列, ...] → {(大区,品类): 密文标量}。"""
+        self._notify(f"多维透视 {agg}")
         return _groupby_mod.pivot_agg(self._hp, _to_ca(measure), key_lists, agg)
 
     def drilldown(self, measure, key_lists, agg="sum"):
         """层级下钻:逐层加深 → [按大区, 按大区×城市, ...] 列表。"""
+        self._notify(f"层级下钻 {agg}")
         return _groupby_mod.drilldown_agg(self._hp, _to_ca(measure), key_lists, agg)
 
 
@@ -656,13 +707,16 @@ _GATED_DECRYPT_NAMES = ("decrypt", "decrypt_df", "decrypt_ndarray", "decrypt_csv
 # crypto_toolkit 解密门控代理 —— 首次 decrypt 触发解密授权
 class _CtGate:
     def __init__(self, real_ct, on_first_decrypt: Callable[[], None],
-                 original_cdf=None, meta_df=None):
+                 original_cdf=None, meta_df=None,
+                 on_operation: Optional[Callable[[str], None]] = None):
         object.__setattr__(self, "_ct", real_ct)
         object.__setattr__(self, "_on_first", on_first_decrypt)
         object.__setattr__(self, "_authorized", False)
         # 整表解密时自动拼回身份列用
         object.__setattr__(self, "_orig_cdf", original_cdf)
         object.__setattr__(self, "_meta_df", meta_df)
+        object.__setattr__(self, "_on_operation", on_operation)
+        object.__setattr__(self, "_decrypt_notified", False)
 
     def __getattr__(self, name):
         real_ct = object.__getattribute__(self, "_ct")
@@ -677,6 +731,11 @@ class _CtGate:
                 if not object.__getattribute__(self, "_authorized"):
                     object.__getattribute__(self, "_on_first")()  # 可能 raise(取消/保留密文)
                     object.__setattr__(self, "_authorized", True)
+                if not object.__getattribute__(self, "_decrypt_notified"):
+                    callback = object.__getattribute__(self, "_on_operation")
+                    if callback:
+                        callback("本机受控解密 · 数据只进入本机内存，不发送给大模型")
+                    object.__setattr__(self, "_decrypt_notified", True)
                 # 已授权解密 —— 真实解密若报错,是「解密失败」终态,
                 # 包成 DecryptionFailed,避免上层误判为代码 bug 去回退固化 skill
                 try:
@@ -687,6 +746,13 @@ class _CtGate:
                 except Exception as e:  # noqa: BLE001
                     raise DecryptionFailed(f"{type(e).__name__}: {e}") from e
             return wrapped
+        if canonical in ("encrypt", "encrypt_df"):
+            def encrypt_wrapped(*a, **k):
+                callback = object.__getattribute__(self, "_on_operation")
+                if callback:
+                    callback("本机加密中间结果 · 明文不离开本机")
+                return attr(*a, **k)
+            return encrypt_wrapped
         return attr
 
 
@@ -721,6 +787,7 @@ def run_generated_code(
     metadata_columns: list[str],
     prompt_decrypt: Optional[Callable[[], str]] = None,
     should_cancel: Optional[Callable[[], bool]] = None,
+    on_operation: Optional[Callable[[str], None]] = None,
 ) -> list[dict]:
     """
     受限 exec 生成代码,返回 results 列表 [{sheet_name, df, chart}]。
@@ -763,7 +830,22 @@ def run_generated_code(
     except Exception:
         meta_df = None
 
-    ct_gate = _CtGate(ct, _on_first_decrypt, original_cdf=cdf, meta_df=meta_df)
+    emitted_operations: set[str] = set()
+
+    def _emit_operation(label: str) -> None:
+        # 生成代码可能在循环中反复调用同一算子。界面展示运算种类即可，
+        # 避免几百条重复事件淹没真正的阶段变化。
+        label = str(label or "").strip()
+        if not label or label in emitted_operations or len(emitted_operations) >= 30:
+            return
+        emitted_operations.add(label)
+        if on_operation:
+            on_operation(label)
+
+    ct_gate = _CtGate(
+        ct, _on_first_decrypt, original_cdf=cdf, meta_df=meta_df,
+        on_operation=_emit_operation,
+    )
 
     # 自定义 import:只放白名单,crypto_toolkit 换成门控代理
     real_modules = {
@@ -781,6 +863,7 @@ def run_generated_code(
         return importlib.import_module(name)
 
     results: list[dict] = []
+    he_durations: list[float] = []
     sandbox_globals: dict[str, Any] = {
         "__builtins__": _safe_builtins(_guarded_import),
         "cdf": cdf,
@@ -788,15 +871,21 @@ def run_generated_code(
         "metadata_columns": metadata_columns,
         "ps": ps, "ct": ct_gate, "hp": hp, "hl": hl,
         "pd": pd, "np": np,
-        "synth": _BoundHp(hp, _synth_mod),       # 比较/条件求和/分箱/多条件布尔(补构建缺陷)
-        "groupby": _BoundGroupby(hp),            # 密态分组聚合(明文键×密文度量)
-        "window": _BoundHp(hp, _window_mod),     # 窗口/时序(diff/lag/rolling/pct_change)
+        "synth": _TimedTools(_BoundHp(hp, _synth_mod, _emit_operation), he_durations.append),
+        "groupby": _TimedTools(_BoundGroupby(hp, _emit_operation), he_durations.append, groupby=True),
+        "window": _TimedTools(_BoundHp(hp, _window_mod, _emit_operation), he_durations.append),
         "results": results,
     }
 
     compiled = compile(code, "<generated_skill_code>", "exec")
     # 独立线程 + wall-clock 超时 + 取消轮询 —— 防 while True 挂死守护线程、点停止无效
-    _run_exec_with_timeout(compiled, sandbox_globals, _EXEC_TIMEOUT_SEC, should_cancel)
+    started_at = time.perf_counter()
+    try:
+        _run_exec_with_timeout(compiled, sandbox_globals, _EXEC_TIMEOUT_SEC, should_cancel)
+    finally:
+        if on_operation:
+            on_operation(f"本机执行计时 · {time.perf_counter() - started_at:.6f} 秒")
+            on_operation(f"同态工具计时 · {sum(he_durations):.6f} 秒 · {len(he_durations)} 次")
 
     # 取回 results(代码可能重新赋值 results = [...])
     final = sandbox_globals.get("results", results)

@@ -9,10 +9,21 @@ def test_lazy_component_initializes_once():
     component = LazyComponent(lambda: calls.append("created") or {"ok": True}, "test")
 
     assert component.initialized is False
-    assert component.get() == {"ok": True}
-    assert component.get() == {"ok": True}
+    assert component.resolve() == {"ok": True}
+    assert component.resolve() == {"ok": True}
     assert component.initialized is True
     assert calls == ["created"]
+
+
+def test_lazy_component_forwards_wrapped_get_method():
+    class Store:
+        def get(self, item_id):
+            return {"id": item_id}
+
+    component = LazyComponent(Store, "store")
+
+    assert component.get("cfg-123") == {"id": "cfg-123"}
+    assert component.initialized is True
 
 
 def test_host_runtime_constructor_has_no_persistent_component_side_effects():

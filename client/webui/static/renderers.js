@@ -7,6 +7,7 @@
   const SESS_CLOCK_INLINE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>';
   const FOLDER_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
   const CHECK_ICON_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6L9 17l-5-5"/></svg>';
+  const STOP_ICON_SVG = '<svg class="ic-stop" viewBox="0 0 24 24" aria-label="停止" role="img"><rect x="6" y="6" width="12" height="12" rx="2"></rect></svg>';
   const ICON_SVG = Object.freeze({
     doc: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="10" x2="21" y2="10"/></svg>',
     warn: '<svg class="ic-inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
@@ -18,7 +19,7 @@
     const icon = kind === "cipher" ? LOCK_ICON_SVG : FILE_ICON_SVG;
     const hint = kind === "cipher" ? "加密文件 · 数值列为密文" : "Excel 输出 · 明文";
     return `<div class="file-card" data-path="${esc(path)}" data-name="${esc(name)}" data-kind="${esc(kind)}">
-      <div class="fc-ic ${esc(kind)}">${icon}</div><div class="fc-body"><div class="fc-nm">${esc(name)}</div>
+      <div class="fc-ic ${esc(kind)}">${icon}</div><div class="fc-body"><div class="fc-nm" title="${esc(name)}">${esc(name)}</div>
       <div class="fc-hint">${hint}</div></div><a class="fc-btn" href="${download}" download="${esc(name)}">⬇ 下载</a></div>`;
   }
 
@@ -35,7 +36,7 @@
   }
 
   global.ClawRenderers = Object.freeze({
-    SESS_CLOCK_INLINE, FOLDER_ICON_SVG, CHECK_ICON_SVG, ICON_SVG,
+    SESS_CLOCK_INLINE, FOLDER_ICON_SVG, CHECK_ICON_SVG, STOP_ICON_SVG, ICON_SVG,
     oneFileCard, fileCardsHtml,
   });
 }(window));

@@ -117,6 +117,26 @@ def test_decrypt_cipherseries_uses_to_cipherarray():
     assert ("decrypt", ("ARRAY", "销售额")) in ct.calls
 
 
+def test_decrypt_reports_real_time_local_operation_once():
+    events = []
+    ct = FakeCt()
+    gate = cg._CtGate(ct, lambda: None, on_operation=events.append)
+
+    gate.decrypt([1, 2, 3])
+    gate.decrypt([4, 5, 6])
+
+    assert events == ["本机受控解密 · 数据只进入本机内存，不发送给大模型"]
+
+
+def test_encrypt_reports_real_time_local_operation():
+    events = []
+    gate = cg._CtGate(FakeCt(), lambda: None, on_operation=events.append)
+
+    gate.encrypt([1, 2, 3])
+
+    assert events == ["本机加密中间结果 · 明文不离开本机"]
+
+
 def test_decrypt_cipherdataframe_routes_to_decrypt_df():
     ct = FakeCt()
     g = _gate(ct)

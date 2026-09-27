@@ -1,7 +1,7 @@
 /* 本机加密文件上传、列表和预览。 */
 (function initClawFilesUI(global) {
   "use strict";
-  function create({ state, api, $, esc, pickExistingCipher }) {
+  function create({ state, api, $, esc, ui, pickExistingCipher }) {
   function openFilesModal() {
     $("filesMask").classList.add("open");
     renderFilesModal();
@@ -106,7 +106,7 @@
       showFilePreview(b.dataset.view);
     }));
     box.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
-      if (!confirm(`删除 ${b.dataset.del}?`)) return;
+      if (!await ui.confirm(`删除“${b.dataset.del}”后将无法恢复。`, { title: "删除密文文件？", danger: true, confirmText: "确认删除" })) return;
       await api("DELETE", `/api/files/${encodeURIComponent(b.dataset.del)}`);
       await loadFiles(); renderFilesList();
     }));

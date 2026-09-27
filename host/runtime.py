@@ -39,7 +39,13 @@ class LazyComponent(Generic[T]):
     def initialized(self) -> bool:
         return object.__getattribute__(self, "_instance") is not None
 
-    def get(self) -> T:
+    def resolve(self) -> T:
+        """Return the wrapped component, creating it on first access.
+
+        This method deliberately is not named ``get``. Several wrapped stores
+        expose their own ``get(id)`` method; reserving that name on the proxy
+        would intercept those calls instead of forwarding them to the store.
+        """
         instance = object.__getattribute__(self, "_instance")
         if instance is not None:
             return instance
@@ -51,7 +57,7 @@ class LazyComponent(Generic[T]):
         return instance
 
     def __getattr__(self, name: str):
-        return getattr(self.get(), name)
+        return getattr(self.resolve(), name)
 
     def __repr__(self) -> str:
         state = "ready" if self.initialized else "pending"
@@ -67,32 +73,32 @@ class HostRuntime:
         self.last_startup_error = ""
         self.auth_manager = LazyComponent(AuthorizationManager, "authorization-manager")
         self.user_manager = LazyComponent(
-            lambda: UserManager(self.auth_manager.get()), "user-manager",
+            lambda: UserManager(self.auth_manager.resolve()), "user-manager",
         )
         self.dispatcher = LazyComponent(Dispatcher, "dispatcher")
         self.llm_config_store = LazyComponent(LLMConfigStore, "llm-config-store")
         self.provider_manager = LazyComponent(
-            lambda: ProviderManager(self.llm_config_store.get()), "provider-manager",
+            lambda: ProviderManager(self.llm_config_store.resolve()), "provider-manager",
         )
         self.call_stats = LazyComponent(CallStatStore, "call-stats")
         self.data_source_store = LazyComponent(DataSourceStore, "data-source-store")
         self.connector_registry = LazyComponent(ConnectorRegistry, "connector-registry")
         self.data_access_store = LazyComponent(
-            lambda: DataAccessStore(self.data_source_store.get().db_path), "data-access-store",
+            lambda: DataAccessStore(self.data_source_store.resolve().db_path), "data-access-store",
         )
         self.query_gateway = LazyComponent(
             lambda: QueryGateway(
-                self.data_source_store.get(),
-                self.data_access_store.get(),
-                self.connector_registry.get(),
+                self.data_source_store.resolve(),
+                self.data_access_store.resolve(),
+                self.connector_registry.resolve(),
             ),
             "query-gateway",
         )
         self.query_task_manager = LazyComponent(
             lambda: QueryTaskManager(
-                self.query_gateway.get(),
-                self.data_source_store.get(),
-                self.data_access_store.get(),
+                self.query_gateway.resolve(),
+                self.data_source_store.resolve(),
+                self.data_access_store.resolve(),
             ),
             "query-task-manager",
         )
@@ -105,7 +111,7 @@ class HostRuntime:
         started = time.monotonic()
         try:
             for component in self.components():
-                component.get()
+                component.resolve()
         except Exception as exc:
             self.last_startup_error = type(exc).__name__
             raise
@@ -139,7 +145,7 @@ class HostRuntime:
         database_ok = False
         if not pending:
             try:
-                with self.data_source_store.get()._connect() as connection:
+                with self.data_source_store.resolve()._connect() as connection:
                     database_ok = connection.execute("SELECT 1").fetchone()[0] == 1
             except Exception:  # noqa: BLE001
                 database_ok = False
@@ -156,4 +162,4 @@ class HostRuntime:
 
     def shutdown(self) -> None:
         if self.query_task_manager.initialized:
-            self.query_task_manager.get().close()
+            self.query_task_manager.resolve().close()

@@ -54,6 +54,7 @@ class Message:
     tokens: int = 0                            # 本轮所有 LLM 调用的 token 用量合计
     remediation_note: str = ""                 # assistant-only:本轮是漏跑补救时,附在执行时间下方的说明
     used_cipher: str = ""                      # assistant 实际用了哪份 cipher
+    security_proof: dict[str, Any] = field(default_factory=dict)  # assistant-only:本轮密文计算证据
     created_at: str = field(default_factory=lambda: datetime.now().isoformat(timespec="seconds"))
 
     def to_dict(self) -> dict[str, Any]:
@@ -88,6 +89,7 @@ class Message:
             tokens=int(d.get("tokens", 0) or 0),
             remediation_note=d.get("remediation_note", ""),
             used_cipher=d.get("used_cipher", ""),
+            security_proof=dict(d.get("security_proof", {}) or {}),
             created_at=d.get("created_at", datetime.now().isoformat(timespec="seconds")),
         )
 

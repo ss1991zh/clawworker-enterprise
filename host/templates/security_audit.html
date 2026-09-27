@@ -1,0 +1,38 @@
+{% extends "base.html" %}
+{% block title %}密文计算审计 · Admin{% endblock %}
+{% block content %}
+  <h1 class="page-title">密文计算审计</h1>
+  <p class="page-subtitle">集中查看用户端提交的密文计算证据。这里只保存任务编号、密文 SHA-256 指纹、执行方式和哈希链状态，不保存业务明文、文件路径、密钥或查询结果。</p>
+
+  <div class="kpi-grid">
+    <div class="kpi-card"><div class="label">证据总数</div><div class="value">{{ summary.total or 0 }}</div><div class="hint">客户端已提交的计算任务</div></div>
+    <div class="kpi-card"><div class="label">通过本地验证</div><div class="value ok">{{ summary.verified or 0 }}</div><div class="hint">输入指纹、零明文检查和哈希链均通过</div></div>
+    <div class="kpi-card"><div class="label">结构化数据零明文</div><div class="value ok">{{ summary.zero_plaintext or 0 }}</div><div class="hint">大模型仅收到字段结构和计算要求</div></div>
+    <div class="kpi-card"><div class="label">使用账号</div><div class="value">{{ summary.users or 0 }}</div><div class="hint">提交过密文计算证据的用户</div></div>
+  </div>
+
+  <div class="panel"><div class="panel-header"><h3>筛选</h3></div><div class="panel-body">
+    <form method="get" action="/admin/security-audit" class="usage-filters">
+      <select name="username"><option value="">全部用户</option>{% for user in users %}<option value="{{ user }}" {% if filters.username == user %}selected{% endif %}>{{ user }}</option>{% endfor %}</select>
+      <button class="btn btn-primary" type="submit">查询</button><a class="btn btn-secondary" href="/admin/security-audit">清除</a>
+    </form>
+  </div></div>
+
+  <div class="panel"><div class="panel-header"><h3>最近证据（最多 500 条）</h3></div><div class="panel-body compact usage-table-wrap">
+    {% if proofs %}<table class="table security-proof-table"><thead><tr><th>时间 / 用户</th><th>数据来源 / 执行</th><th>验证结论</th><th>密文指纹</th><th>审计哈希</th></tr></thead><tbody>
+    {% for proof in proofs %}<tr>
+      <td><div class="mono">{{ (proof.client_created_at or proof.created_at)[:19].replace('T',' ') }}</div><strong>{{ proof.username }}</strong><div class="muted">任务 {{ proof.task_id or '—' }}</div></td>
+      <td><div>{{ proof.source_name }}</div><span class="pill muted">{{ proof.engine }}</span><div class="muted">{{ proof.skill_calls|join('、') or '密态计算' }}</div></td>
+      <td>
+        <span class="pill {{ 'active' if proof.client_verified and proof.chain_verified else 'warning' }}">{{ '密文计算已验证' if proof.client_verified and proof.chain_verified else '证据待复核' }}</span>
+        <div class="muted">{{ ('仅发送字段结构，未发送数值明文' if proof.llm_exposure_count else '本轮未调用大模型') if proof.no_structured_plaintext else '零明文检查未通过' }}</div>
+        {% if proof.document_exposure_count %}<div class="muted">含 {{ proof.document_exposure_count }} 次用户确认的文档正文发送</div>{% endif %}
+      </td>
+      <td><div class="proof-hash" title="{{ proof.input_fingerprint }}">输入 {{ proof.input_fingerprint }}</div>{% if proof.output_fingerprint %}<div class="proof-hash" title="{{ proof.output_fingerprint }}">输出 {{ proof.output_fingerprint }}</div>{% endif %}</td>
+      <td><div class="proof-hash" title="{{ proof.audit_hash }}">{{ proof.audit_hash }}</div><div class="muted">{{ '哈希链完整' if proof.chain_verified else '哈希链待复核' }}</div></td>
+    </tr>{% endfor %}
+    </tbody></table>{% else %}<div class="empty">暂无密文计算证据。用户端完成一次密文分析后会自动提交；管理端暂时不可达时，本地审计证据仍会保留。</div>{% endif %}
+  </div></div>
+
+  <div class="alert info">说明：这里显示的是客户端执行日志、文件指纹与哈希链形成的可核查证据，不等同于第三方远程证明。更高等级场景仍建议配合独立验证工具或第三方安全审计。</div>
+{% endblock %}

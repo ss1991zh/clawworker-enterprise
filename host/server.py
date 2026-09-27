@@ -24,7 +24,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from host.admin_ui import build_admin_router
 from host.llm_configs import (
@@ -322,6 +322,37 @@ class NaturalDataQueryRequest(BaseModel):
     data_source_id: str
     intent: str
     operation: str = "query"
+
+
+class SecurityProofRequest(BaseModel):
+    task_id: str = ""
+    data_source_id: str = ""
+    mode: str
+    engine: str
+    input_fingerprint: str
+    output_fingerprint: str = ""
+    skill_calls: list[str] = Field(default_factory=list)
+    llm_exposure_count: int = 0
+    document_exposure_count: int = 0
+    no_structured_plaintext_to_llm: bool = False
+    created_at: str = ""
+    audit_hash: str
+    chain_verified: bool = False
+    verified: bool = False
+
+
+@app.post("/data/security-proofs")
+def receive_security_proof(req: SecurityProofRequest,
+                           sess=Depends(get_current_session)):
+    """接收客户端的密文计算证据摘要；不传文件、路径、密钥或业务数据。"""
+    try:
+        proof_id = data_access_store.record_compute_proof(
+            username=sess.username,
+            proof=req.model_dump(),
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+    return {"ok": True, "proof_id": proof_id}
 
 
 @app.post("/data/query/plan")

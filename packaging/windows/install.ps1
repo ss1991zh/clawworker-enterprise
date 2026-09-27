@@ -190,8 +190,11 @@ if ($Role -eq "admin" -or $Role -eq "both") {
             throw "Microsoft VC++ 运行库安装失败(退出码 $($vcInstall.ExitCode))。"
         }
         Write-Host "安装 SQL Server ODBC Driver 18..." -ForegroundColor Yellow
+        # Start-Process 会把 ArgumentList 拼成命令行；MSI 位于包含空格的安装目录时，
+        # 必须显式为 /i 后的路径加引号，否则 msiexec 会返回 1639（命令行无效）。
+        $quotedOdbcInstaller = '"' + $SqlServerOdbcInstaller + '"'
         $odbcInstall = Start-Process -FilePath "msiexec.exe" -Wait -PassThru -ArgumentList `
-            "/i",$SqlServerOdbcInstaller,"/qn","IACCEPTMSODBCSQLLICENSETERMS=YES","ADDLOCAL=ALL"
+            "/i",$quotedOdbcInstaller,"/qn","IACCEPTMSODBCSQLLICENSETERMS=YES","ADDLOCAL=ALL"
         if ($odbcInstall.ExitCode -ne 0 -and $odbcInstall.ExitCode -ne 3010) {
             throw "SQL Server ODBC Driver 18 安装失败(退出码 $($odbcInstall.ExitCode))。"
         }

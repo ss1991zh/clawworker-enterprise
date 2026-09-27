@@ -1,7 +1,7 @@
 /* Skill 上传、查看和自定义指标管理。 */
 (function initClawSkillsUI(global) {
   "use strict";
-  function create({ state, api, $, esc, title }) {
+  function create({ state, api, $, esc, ui, title }) {
   async function renderSkillsTab() {
     $("modalBody").innerHTML = `
       <h2>${title("skills")}</h2>
@@ -148,7 +148,7 @@
       showSkillMd(b.dataset.viewMd);
     }));
     box.querySelectorAll("[data-del-md]").forEach(b => b.addEventListener("click", async () => {
-      if (!confirm("删除这个技能?")) return;
+      if (!await ui.confirm("删除后，这项技能将不再参与后续分析。", { title: "删除这个技能？", danger: true, confirmText: "确认删除" })) return;
       try {
         await api("DELETE", `/api/skills/md/${encodeURIComponent(b.dataset.delMd)}`);
         await loadSkills();
@@ -220,7 +220,7 @@
       </div>
     `).join("");
     box.querySelectorAll("[data-del-skill]").forEach(b => b.addEventListener("click", async () => {
-      if (!confirm("删除这个自定义指标?")) return;
+      if (!await ui.confirm("删除后，这项企业指标及其公式将无法恢复。", { title: "删除这个自定义指标？", danger: true, confirmText: "确认删除" })) return;
       try {
         await api("DELETE", `/api/skills/${encodeURIComponent(b.dataset.delSkill)}`);
         await loadSkills();

@@ -56,6 +56,40 @@ def build_data_usage_router(*, templates, data_source_store, data_access_store,
     return router
 
 
+def build_security_audit_router(*, templates, data_source_store, data_access_store,
+                                user_manager,
+                                pop_messages: Callable[[Request], list]) -> APIRouter:
+    """管理端查看客户端回传的密文计算证据元数据。"""
+    router = APIRouter(prefix="/security-audit")
+
+    @router.get("", response_class=HTMLResponse)
+    def security_audit_list(request: Request, username: str = ""):
+        sources = data_source_store.list_all() if data_source_store else []
+        source_names = {source.id: source.name for source in sources}
+        proofs = data_access_store.list_compute_proofs(
+            500, username=username.strip(),
+        ) if data_access_store else []
+        for proof in proofs:
+            proof["source_name"] = source_names.get(
+                proof.get("data_source_id"),
+                proof.get("data_source_id") or "本地加密文件",
+            )
+        return templates.TemplateResponse(
+            request, "security_audit.html",
+            {
+                "active": "security_audit",
+                "proofs": proofs,
+                "summary": data_access_store.compute_proof_summary()
+                if data_access_store else {},
+                "users": sorted(user_manager._accounts.keys()),
+                "filters": {"username": username},
+                "messages": pop_messages(request),
+            },
+        )
+
+    return router
+
+
 def build_ops_router(*, templates, pop_messages: Callable[[Request], list]) -> APIRouter:
     router = APIRouter(prefix="/ops")
 

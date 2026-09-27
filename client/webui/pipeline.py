@@ -17,6 +17,7 @@ v2 客户端分析 pipeline — 无 LangGraph,单层函数。
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import threading
 from pathlib import Path
@@ -601,6 +602,11 @@ def _run_codegen_path(
             else:
                 from_cache = True
                 log("think", "定时任务 · 复用首次固化的分析代码(每次运行结构保持一致)")
+                try:
+                    from client.he_ops import audit as _audit
+                    _audit.record_llm_bypass(purpose="fixed_code_reuse")
+                except Exception:  # noqa: BLE001
+                    pass
 
     if not from_cache:
         # 1) 意图路由选 SKILL.md
@@ -766,6 +772,11 @@ def _run_codegen_path(
     except Exception as e:
         log("error", f"密文加载失败:{e} · 回退固化 skill")
         return None
+    encrypted_columns = [str(c) for c in getattr(cdf, "columns", [])]
+    log(
+        "cipher",
+        f"密文数据已载入 · {len(encrypted_columns)} 个加密数值字段 · 数值未发送给大模型",
+    )
 
     # 4.5) 明文小样本校验(建议式):用按 schema 合成的几行随机数据先跑一遍同样的密态链路,
     #       几毫秒抓出列名错/崩溃/无产出等;硬失败→把错误反馈 LLM 重生成一次;**不硬拦**
@@ -798,13 +809,15 @@ def _run_codegen_path(
         except Exception as e:  # noqa: BLE001 —— 校验器自身异常绝不拖垮主流程
             log("think", f"小样本校验跳过(校验器异常:{type(e).__name__})")
 
-    # 5) 受限执行(decrypt 首次触发解密授权)
-    log("call", "受限执行生成代码 · 密态计算")
+    # 5) 受限执行。底层密文算子与本机受控解密都会通过 on_operation
+    # 实时回报，前端展示真实发生的运算，不再只显示笼统的“密态计算”。
+    log("compute", "开始执行加密数据分析 · 正在跟踪实际运算")
     try:
         results = codegen_mod.run_generated_code(
             code, cdf=cdf,
             metadata_rows=metadata_rows, metadata_columns=metadata_columns,
             prompt_decrypt=exec_prompt_decrypt, should_cancel=chk,
+            on_operation=lambda label: log("compute", label),
         )
     except codegen_mod.CodegenCancelled:
         log("error", "已停止 · 用户取消")
@@ -1016,8 +1029,19 @@ def _run_codegen_path(
     return _build_done_files(decision, results, cipher_path, excel_stem, ["codegen"], clean, log)
 
 
+def _sha256_file(path: Optional[Path]) -> str:
+    """流式计算文件指纹；证据只保存摘要，不保存路径或文件内容。"""
+    if path is None or not path.exists() or not path.is_file():
+        return ""
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def ask(**kwargs) -> dict:
-    """外层入口:重置本次 token 累计,跑完后把总用量注入 result["tokens"]。"""
+    """外层入口:累计 token，并为真正完成的密文任务生成可核验审计证据。"""
     _usage_reset()
     try:
         result = _ask_impl(**kwargs)
@@ -1027,6 +1051,34 @@ def ask(**kwargs) -> dict:
                             "请把问题拆小、明确要什么指标后重试。")}
     if isinstance(result, dict):
         result.setdefault("tokens", _usage_total())
+        cipher_path = kwargs.get("cipher_path")
+        completed_cipher_work = (
+            result.get("status") in ("done", "encrypted_pending")
+            and bool(result.get("skill_calls"))
+            and isinstance(cipher_path, Path)
+            and cipher_path.exists()
+        )
+        if completed_cipher_work:
+            try:
+                from client.he_ops import audit as _audit
+
+                output_path = result.get("enc_excel_path") or ""
+                # 极少数“保留源密文”路径沿用 excel_path 字段；只有没有明文输出名时才
+                # 将它作为密文输出取指纹，避免误把解密结果计入密文证据。
+                if not output_path and not result.get("excel_name"):
+                    output_path = result.get("excel_path") or ""
+                proof = _audit.record_cipher_computation(
+                    run_id=str(kwargs.get("run_id") or ""),
+                    input_fingerprint=_sha256_file(cipher_path),
+                    output_fingerprint=_sha256_file(Path(output_path)) if output_path else "",
+                    skill_calls=list(result.get("skill_calls") or []),
+                    user=str(kwargs.get("audit_user") or "") or None,
+                    session_id=str(kwargs.get("audit_session") or "") or None,
+                )
+                if proof:
+                    result["security_proof"] = proof
+            except Exception:  # noqa: BLE001 —— 证据生成失败不应吞掉已经完成的分析结果
+                pass
     return result
 
 
@@ -1049,6 +1101,7 @@ def _ask_impl(
     web_search: bool = False,
     audit_user: str = "",
     audit_session: str = "",
+    audit_message: str = "",
 ) -> dict:
     """
     跑一次完整分析。返回:
@@ -1066,7 +1119,7 @@ def _ask_impl(
     # 可信审计:设请求作用域上下文(user, session),供各埋点记录(不层层穿参)
     try:
         from client.he_ops import audit as _audit
-        _audit.set_context(audit_user, audit_session or run_id)
+        _audit.set_context(audit_user, audit_session or run_id, audit_message)
     except Exception:  # noqa: BLE001
         pass
 
@@ -1245,6 +1298,12 @@ def _ask_impl(
     # 3) 调 LLM 拿 plan
     log("call", "调用 LLM 生成 skill_calls 计划")
     try:
+        # 固化 skill 规划同样只把 schema/字段名发给模型，并写入本轮审计证据。
+        try:
+            from client.he_ops import audit as _audit
+            _audit.record_llm_exposure(schema, effective_query, purpose="skill_plan")
+        except Exception:  # noqa: BLE001
+            pass
         _ck()
         plan, summary_raw = call_llm_for_plan(
             host_url, token, system_prompt, effective_query, schema,

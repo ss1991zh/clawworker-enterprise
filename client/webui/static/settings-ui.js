@@ -1,7 +1,7 @@
 /* 连接设置中的密钥、审计和账户页面。 */
 (function initClawSettingsUI(global) {
   "use strict";
-  function create({ api, $, esc, title }) {
+  function create({ api, $, esc, ui, title }) {
   async function renderKeysTab() {
     const k = await api("GET", "/api/keys");
     const sizeKb = (p) => p ? "(已沙盒化)" : "—";
@@ -126,6 +126,7 @@
       return;
     }
     const s = data.summary || {};
+    const chain = data.chain || {};
     const events = (data.events || []).slice().reverse();
     $("modalBody").innerHTML = `
       <h2>可信审计</h2>
@@ -133,11 +134,13 @@
       <div class="alert-box ${s.zero_plaintext_holds ? "success" : ""}">${esc(s.statement || "暂无审计记录 —— 跑一次分析后这里会有台账。")}</div>
       <div class="key-row"><div class="key-meta af-s">
         LLM 暴露事件 <strong>${s.llm_exposures || 0}</strong> ·
+        密文计算 <strong>${s.cipher_computations || 0}</strong> ·
         文档正文发送 <strong>${s.document_exposures || 0}</strong> ·
         解密授权 <strong>${s.decrypt_authorizations || 0}</strong>
         (授权 ${s.decrypt_granted || 0} / 拒绝或保留密文 ${s.decrypt_denied || 0}) ·
         疑似明文外发 <strong>${s.plaintext_breaches || 0}</strong>
       </div></div>
+      <div class="alert-box ${chain.ok ? "success" : ""}">${chain.ok ? `✓ 审计哈希链完整 · ${chain.total || 0} 条事件可核对` : `⚠ 审计链需要复核：${esc(chain.reason || "未知原因")}`}</div>
       <h3 class="keys-h3">最近事件</h3>
       <div>${events.length ? events.map(renderAuditEvent).join("") : '<div class="af-s">暂无记录。</div>'}</div>
       <div style="margin-top:12px;"><button class="btn-primary" id="auditExportBtn">导出合规报告(Word)</button></div>
@@ -173,6 +176,21 @@
       return `<div class="key-row"><div class="key-meta">
         <span class="badge warn">已确认发送</span>
         <span class="mono-tag">文档</span> <span class="af-s">${ts} · ${esc(names)} · ${e.total_chars || 0} 字</span>
+      </div></div>`;
+    }
+    if (e.type === "llm_bypass") {
+      return `<div class="key-row"><div class="key-meta">
+        <span class="badge ok">未调用模型</span>
+        <span class="mono-tag">本地</span> <span class="af-s">${ts} · 复用已固化的本地分析代码</span>
+      </div></div>`;
+    }
+    if (e.type === "cipher_compute") {
+      const ok = e.no_structured_plaintext_to_llm;
+      const fp = String(e.input_fingerprint || "");
+      const shortFp = fp ? `${fp.slice(0, 12)}…${fp.slice(-8)}` : "无指纹";
+      return `<div class="key-row"><div class="key-meta">
+        <span class="badge ${ok ? "ok" : "warn"}">${ok ? "密文计算" : "待复核"}</span>
+        <span class="mono-tag">证据</span> <span class="af-s">${ts} · ${esc(e.engine || "ZFHE")} · 输入 ${esc(shortFp)} · ${(e.skill_calls || []).map(item => esc(item)).join("、")}</span>
       </div></div>`;
     }
     return "";
@@ -223,7 +241,7 @@
       <button class="btn-danger" id="logoutBtn" style="margin-top:16px;">退出登录</button>
     `;
     $("logoutBtn").addEventListener("click", async () => {
-      if (!confirm("退出登录?当前会话会保留,下次登录后仍可看到。")) return;
+      if (!await ui.confirm("当前会话会保留，下次登录后仍可继续查看。", { title: "退出登录？", confirmText: "退出" })) return;
       await api("POST", "/logout");
       window.location = "/login";
     });

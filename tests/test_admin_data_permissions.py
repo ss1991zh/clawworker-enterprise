@@ -274,3 +274,56 @@ def test_redact_audit_sql_handles_escaped_quotes():
     assert "O''Brien" not in redacted
     assert "98.5" not in redacted
     assert "name='***'" in redacted
+
+
+def test_compute_proof_store_deduplicates_and_exposes_summary(tmp_path):
+    access = DataAccessStore(tmp_path / "control.db", harden=lambda path: True)
+    proof = {
+        "audit_hash": "a" * 64,
+        "input_fingerprint": "b" * 64,
+        "output_fingerprint": "c" * 64,
+        "mode": "homomorphic_ciphertext",
+        "engine": "ZFHE",
+        "task_id": "task-1",
+        "skill_calls": ["codegen"],
+        "llm_exposure_count": 1,
+        "no_structured_plaintext_to_llm": True,
+        "chain_verified": True,
+        "verified": True,
+    }
+    first = access.record_compute_proof(username="alice", proof=proof)
+    second = access.record_compute_proof(username="alice", proof=proof)
+
+    assert first == second
+    rows = access.list_compute_proofs()
+    assert len(rows) == 1
+    assert rows[0]["skill_calls"] == ["codegen"]
+    assert access.compute_proof_summary() == {
+        "total": 1, "verified": 1, "zero_plaintext": 1, "users": 1,
+    }
+
+
+def test_admin_security_audit_page_shows_proof_without_business_data(tmp_path):
+    client, source, access = setup_admin(tmp_path)
+    access.record_compute_proof(username="alice", proof={
+        "audit_hash": "d" * 64,
+        "input_fingerprint": "e" * 64,
+        "output_fingerprint": "f" * 64,
+        "data_source_id": source.id,
+        "mode": "homomorphic_ciphertext",
+        "engine": "ZFHE",
+        "task_id": "task-2",
+        "skill_calls": ["finance"],
+        "llm_exposure_count": 1,
+        "no_structured_plaintext_to_llm": True,
+        "chain_verified": True,
+        "verified": True,
+    })
+
+    page = client.get("/admin/security-audit?username=alice")
+    assert page.status_code == 200
+    assert "密文计算审计" in page.text
+    assert "密文计算已验证" in page.text
+    assert "ERP" in page.text
+    assert "task-2" in page.text
+    assert "CUSTOMER-SECRET-ROW-VALUE" not in page.text

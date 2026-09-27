@@ -896,6 +896,8 @@ app.include_router(build_database_router(
 ))
 app.include_router(build_files_router(
     storage=_storage,
+    ingest_plaintext_path=_ingest_plaintext_path,
+    extract_text=text_extract.extract,
     is_logged_in=_is_logged_in,
     need_login=_need_login,
 ))
@@ -1313,6 +1315,7 @@ def _run_pipeline(
             web_search=web_search,
             audit_user=_session_state.get("username", ""),
             audit_session=sid,
+            audit_message=asst_mid,
         )
     except Exception as e:
         _sessions.update_message(
@@ -1333,6 +1336,18 @@ def _run_pipeline(
             _decrypt_events.pop(asst_mid, None)
 
     status = result.get("status", "failed")
+    security_proof = dict(result.get("security_proof") or {})
+    if security_proof:
+        security_proof["data_source_id"] = database_source_id
+        # 管理端只接收任务元数据和 SHA-256 指纹，不接收路径、密文内容或业务数据。
+        try:
+            _host_client.request_json(
+                "POST", "/data/security-proofs",
+                json_body=security_proof, timeout=5,
+            )
+            security_proof["host_recorded"] = True
+        except Exception:  # noqa: BLE001 —— 管理端暂时不可达不影响本地结果和本地审计链
+            security_proof["host_recorded"] = False
     if status == "needs_cipher":
         _sessions.update_message(
             sid, asst_mid, status="needs_cipher",
@@ -1347,6 +1362,7 @@ def _run_pipeline(
             error="",
             skill_calls=result.get("skill_calls", []),
             used_cipher=used_cipher,
+            security_proof=security_proof,
             duration_sec=round(time.time() - t0, 2),
         )
         return
@@ -1394,6 +1410,7 @@ def _run_pipeline(
             summary=run_summary,
             skill_calls=result.get("skill_calls", []),
             used_cipher=used_cipher,
+            security_proof=security_proof,
             duration_sec=round(time.time() - t0, 2),
             tokens=int(result.get("tokens", 0) or 0),
         )
@@ -1414,6 +1431,7 @@ def _run_pipeline(
         dec_stem=result.get("dec_stem", ""),
         skill_calls=result.get("skill_calls", []),
         used_cipher=used_cipher,
+        security_proof=security_proof,
         duration_sec=round(time.time() - t0, 2),
         tokens=int(result.get("tokens", 0) or 0),
     )

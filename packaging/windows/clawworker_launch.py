@@ -127,6 +127,10 @@ def _show_error(label: str, svc: str) -> None:
 def _start_supervisor(project_dir: Path, svc: str) -> None:
     """后台、无窗口、脱离父进程地拉起 supervisor,只托管指定角色。"""
     env = {**os.environ, "AGENT_BACKEND": "real", "CLAWWORKER_MANAGED_SERVICES": svc}
+    # 客户端有独立的守护与状态文件。不能再复用管理端 supervisor.py，
+    # 否则分离安装在同一台电脑时，先启动的管理端会从自己的安装目录拉起
+    # :8444，桌面快捷方式随后只会打开那份旧页面，看起来像“没有更新”。
+    supervisor_name = "client_supervisor.py" if svc == "client" else "supervisor.py"
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     logf = SUPERVISOR_LOG.open("a", encoding="utf-8")
     kwargs = dict(cwd=str(project_dir), env=env,
@@ -138,7 +142,7 @@ def _start_supervisor(project_dir: Path, svc: str) -> None:
     else:
         kwargs["start_new_session"] = True
     try:
-        subprocess.Popen([sys.executable, str(project_dir / "supervisor.py")], **kwargs)
+        subprocess.Popen([sys.executable, str(project_dir / supervisor_name)], **kwargs)
     finally:
         logf.close()
 

@@ -2,7 +2,7 @@
 (function initClawTasksUI(global) {
   "use strict";
   function create({
-    state, api, $, esc, FOLDER_ICON_SVG, title, loadSessions, selectSession,
+    state, api, $, esc, ui, FOLDER_ICON_SVG, title, loadSessions, selectSession,
     setSessionView, closeModal, renderSessionList, updateSessionChrome,
     syncFooter, renderMessage, showWelcome,
   }) {
@@ -131,7 +131,7 @@
         try {
           const r = await api("POST", "/api/pick_folder", {});
           if (!r.cancelled && r.path) { s.source_folder = r.path; $("wizFolderPath").textContent = r.path; }
-        } catch (e) { alert("选择失败:" + e.message); }
+        } catch (e) { await ui.alert("选择失败：" + e.message, { title: "无法选择文件夹", kind: "danger" }); }
       });
     } else if (w.stepKey === "output") {
       body.innerHTML = `
@@ -146,7 +146,7 @@
         try {
           const r = await api("POST", "/api/pick_folder", {});
           if (!r.cancelled && r.path) { s.output_folder = r.path; $("wizOutPath").textContent = r.path; }
-        } catch (e) { alert("选择失败:" + e.message); }
+        } catch (e) { await ui.alert("选择失败：" + e.message, { title: "无法选择文件夹", kind: "danger" }); }
       });
     } else if (w.stepKey === "confirm") {
       if (!s.name) s.name = (s.question || "定时任务").slice(0, 8);
@@ -184,11 +184,11 @@
     const s = w.slots;
     // 校验当前步
     if (w.stepKey === "question" && !_meaningfulTask(s.question))
-      return alert("请输入明确的问题/指令,例如「按大区统计本月回款率 TOP10」(不能只填「1」之类)");
-    if (w.stepKey === "schedule" && !s.cron) return alert("排程没识别成功 · 换个写法,如「每天早上9点」");
+      return ui.alert("请输入明确的问题或指令，例如“按大区统计本月回款率 TOP10”。", { title: "任务描述不够清楚" });
+    if (w.stepKey === "schedule" && !s.cron) return ui.alert("请换一种写法，例如“每天早上 9 点”。", { title: "未识别到执行时间" });
     if (w.stepKey === "data") {
-      if (s.data_source === "folder" && !s.source_folder) return alert("请选择数据文件夹");
-      if (s.data_source === "cipher" && !s.cipher_path) return alert("请选择一份已加密文件");
+      if (s.data_source === "folder" && !s.source_folder) return ui.alert("请先选择数据文件夹。", { title: "还缺少数据来源" });
+      if (s.data_source === "cipher" && !s.cipher_path) return ui.alert("请先选择一份已加密文件。", { title: "还缺少数据来源" });
     }
     const steps = wizActiveSteps();
     const idx = steps.indexOf(w.stepKey);
@@ -215,7 +215,7 @@
       created = true;
     } catch (e) {
       if (btn) { btn.disabled = false; btn.textContent = "创建任务"; }
-      alert("创建失败:" + e.message);
+      await ui.alert("创建失败：" + e.message, { title: "定时任务未创建", kind: "danger" });
       return;
     }
     // 创建已成功 —— 把触发这次向导的消息卡标记为「创建完成」(持久化 + 本地重渲)
@@ -239,10 +239,7 @@
   }
 
   function toast(msg) {
-    let t = $("cwToast");
-    if (!t) { t = document.createElement("div"); t.id = "cwToast"; t.className = "cw-toast"; document.body.appendChild(t); }
-    t.textContent = msg; t.classList.add("show");
-    clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 3200);
+    return ui.toast(msg);
   }
 
   async function renderTasksTab() {
@@ -632,7 +629,7 @@
       await loadTasksData(); renderTaskList();
     }));
     box.querySelectorAll("[data-del]").forEach(b => b.addEventListener("click", async () => {
-      if (!confirm("删除这个定时任务?")) return;
+      if (!await ui.confirm("任务、关联会话和运行历史将一并清除。", { title: "删除这个定时任务？", danger: true, confirmText: "确认删除" })) return;
       await api("DELETE", `/api/scheduled_tasks/${b.dataset.del}`);
       await loadTasksData(); renderTaskList();
     }));
@@ -713,6 +710,12 @@
   function _tpBody() { return _tpHost === "overview" ? $("ovBody") : $("taskPanelBody"); }
   function _tpTabs() { return _tpHost === "overview" ? $("ovTabs") : $("taskPanelTabs"); }
   let _gsTimer = null;
+
+  function leaveOverview() {
+    state.ov = false;
+    clearInterval(_gsTimer);
+    _gsTimer = null;
+  }
 
   function closeTaskPanel() {
     if (_tpHost === "overview") { _tpHost = "modal"; renderOverviewList(); return; }  // 全屏内联 → 返回总概览
@@ -854,7 +857,7 @@
     $("chat").querySelectorAll("[data-ovdel]").forEach(b => b.addEventListener("click", async (e) => {
       e.stopPropagation();
       const id = b.dataset.ovdel, nm = b.dataset.name || "该任务";
-      if (!confirm(`确认删除定时任务「${nm}」?\n\n该任务、它的聊天会话与全部运行历史都会被清除,且不可恢复。`)) return;
+      if (!await ui.confirm(`“${nm}”的任务、聊天会话和全部运行历史都会被清除，且无法恢复。`, { title: "删除定时任务？", danger: true, confirmText: "确认删除" })) return;
       b.disabled = true; b.textContent = "删除中…";
       try {
         await api("DELETE", `/api/scheduled_tasks/${id}`);
@@ -929,7 +932,7 @@
       catch (e) { $("tpAlert").innerHTML = `<div class="alert-box">操作失败:${esc(e.message)}</div>`; }
     });
     $("tpDel").addEventListener("click", async () => {
-      if (!confirm(`确认删除定时任务「${t.name}」?\n\n该任务、它的聊天会话与全部运行历史都会被清除,且不可恢复。`)) return;
+      if (!await ui.confirm(`“${t.name}”的任务、聊天会话和全部运行历史都会被清除，且无法恢复。`, { title: "删除定时任务？", danger: true, confirmText: "确认删除" })) return;
       try {
         await api("DELETE", `/api/scheduled_tasks/${t.id}`);
         await refreshTaskCount(); await loadSessions(); refreshTasksBadge(); toast("任务已删除");
@@ -1277,7 +1280,7 @@
       submitWizard, toast, renderTasksTab, loadTasksData, scheduleText,
       renderPendingList, renderTaskList, renderTaskHistory, refreshTaskCount,
       refreshTasksBadge, closeTaskPanel, openTaskPanel, openMissedPanel,
-      openOverview, renderOverviewList, renderTaskPanel, renderTPStatus,
+      openOverview, leaveOverview, renderOverviewList, renderTaskPanel, renderTPStatus,
       renderTPPending, renderTPMissed, renderTPHistory, renderTPEdit,
       openCreateTaskForm, renderCreateTaskForm, submitCreateTask,
     };

@@ -108,7 +108,8 @@
         const card=make('section','permission-overview-card');
         const head=make('div','permission-overview-head');
         const title=make('div'); title.append(make('strong','',group.subject), make('span','pill muted',group.kind==='group'?'用户组':'个人用户'), make('span','permission-source-name',group.source));
-        const edit=make('button','btn btn-sm','调整授权'); edit.type='button'; edit.addEventListener('click',()=>{
+        const edit=make('button','btn btn-sm','调整授权'); edit.type='button'; edit.addEventListener('click',async ()=>{
+          if(form && !await allowSwitch()) return;
           const subject=document.getElementById('perm-subject'), source=document.getElementById('perm-source');
           if(subject && [...subject.options].some(item=>item.value===group.subjectValue)) subject.value=group.subjectValue;
           if(source && [...source.options].some(item=>item.value===group.sourceId)) source.value=group.sourceId;
@@ -121,7 +122,7 @@
           const info=make('div'); info.append(make('strong','permission-table-name',policy.table_name),make('span','muted',policy.schema_name));
           const allFields=policy.allowed_columns.includes('*');
           const details=make('div','permission-overview-detail',(allFields?'全部字段':`${policy.allowed_columns.length} 个字段`)+' · '+policy.operations.map(op=>opNames[op]||op).join('、'));
-          const revoke=document.createElement('form'); revoke.method='post'; revoke.action=policy.subject_kind==='group'?`/admin/data-permissions/group-policies/${policy.id}/revoke`:`/admin/data-permissions/${policy.id}/revoke`; revoke.addEventListener('submit',event=>{if(!confirm(`撤销 ${policy.table_name} 的访问权限？`)) event.preventDefault();});
+          const revoke=document.createElement('form'); revoke.method='post'; revoke.action=policy.subject_kind==='group'?`/admin/data-permissions/group-policies/${policy.id}/revoke`:`/admin/data-permissions/${policy.id}/revoke`; revoke.dataset.confirm=`撤销 ${policy.table_name} 的访问权限？`;
           const button=make('button','btn btn-danger btn-sm','撤销'); button.type='submit'; revoke.append(button);
           row.append(info,details,revoke); rows.append(row);
         });
@@ -134,6 +135,20 @@
     const subject=document.getElementById('perm-subject'), source=document.getElementById('perm-source'), search=document.getElementById('perm-search'), subjectSearch=document.getElementById('perm-subject-search');
     const list=document.getElementById('permission-table-list'), empty=document.getElementById('permission-empty-search');
     const state=new Map();
+    let savedSelection = '', saving = false;
+    function selectionSignature() {
+      return JSON.stringify({tables:[...state].map(([key,item])=>[key,item.selected,item.mode,[...item.columns].sort()]),
+        operations:[...form.querySelectorAll('input[name="operations"]:checked')].map(input=>input.value),
+        maxRows:document.getElementById('perm-max-rows').value});
+    }
+    function hasChanges(){return !!savedSelection && savedSelection!==selectionSignature();}
+    async function allowSwitch(){
+      return !hasChanges() || await window.adminConfirm('当前表、字段或使用方式的修改还没有保存。切换后会丢弃这些修改。',{title:'放弃未保存的修改？',confirmText:'放弃并切换'});
+    }
+    window.addEventListener('beforeunload',event=>{if(!saving && hasChanges()){event.preventDefault();event.returnValue='';}});
+    form.addEventListener('input',()=>{
+      document.getElementById('perm-save-button').title=hasChanges()?'有未保存的修改':'保存当前授权';
+    });
     const keyOf=(schema,table)=>`${schema}.${table}`;
     const subjectOptions=()=>[...subject.options].map(option=>({value:option.value,label:option.textContent,kind:option.dataset.kind||'user'}));
     const policyCount=(subjectValue,sourceId='')=>policies.filter(item=>item.subject_value===subjectValue&&(!sourceId||item.data_source_id===sourceId)).length;
@@ -144,7 +159,7 @@
         const button=make('button','permission-subject-item'+(item.value===subject.value?' active':'')); button.type='button'; button.dataset.value=item.value;
         const avatar=make('span','permission-subject-avatar',item.kind==='group'?'组':item.label.slice(0,1).toUpperCase());
         const info=make('span'); info.append(make('strong','',item.kind==='group'?`用户组：${item.label}`:item.label),make('small','',sourceCount(item.value)?`已授权 ${sourceCount(item.value)} 个数据库 · ${policyCount(item.value)} 张表`:'尚未授权数据库'));
-        button.append(avatar,info); button.addEventListener('click',()=>{subject.value=item.value; renderSubjects(); renderSources(); loadSelection();});
+        button.append(avatar,info); button.addEventListener('click',async ()=>{if(item.value===subject.value || !await allowSwitch()) return; subject.value=item.value; renderSubjects(); renderSources(); loadSelection();});
         document.getElementById('perm-subject-list').append(button);
       });
     }
@@ -157,7 +172,7 @@
         const count=policyCount(subject.value,item.id), button=make('button','permission-source-card'+(item.id===source.value?' active':'')); button.type='button';
         const icon=make('span','permission-source-icon','DB'); const info=make('span'); info.append(make('strong','',item.name),make('small','',count?`已授权 ${count} 张表`:'未授权'));
         const status=make('em',count?'configured':'',count?'已配置':'可配置'); button.append(icon,info,status);
-        button.addEventListener('click',()=>{source.value=item.id; renderSources(); loadSelection();}); pane.append(button);
+        button.addEventListener('click',async ()=>{if(item.id===source.value || !await allowSwitch()) return; source.value=item.id; renderSources(); loadSelection();}); pane.append(button);
       });
       const sourceLabel=source.selectedOptions[0]?.textContent||'';
       document.getElementById('perm-table-title').textContent=`配置「${sourceLabel}」的表和字段`;
@@ -189,6 +204,7 @@
       document.getElementById('perm-table-title').textContent=`配置「${source.selectedOptions[0]?.textContent||''}」的表和字段`;
       document.getElementById('perm-save-button').textContent=`保存 ${subject.selectedOptions[0]?.textContent||''} · ${source.selectedOptions[0]?.textContent||''}`;
       renderTables();
+      savedSelection=selectionSignature();
     }
     function renderTables() {
       list.replaceChildren(); let visible=0;
@@ -238,7 +254,12 @@
     document.getElementById('perm-clear-visible').addEventListener('click',()=>setVisible(false));
     search.addEventListener('input',renderTables); subjectSearch.addEventListener('input',renderSubjects);
     subject.addEventListener('change',()=>{renderSubjects();renderSources();loadSelection();}); source.addEventListener('change',()=>{renderSources();loadSelection();});
-    form.addEventListener('submit',event=>{if(![...state.values()].some(item=>item.selected) && !confirm('当前没有选择任何表。保存后会撤销该对象在此数据源上的全部权限，确定继续吗？')) event.preventDefault();});
+    form.addEventListener('submit',async event=>{
+      if([...state.values()].some(item=>item.selected) || form.dataset.emptyConfirmed==='1') {saving=true;return;}
+      event.preventDefault();
+      const ok=await window.adminConfirm('当前没有选择任何表。保存后会撤销该对象在此数据源上的全部权限。',{title:'清空该数据源的全部授权？',confirmText:'确认清空'});
+      if(ok){form.dataset.emptyConfirmed='1';form.requestSubmit();}
+    });
     renderSubjects(); renderSources(); loadSelection();
   })();
   </script>

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Clawworker 桌面助手</title>
+<style>
+*{box-sizing:border-box}html,body{margin:0;background:transparent;overflow:hidden;font-family:"Segoe UI","Microsoft YaHei",sans-serif;user-select:none}
+.pet{width:220px;height:204px;position:relative;padding-top:8px}.lobster{display:block;width:160px;height:104px;margin:0 auto -4px;image-rendering:pixelated;filter:drop-shadow(0 4px 0 #0c24472b)}
+.panel{width:184px;margin:auto;position:relative;background:#12243af5;border:1px solid #355574;border-radius:12px;padding:10px 12px 11px;color:#e6f4ff;box-shadow:0 5px 12px #07152624}
+.heading{display:flex;align-items:center;gap:6px;font-size:9px;letter-spacing:1.5px;color:#85a6c5;margin-bottom:8px}.led{width:5px;height:5px;background:#74d4f0;border-radius:1px}
+.meters{display:grid;grid-template-columns:1fr 1fr;gap:12px}.meter+.meter{border-left:1px solid #33465d;padding-left:12px}.row{display:flex;align-items:baseline;justify-content:space-between;gap:5px;font-size:10px;color:#a6bed4}.value{font:600 15px "Consolas",monospace;color:#ecf8ff;font-variant-numeric:tabular-nums}
+.track{height:4px;background:#30435c;margin-top:7px;overflow:hidden;border-radius:1px}.fill{height:100%;width:0;background:#56a9ff;transition:width .6s ease}.memory .fill{background:#7cd6e9}
+.hide{position:absolute;right:7px;top:7px;border:0;background:transparent;color:#9eb7cf;width:20px;height:20px;font-size:16px;cursor:pointer;opacity:0;border-radius:4px}.pet:hover .hide,.hide:focus-visible{opacity:1}.hide:hover{background:#30435c;color:#fff}.hint{text-align:center;color:#6d859e;font-size:10px;margin-top:6px;opacity:0}.pet:hover .hint{opacity:1}
+</style>
+<div class="pet" title="拖动龙虾可移动位置">
+<svg class="lobster pywebview-drag-region" viewBox="0 0 40 26" shape-rendering="crispEdges" aria-label="蓝色像素龙虾助手" role="img">
+<!-- Compact pixel portrait: antennae, head and open pincers only. -->
+<g fill="#173a68"><path d="M12 3h2v2h2v2h2v5h-2V8h-2V6h-2zM26 3h2v3h-2v2h-2v4h-2V7h2V5h2z"/></g>
+<path fill="#15365f" d="M3 8h3v5h2V9h3v3h2v8h-2v3H6v-2H3v-3H1v-7h2zM34 8h3v3h2v7h-2v3h-3v2h-5v-3h-2v-8h2V9h3v4h2z"/>
+<path fill="#398be1" d="M3 12h2v4h4v-4h2v7H9v2H6v-2H3zM35 12h2v7h-3v2h-3v-2h-2v-7h2v4h4z"/>
+<path fill="#83d8ff" d="M3 12h2v6H3zM9 12h2v4H9zM29 12h2v4h-2zM35 12h2v6h-2z"/>
+<path fill="#2463b4" d="M10 21h6v4h-4v-2h-2zM24 21h6v2h-2v2h-4z"/>
+<path fill="#15365f" d="M15 10h10v2h3v3h2v7h-2v3H12v-3h-2v-7h2v-3h3z"/>
+<path fill="#4ca4f1" d="M15 12h10v2h3v8h-2v1H14v-1h-2v-8h3z"/>
+<path fill="#92e0ff" d="M15 12h10v2H15zM12 14h3v3h-3z"/>
+<path fill="#2a72c7" d="M14 21h12v2H14zM26 17h2v5h-2z"/>
+<path fill="#effbff" d="M14 16h4v4h-4zM22 16h4v4h-4z"/>
+<path fill="#102a48" d="M16 17h2v3h-2zM22 17h2v3h-2zM18 21h4v1h-4z"/>
+<path fill="#a0e5ff" d="M13 20h3v1h-3zM24 20h3v1h-3z"/>
+</svg>
+<div class="panel"><div class="heading pywebview-drag-region"><span class="led"></span>CLAW · SYSTEM</div>
+<button class="hide" id="hide" title="隐藏桌面助手" aria-label="隐藏桌面助手">×</button>
+<div class="meters pywebview-drag-region">
+<div class="meter"><div class="row"><span>CPU</span><span class="value" id="cpu">--%</span></div><div class="track"><div class="fill" id="cpuBar"></div></div></div>
+<div class="meter memory"><div class="row"><span>内存</span><span class="value" id="memory">--%</span></div><div class="track"><div class="fill" id="memoryBar"></div></div></div>
+</div></div><div class="hint" id="hint">本机实时使用率 · 每秒更新</div></div>
+<script>
+function paint(name, value) {
+  const valid = typeof value === 'number' && Number.isFinite(value);
+  document.getElementById(name).textContent = valid ? Math.round(value) + '%' : '--%';
+  document.getElementById(name + 'Bar').style.width = valid ? Math.max(0, Math.min(100, value)) + '%' : '0%';
+}
+async function tick() {
+  try { const m = await window.pywebview.api.companion_metrics(); paint('cpu', m.cpu); paint('memory', m.memory); document.getElementById('hint').textContent = '本机实时使用率 · 每秒更新'; }
+  catch (_) { paint('cpu', null); paint('memory', null); document.getElementById('hint').textContent = '暂时无法读取系统状态'; }
+  setTimeout(tick, 1000);
+}
+window.addEventListener('pywebviewready', tick, {once:true});
+document.getElementById('hide').addEventListener('click', async () => { await window.pywebview.api.set_companion(false); });
+</script></html>

@@ -6,10 +6,10 @@
  * - 设置 modal(连接 / 密文文件 / 同态密钥 / 账户)
  * ========================================================= */
 
-const { $, esc, mdToHtml, api } = window.ClawCore;
+const { $, esc, mdToHtml, api, ui } = window.ClawCore;
 
 const {
-  SESS_CLOCK_INLINE, FOLDER_ICON_SVG, CHECK_ICON_SVG, ICON_SVG, fileCardsHtml,
+  SESS_CLOCK_INLINE, FOLDER_ICON_SVG, CHECK_ICON_SVG, STOP_ICON_SVG, ICON_SVG, fileCardsHtml,
 } = window.ClawRenderers;
 
 // ============ 状态 ============
@@ -31,6 +31,7 @@ const state = {
   histFilter: { date: "" },
   // 运行状态:有 assistant 消息在跑时锁住发送按钮 / 变停止
   running: false,
+  submitting: false,
   runningMid: null,
   // 已经播过打字机动画的 mid(防止重渲时再次动画)
   typedMids: new Set(),
@@ -59,7 +60,7 @@ const {
   openFilesModal, closeFilesModal, renderFilesModal, loadFiles, renderFilesList,
   showFilePreview,
 } = window.ClawFilesUI.create({
-  state, api, $, esc,
+  state, api, $, esc, ui,
   pickExistingCipher: (...args) => pickExistingCipher(...args),
 });
 
@@ -67,7 +68,7 @@ const {
   renderKeysTab, renderKeycheckResult, renderAuditTab, renderAuditEvent,
   bindKeyDrop, renderAccountTab,
 } = window.ClawSettingsUI.create({
-  api, $, esc,
+  api, $, esc, ui,
   title: (key) => TABS[key].title,
 });
 
@@ -75,7 +76,7 @@ const {
   renderSkillsTab, loadSkills, bindSkillDrop, walkEntry, uploadSkillFiles,
   renderSkillMdList, showSkillMd, renderBuiltinSkills, renderCustomSkills,
 } = window.ClawSkillsUI.create({
-  state, api, $, esc,
+  state, api, $, esc, ui,
   title: (key) => TABS[key].title,
 });
 
@@ -84,11 +85,11 @@ const {
   submitWizard, toast, renderTasksTab, loadTasksData, scheduleText,
   renderPendingList, renderTaskList, renderTaskHistory, refreshTaskCount,
   refreshTasksBadge, closeTaskPanel, openTaskPanel, openMissedPanel,
-  openOverview, renderOverviewList, renderTaskPanel, renderTPStatus,
+  openOverview, leaveOverview, renderOverviewList, renderTaskPanel, renderTPStatus,
   renderTPPending, renderTPMissed, renderTPHistory, renderTPEdit,
   openCreateTaskForm, renderCreateTaskForm, submitCreateTask,
 } = window.ClawTasksUI.create({
-  state, api, $, esc, FOLDER_ICON_SVG,
+  state, api, $, esc, ui, FOLDER_ICON_SVG,
   title: (key) => TABS[key].title,
   loadSessions: (...args) => loadSessions(...args),
   selectSession: (...args) => selectSession(...args),
@@ -101,8 +102,9 @@ const {
   showWelcome: (...args) => showWelcome(...args),
 });
 
-const { runMetaHtml, renderMessage, typewriter } = window.ClawChatUI.create({
-  state, api, $, esc, mdToHtml, fileCardsHtml, ICON_SVG, CHECK_ICON_SVG,
+const { runMetaHtml, renderMessage, typewriter, computeStageIndex, stepHtml, displaySteps } = window.ClawChatUI.create({
+  restoreFailedRequest,
+  state, api, $, esc, ui, mdToHtml, fileCardsHtml, ICON_SVG, CHECK_ICON_SVG,
   SESS_CLOCK_INLINE, databaseRequestBeforeAssistant, reconnectDatabaseRequest,
   restoreDatabaseRequest, openDatabasePicker, openTaskWizard,
   pollMessage: (...args) => pollMessage(...args),
@@ -111,6 +113,28 @@ const { runMetaHtml, renderMessage, typewriter } = window.ClawChatUI.create({
 });
 
 // ============ Sidebar ============
+async function restoreFailedRequest(mid) {
+  if (state.running || state.submitting) { ui.toast("请先等待当前任务结束", "warning"); return; }
+  const messages = state.currentSession?.messages || [];
+  const index = messages.findIndex(m => m.id === mid);
+  if (index < 1) return;
+  const request = messages.slice(0, index).reverse().find(m => m.role === "user");
+  if (!request) return;
+  if ($("input").value.trim() || state.pendingCipher || state.pendingDatabase || state.pendingTexts.length) {
+    if (!await ui.confirm("输入区已有内容，是否替换为这次任务的问题和数据来源？", { title: "恢复这次任务", confirmText: "替换内容" })) return;
+  }
+  state.pendingTexts = [];
+  state.pendingCipher = null;
+  state.pendingDatabase = null;
+  $("input").value = request.content || "";
+  $("input").dispatchEvent(new Event("input"));
+  if (request.database_source_id) restoreDatabaseRequest(request);
+  else if (request.attached_cipher) state.pendingCipher = {path: request.attached_cipher, name: request.attached_cipher.split(/[\\/]/).pop(), uploading: false};
+  renderAttachChips();
+  $("input").focus();
+  ui.toast(request.text_attachment_names?.length ? "问题已恢复，请重新添加原文档，再点击发送" : "问题和数据来源已恢复，核对后点击发送");
+}
+
 async function loadSessions() {
   state.sessions = await api("GET", "/api/sessions");
   // 首次加载:把现有会话设为"已读"基线(避免一上来全标未读);之后新产生的活动才算未读
@@ -140,6 +164,71 @@ function _isUnread(s) {
 
 function isSchedSess(s) { return (s.kind === "scheduled") || (s.title || "").startsWith("⏰"); }
 
+function sessionPins() {
+  try { const value = JSON.parse(localStorage.getItem("cw_session_pins") || "[]"); return new Set(Array.isArray(value) ? value : []); }
+  catch (_) { return new Set(); }
+}
+let closeSessionMenu = () => {};
+function toggleSessionPin(sid) {
+  const pins = sessionPins();
+  if (pins.has(sid)) pins.delete(sid); else pins.add(sid);
+  localStorage.setItem("cw_session_pins", JSON.stringify([...pins]));
+  renderSessionList();
+}
+async function deleteSessionFromMenu(sid) {
+  const session = state.sessions.find(s => s.id === sid);
+  if (!session) return;
+  const scheduled = isSchedSess(session);
+  const message = scheduled
+    ? "从列表移除这个定时任务会话？任务仍会继续运行，可从任务的「查看会话」找回。"
+    : "删除这个会话？其消息记录会一并丢失。";
+  if (!await ui.confirm(message, { danger: !scheduled, confirmText: scheduled ? "从列表移除" : "删除会话" })) return;
+  await api("DELETE", `/api/sessions/${sid}`);
+  if (sid === state.currentSid) {
+    state.currentSid = null; state.currentSession = null;
+    showWelcome();
+  }
+  await loadSessions();
+}
+function openSessionMenu(event, sid) {
+  event.preventDefault();
+  closeSessionMenu();
+  const session = state.sessions.find(s => s.id === sid);
+  if (!session) return;
+  const menu = document.createElement("div");
+  menu.className = "session-menu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = `<button type="button" role="menuitem" data-action="rename">重命名</button><button type="button" role="menuitem" data-action="pin">${sessionPins().has(sid) ? "取消置顶" : "置顶"}</button><button type="button" role="menuitem" data-action="delete">删除</button>`;
+  document.body.appendChild(menu);
+  menu.style.left = Math.max(8, Math.min(event.clientX, window.innerWidth - menu.offsetWidth - 8)) + "px";
+  menu.style.top = Math.max(8, Math.min(event.clientY, window.innerHeight - menu.offsetHeight - 8)) + "px";
+  const controller = new AbortController();
+  closeSessionMenu = () => { controller.abort(); menu.remove(); };
+  document.addEventListener("pointerdown", e => { if (!menu.contains(e.target)) closeSessionMenu(); }, { signal: controller.signal });
+  document.addEventListener("keydown", e => { if (e.key === "Escape") closeSessionMenu(); }, { signal: controller.signal });
+  window.addEventListener("resize", closeSessionMenu, { signal: controller.signal });
+  menu.addEventListener("click", async e => {
+    const action = e.target.closest("button")?.dataset.action;
+    if (!action) return;
+    closeSessionMenu();
+    try {
+      if (action === "rename") {
+        const title = await ui.prompt("输入会话名称", session.title || "", { title: "重命名会话" });
+        if (title === null || title === undefined) return;
+        if (!title.trim()) { ui.toast("会话名称不能为空"); return; }
+        await api("POST", `/api/sessions/${sid}/title`, { title: title.trim().slice(0, 100) });
+        if (state.currentSession?.id === sid) state.currentSession.title = title.trim().slice(0, 100);
+        await loadSessions();
+      } else if (action === "delete") await deleteSessionFromMenu(sid);
+      else if (action === "pin") toggleSessionPin(sid);
+    } catch (error) { ui.toast("操作失败：" + error.message, "error"); }
+  });
+  // 鼠标打开菜单不默认选中第一项；键盘打开时保留可访问的焦点入口。
+  if (event.button !== 2 && event.clientX === 0 && event.clientY === 0) {
+    menu.querySelector("button").focus();
+  }
+}
+
 function renderSessionList() {
   const el = $("sessionList");
   const SESS_CLOCK_SVG = `<svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>`;
@@ -157,6 +246,8 @@ function renderSessionList() {
   });
 
   const list = view === "scheduled" ? sched : normal;
+  const pins = sessionPins();
+  list.sort((a, b) => Number(pins.has(b.id)) - Number(pins.has(a.id)));
   if (!list.length) {
     el.innerHTML = view === "scheduled"
       ? '<div class="session-empty">还没有定时任务会话<br>点上方「定时任务管理」,在任务上点「查看会话」即可在此打开</div>'
@@ -177,36 +268,29 @@ function renderSessionList() {
       <span class="session__title">${esc(title)}</span>
       ${missed ? `<span class="sess-missed" title="有 ${s.missed_count} 次漏跑待处理"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg></span>` : ''}
       ${unread ? '<span class="sess-unread" title="有新消息"></span>' : ''}
-      <button class="session__del" data-del="${s.id}" title="删除会话">
-        <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6"/>
-        </svg>
-      </button>
+      <button type="button" class="session-tool" data-session-more title="更多操作" aria-label="更多操作" aria-haspopup="menu"><svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="5" cy="12" r="1.7"/><circle cx="12" cy="12" r="1.7"/><circle cx="19" cy="12" r="1.7"/></svg></button>
+      <button type="button" class="session-tool${pins.has(s.id) ? ' pinned' : ''}" data-session-pin title="${pins.has(s.id) ? '取消置顶' : '置顶'}" aria-label="${pins.has(s.id) ? '取消置顶' : '置顶'}" aria-pressed="${pins.has(s.id)}"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 3h6l-1 7 4 4H6l4-4-1-7ZM12 14v7"/></svg></button>
     </div>`;
   };
   el.innerHTML = list.map(oneItem).join("");
   el.querySelectorAll(".session").forEach(node => {
+    node.addEventListener("contextmenu", e => openSessionMenu(e, node.dataset.id));
     node.addEventListener("click", e => {
-      if (e.target.closest("[data-del]")) return;
+      if (e.target.closest(".session-tool")) return;
       selectSession(node.dataset.id);
     });
   });
-  el.querySelectorAll("[data-del]").forEach(b => {
-    b.addEventListener("click", async e => {
+  el.querySelectorAll(".session-tool").forEach(b => {
+    b.addEventListener("click", e => {
       e.stopPropagation();
-      const sid = b.dataset.del;
-      const s = (state.sessions || []).find(x => x.id === sid) || {};
-      const isSched = isSchedSess(s);
-      const msg = isSched
-        ? "从列表移除这个定时任务会话?\n\n任务会继续运行,历次运行内容不会丢失;点该任务的「查看会话」可随时找回。"
-        : "删除这个会话?其消息记录会一并丢失。";
-      if (!confirm(msg)) return;
-      await api("DELETE", `/api/sessions/${sid}`);
-      if (sid === state.currentSid) {
-        state.currentSid = null; state.currentSession = null;
-        showWelcome();
+      const sid = b.closest(".session").dataset.id;
+      if (b.hasAttribute("data-session-more")) {
+        const rect = b.getBoundingClientRect();
+        openSessionMenu({ preventDefault() {}, button: 2, clientX: rect.left, clientY: rect.bottom + 4 }, sid);
+      } else {
+        closeSessionMenu();
+        try { toggleSessionPin(sid); } catch (error) { ui.toast("置顶失败：" + error.message, "error"); }
       }
-      await loadSessions();
     });
   });
 }
@@ -287,7 +371,7 @@ function updateSessionChrome() {
 }
 
 async function selectSession(sid) {
-  state.ov = false; clearInterval(_gsTimer);   // 退出总概览全屏模式
+  leaveOverview();   // 退出总概览全屏模式，并由任务模块停止自己的轮询器
   try { localStorage.removeItem("cw_ov"); } catch (e) {}
   // 选中的若是定时任务会话,自动切到「定时任务」视图,使其在侧栏可见
   const meta = (state.sessions || []).find(x => x.id === sid);
@@ -327,7 +411,7 @@ async function selectSession(sid) {
 
 // ============ Chat 渲染 ============
 function showWelcome() {
-  state.ov = false; clearInterval(_gsTimer);
+  leaveOverview();
   try { localStorage.removeItem("cw_ov"); } catch (e) {}
   $("chat").classList.remove("ovmode");
   $("chat").innerHTML = "";
@@ -428,10 +512,19 @@ function pollMessage(sid, mid) {
   state.pollingMids.add(mid);
   const since = Date.now();
   // 逐条亮出(自愈式):始终按「DOM 已显示条数」从服务端最新 steps 数组取下一条,
-  // 每 230ms 一条 —— 中途整体重渲(刷新/授权浮卡)后自动对齐,不可能重复或乱序。
+  // 每步至少展示 500ms，终态等待队列；授权面板独立显示，不改变播放进度。
+  const STEP_DISPLAY_MS = 500;
+  const STAGE_DISPLAY_MS = 1500;
+  state.tracePlayback = state.tracePlayback || new Map();
+  const rememberPlayback = (count) => state.tracePlayback.set(mid, { count, stage: displayedStage });
+  let displayedStage = Number(document.querySelector(`.msg[data-mid="${mid}"] details.trace`)?.dataset?.stage || 0);
+  let stageChangedAt = Date.now();
+  let lastRevealedAt = 0;
   let latestSteps = [];
   let revealTimer = null;
   let stopped = false;
+  let polling = false;
+  let retryAfter = 0, connectionFailures = 0;
   const stepsBoxOf = () => {
     const n = document.querySelector(`.msg[data-mid="${mid}"]`);
     return n ? n.querySelector(".trace-steps") : null;
@@ -443,27 +536,41 @@ function pollMessage(sid, mid) {
       if (stopped) return;
       const box = stepsBoxOf();
       if (box && box.children.length < latestSteps.length) {
+        // 下一条属于后续阶段时等待顶部切换，不能让详细记录抢先显示。
+        const nextStage = computeStageIndex(latestSteps.slice(0, box.children.length + 1), "running");
+        if (nextStage !== displayedStage) return;
         const s = latestSteps[box.children.length];   // 永远取"下一条",以 DOM 为准
         const wasNearBottom =
           ($("main").scrollHeight - $("main").scrollTop - $("main").clientHeight) < 80;
         const div = document.createElement("div");
         div.className = `step ${s.kind || "step"}`;
-        div.textContent = s.label;
+        div.innerHTML = stepHtml(s);
         // 新亮出的这步成为"当前活跃步"(脉冲),清掉上一步的活跃态
         box.querySelectorAll(".step.active").forEach(e => e.classList.remove("active"));
         div.classList.add("active");
         box.appendChild(div);
+        rememberPlayback(box.children.length);
+        lastRevealedAt = Date.now();
         if (wasNearBottom) $("main").scrollTop = $("main").scrollHeight;
         if (box.children.length < latestSteps.length) drain();
       }
-    }, 230);
+    }, STEP_DISPLAY_MS);
   };
   const intv = setInterval(async () => {
+    if (polling || Date.now() < retryAfter) return;
+    polling = true;
     try {
       const m = await api("GET", `/api/sessions/${sid}/messages/${mid}`);
-      const node = document.querySelector(`.msg[data-mid="${mid}"]`);
+      connectionFailures = 0;
+      let node = document.querySelector(`.msg[data-mid="${mid}"]`);
       const el = node?.querySelector(".run-time");
-      if (el) el.textContent = ((Date.now() - since) / 1000).toFixed(0) + "s";
+      if (el) el.textContent = (["done", "failed", "cancelled", "needs_cipher"].includes(m.status) && Number.isFinite(m.duration_sec)
+        ? m.duration_sec : (Date.now() - since) / 1000).toFixed(0) + "s";
+      const activity = node?.querySelector(".run-status");
+      const displayedCount = node?.querySelector('.trace-steps')?.children.length || 0;
+      latestSteps = displaySteps(m.steps);
+      const hasQueuedSteps = displayedCount < latestSteps.length;
+      if (activity) activity.textContent = "执行用时";
 
       const terminal = (m.status === "done" || m.status === "failed" ||
                         m.status === "needs_cipher" || m.status === "cancelled");
@@ -471,16 +578,31 @@ function pollMessage(sid, mid) {
 
       // 出现授权门 → 主动重渲一次(把浮卡渲出来),但不终止轮询;
       // 浮卡已在则不再重渲(避免每 tick 重置折叠/滚动状态)
-      if (awaitingDecrypt && node && !node.querySelector(".decrypt-card")) {
-        const fresh = renderMessage(m);
+      const targetStage = computeStageIndex(
+        latestSteps.slice(0, displayedCount + 1),
+        !hasQueuedSteps && m.status === "done" ? "done" : "running",
+      );
+      // 阶段只逐个推进，后台快速完成时也不能从第一阶段直接跳到最后。
+      if (node && displayedStage !== targetStage && Date.now() - stageChangedAt >= STAGE_DISPLAY_MS) {
+        displayedStage = targetStage < displayedStage ? targetStage : displayedStage + 1;
+        stageChangedAt = Date.now();
+      }
+      const presentationPending = !!node && (hasQueuedSteps || Date.now() - lastRevealedAt < STEP_DISPLAY_MS
+        || displayedStage !== targetStage || Date.now() - stageChangedAt < STAGE_DISPLAY_MS);
+      if (node) rememberPlayback(displayedCount);
+      // 授权需要及时响应，不能被展示队列延后；保留现有 trace，仍按原节奏播放。
+      if (awaitingDecrypt && !presentationPending && node && !node.querySelector(".decrypt-card")) {
+        const existingTrace = node.querySelector("details.trace");
+        const fresh = renderMessage(m, { authorizationReady: true });
+        if (existingTrace) fresh.querySelector("details.trace")?.replaceWith(existingTrace);
         node.replaceWith(fresh);
-        latestSteps = m.steps || [];   // 整体重渲已含全部 step,对齐基准
+        node = fresh;
         $("main").scrollTop = $("main").scrollHeight;
       }
       const idx = state.currentSession?.messages?.findIndex(x => x.id === mid);
       if (idx >= 0) state.currentSession.messages[idx] = m;
 
-      if (terminal) {
+      if (terminal && !presentationPending) {
         if (m.status === "failed" && !state.pendingDatabase && !state.pendingCipher) {
           const request = databaseRequestBeforeAssistant(mid);
           if (request && restoreDatabaseRequest(request)) {
@@ -488,6 +610,7 @@ function pollMessage(sid, mid) {
           }
         }
         stopped = true;
+        state.tracePlayback.delete(mid);
         // 终态:完整重渲 → 折叠态、显示 summary / Excel 卡 / 错误 / 取消
         if (node) {
           const fresh = renderMessage(m);
@@ -502,7 +625,7 @@ function pollMessage(sid, mid) {
       }
 
       // running 增量:新 step 进显示队列,由 drain 逐条亮出(不一次性贴一堆)
-      const steps = m.steps || [];
+      const steps = latestSteps;
       if (node && steps.length) {
         let stepsBox = node.querySelector(".trace-steps");
         let traceDetails = node.querySelector("details.trace");
@@ -511,10 +634,10 @@ function pollMessage(sid, mid) {
           const content = node.querySelector(".msg__content");
           if (content) {
             traceDetails = document.createElement("details");
-            traceDetails.className = "trace";
+            traceDetails.className = "trace live";
             traceDetails.open = true;
             traceDetails.innerHTML =
-              `<summary class="trace-summary">计算追踪 · 运行中</summary>
+              `<summary class="trace-summary"><span class="trace-state">加密计算过程 · 实时展示</span><span class="trace-live">实时</span></summary>
                <div class="trace-steps"></div>`;
             // 插入到 run-pill 前面(若有),否则放最前
             const pill = content.querySelector(".run-pill");
@@ -522,14 +645,50 @@ function pollMessage(sid, mid) {
             stepsBox = traceDetails.querySelector(".trace-steps");
           }
         }
+        if (traceDetails) {
+          const visibleSteps = steps.slice(0, stepsBox?.children.length || 0);
+          const currentStage = displayedStage;
+          traceDetails.dataset.stage = String(currentStage);
+          const stateText = traceDetails.querySelector(".trace-state");
+          if (stateText) stateText.textContent = terminal ? "加密计算过程 · 正在展示执行记录" : "加密计算过程 · 执行中";
+          traceDetails.querySelectorAll("[data-process-stage]").forEach(stageNode => {
+            const index = Number(stageNode.dataset.processStage || 0);
+            stageNode.classList.toggle("done", index < currentStage);
+            stageNode.classList.toggle("active", index === currentStage);
+            stageNode.classList.toggle("pending", index > currentStage);
+            const number = stageNode.querySelector("span");
+            if (number) number.textContent = index < currentStage ? "✓" : String(index + 1);
+          });
+        }
         if (stepsBox) {
           latestSteps = steps;
           if (stepsBox.children.length < steps.length) drain();
         }
       }
     } catch (e) {
-      clearInterval(intv);
-      state.pollingMids.delete(mid);
+      if (e.status === 401) {
+        stopped = true;
+        clearInterval(intv);
+        if (revealTimer) clearTimeout(revealTimer);
+        state.pollingMids.delete(mid);
+        state.tracePlayback.delete(mid);
+        setRunning(false);
+        const activity = document.querySelector(`.msg[data-mid="${mid}"] .run-status`);
+        if (activity) activity.textContent = "登录已过期，请重新登录";
+        if (!state.loginExpiredNotice) {
+          state.loginExpiredNotice = true;
+          await ui.alert("登录已过期，无法继续获取任务进度。重新登录后可查看原会话；未完成的任务需要重新发送。", { title: "需要重新登录", confirmText: "前往登录" });
+          window.location.assign("/login");
+        }
+        return;
+      }
+      connectionFailures++;
+      retryAfter = Date.now() + Math.min(30000, 1500 * Math.pow(2, Math.min(connectionFailures, 5)));
+      const node = document.querySelector(`.msg[data-mid="${mid}"]`);
+      const activity = node?.querySelector(".run-status");
+      if (activity) activity.textContent = "暂时无法获取进度，正在重新连接…";
+    } finally {
+      polling = false;
     }
   }, 600);
 }
@@ -580,6 +739,7 @@ function enableComposer() {
 }
 
 async function sendMessage() {
+  if (state.submitting) return;
   // 运行中按了"停止"
   if (state.running) {
     await stopRunning();
@@ -588,16 +748,23 @@ async function sendMessage() {
 
   const text = $("input").value.trim();
   if (!text) return;
-  if (!state.currentSid) await createSession();
 
   // 还在上传 cipher / 抽文本 阻塞
   if (state.pendingCipher && state.pendingCipher.uploading) {
-    alert("等密文加密完成后再发送"); return;
+    ui.toast("文件仍在加密，请稍候", "warning"); return;
   }
   if (state.pendingTexts.some(t => t.uploading)) {
-    alert("等文本文件读取完成后再发送"); return;
+    ui.toast("文档仍在读取，请稍候", "warning"); return;
   }
 
+  state.submitting = true;
+  $("sendBtn").disabled = true;
+  try {
+    if (!state.currentSid) await createSession();
+  } catch (e) {
+    state.submitting = false; $("sendBtn").disabled = false;
+    ui.toast("无法创建会话：" + e.message, "error"); return;
+  }
   $("input").value = "";
   $("input").style.height = "auto";
 
@@ -627,6 +794,9 @@ async function sendMessage() {
     renderChat();
     setRunning(true, res.assistant_message.id);
     pollMessage(state.currentSid, res.assistant_message.id);
+    // 成功发送后退出输入状态，不再自动把光标放回输入框。
+    $("input").blur();
+    $("sendBtn").blur();
     loadSessions();
   } catch (e) {
     state.pendingCipher = attached_cipher ? {name: attached_cipher.split(/[\\/]/).pop(), path: attached_cipher, uploading: false} : null;
@@ -635,10 +805,13 @@ async function sendMessage() {
     }));
     state.pendingDatabase = database;
     renderAttachChips();
-    alert("发送失败:" + e.message);
+    if (!$("input").value.trim()) $("input").value = text;
+    await ui.alert("发送失败：" + e.message, { title: "消息未发送，问题与附件已保留", kind: "danger" });
     setRunning(false);
+    $("input").focus({ preventScroll: true });
   } finally {
-    $("input").focus();
+    state.submitting = false;
+    $("sendBtn").disabled = false;
   }
 }
 
@@ -712,7 +885,7 @@ async function handleFileAttach(filesArg) {
     } else if (TEXT_EXTS.includes(ext)) {
       await _attachTextFile(file);
     } else {
-      alert(`不支持的文件类型:.${ext}\n数据:${DATA_EXTS.join("/")}\n文本:${TEXT_EXTS.join("/")}`);
+      await ui.alert(`暂不支持 .${ext} 文件。\n数据文件：${DATA_EXTS.join(" / ")}\n文档文件：${TEXT_EXTS.join(" / ")}`, { title: "无法添加此文件" });
     }
   }
 }
@@ -739,13 +912,14 @@ async function _attachDataFile(file) {
   } catch (e) {
     state.pendingCipher = null;
     renderAttachChips();
-    alert("加密失败:" + e.message);
+    await ui.alert("加密失败：" + e.message, { title: "附件处理失败", kind: "danger" });
   }
 }
 
 async function _attachTextFile(file) {
-  const agreed = window.confirm(
+  const agreed = await ui.confirm(
     "文本附件安全提示\n\nWord、PDF、TXT 等文档正文需要发送给管理端配置的大模型，模型才能阅读其中的公式和内容。\n\nExcel、CSV 和企业数据库的数值数据仍会先在本机加密，不会发送明文数据行。\n\n是否继续添加该文档？"
+    , { title: "添加文档前请确认", confirmText: "同意并添加" }
   );
   if (!agreed) return;
   const chip = {
@@ -766,7 +940,7 @@ async function _attachTextFile(file) {
     const idx = state.pendingTexts.indexOf(chip);
     if (idx >= 0) state.pendingTexts.splice(idx, 1);
     renderAttachChips();
-    alert("文本读取失败:" + e.message);
+    await ui.alert("文本读取失败：" + e.message, { title: "附件处理失败", kind: "danger" });
   }
 }
 
@@ -968,7 +1142,11 @@ async function renderOpsTab() {
     } finally { btn.disabled = false; btn.textContent = orig; await refresh(); }
   };
   $("opsEnable").addEventListener("click", e => act("/api/ops/autostart/enable", e.target, "启用中…"));
-  $("opsDisable").addEventListener("click", e => { if (confirm("停用开机自启并停止守护?用户端会继续运行,但崩溃后不再自动重启。")) act("/api/ops/autostart/disable", e.target, "停用中…"); });
+  $("opsDisable").addEventListener("click", async e => {
+    if (await ui.confirm("停用后用户端仍会继续运行，但异常退出后不会自动恢复。", { title: "停用开机自启和守护？", danger: true, confirmText: "确认停用" })) {
+      act("/api/ops/autostart/disable", e.target, "停用中…");
+    }
+  });
   $("opsStart").addEventListener("click", e => act("/api/ops/supervisor/start", e.target, "启动中…"));
   $("opsStop").addEventListener("click", e => act("/api/ops/supervisor/stop", e.target, "停止中…"));
 }
@@ -1147,6 +1325,24 @@ function bindEvents() {
     $("scrim").classList.add("open");
   });
   $("scrim")?.addEventListener("click", () => {
+    $("sidebar").classList.remove("open");
+    $("scrim").classList.remove("open");
+  });
+
+  // 统一键盘交互：Esc 关闭最上层面板；应用内确认框自身优先处理。
+  document.addEventListener("keydown", e => {
+    if (e.key !== "Escape" || document.querySelector(".cw-dialog-mask.open")) return;
+    if (state.noticeOpen) { closeNotices(); return; }
+    const masks = Array.from(document.querySelectorAll(".modal-mask.open"));
+    const top = masks[masks.length - 1];
+    if (top) {
+      if (top.id === "modalMask") closeModal();
+      else if (top.id === "databaseMask") closeDatabasePicker();
+      else if (top.id === "filesMask") closeFilesModal();
+      else if (top.id === "taskPanelMask") closeTaskPanel();
+      else top.remove();
+      return;
+    }
     $("sidebar").classList.remove("open");
     $("scrim").classList.remove("open");
   });

@@ -214,6 +214,40 @@ def test_startup_timeout_uses_wall_clock_deadline(monkeypatch, tmp_path):
     assert 1.0 <= clock[0] < 1.5
 
 
+def test_client_starts_dedicated_supervisor(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(launcher, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "SUPERVISOR_LOG", tmp_path / "supervisor.log")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "Popen",
+        lambda argv, **kwargs: started.append((argv, kwargs)),
+    )
+
+    launcher._start_supervisor(tmp_path, "client")
+
+    argv, kwargs = started[0]
+    assert Path(argv[1]).name == "client_supervisor.py"
+    assert kwargs["env"]["CLAWWORKER_MANAGED_SERVICES"] == "client"
+
+
+def test_admin_starts_host_supervisor(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(launcher, "STATE_DIR", tmp_path)
+    monkeypatch.setattr(launcher, "SUPERVISOR_LOG", tmp_path / "supervisor.log")
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "Popen",
+        lambda argv, **kwargs: started.append((argv, kwargs)),
+    )
+
+    launcher._start_supervisor(tmp_path, "host")
+
+    argv, kwargs = started[0]
+    assert Path(argv[1]).name == "supervisor.py"
+    assert kwargs["env"]["CLAWWORKER_MANAGED_SERVICES"] == "host"
+
+
 def test_desktop_window_enables_downloads_and_persistent_storage(
     monkeypatch, tmp_path
 ):
@@ -248,7 +282,9 @@ def test_desktop_window_enables_downloads_and_persistent_storage(
     assert ok is True
     assert fake.title == "Clawworker 用户端"
     assert fake.window_kwargs["url"] == "http://127.0.0.1:8444"
-    assert fake.window_kwargs["maximized"] is True
+    assert fake.window_kwargs["maximized"] is False
+    assert fake.window_kwargs["width"] == 1180
+    assert fake.window_kwargs["height"] == 760
     assert fake.settings["ALLOW_DOWNLOADS"] is True
     assert fake.settings["ALLOW_FILE_URLS"] is False
     assert fake.start_kwargs["gui"] == "edgechromium"

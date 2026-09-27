@@ -41,7 +41,7 @@
     </button>
     <div class="session-list" id="sessionList"></div>
     <div class="sidebar__foot">
-      <span class="user-chip">{{ username }}</span>
+      <span class="user-chip"><span class="user-chip__name">{{ username }}</span></span>
       <button class="settings-btn" id="settingsBtn" title="设置">
         <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round">
@@ -61,6 +61,7 @@
              stroke-linecap="round"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <h2 id="topTitle">智能分析助手</h2>
+      <button id="companionToggle" class="companion-toggle" type="button" role="switch" aria-checked="true" aria-label="桌面助手" title="桌面助手（请在桌面客户端中使用）" disabled><span>桌面助手</span><i aria-hidden="true"></i></button>
       <!-- 选中定时任务会话时显示:该任务的 4 个管理面板入口 -->
       <div class="task-actions" id="taskActions" style="margin-left:auto; display:none;">
         <button class="top-action" data-tpanel="pending" title="待解密文件" style="display:none;">
@@ -207,5 +208,6 @@
   <script src="/static/tasks-ui.js?v={{ asset_ver }}"></script>
   <script src="/static/chat-ui.js?v={{ asset_ver }}"></script>
   <script src="/static/app.js?v={{ asset_ver }}"></script>
+  <script src="/static/desktop-companion.js?v={{ asset_ver }}"></script>
 </body>
 </html>

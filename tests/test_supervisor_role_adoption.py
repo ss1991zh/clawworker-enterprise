@@ -60,6 +60,8 @@ def test_supervisor_merges_desired_on_startup_and_adopts_in_loop():
     # 主循环要读期望集合并接管
     loop = src[src.index("while _running"):]
     assert "read_desired" in loop, "主循环没有接管新角色"
+    assert "explicit_roles" in src, "安装版显式角色没有隔离历史期望集合"
+    assert "sm.set_desired(want) if explicit_roles" in src
 
 
 def test_compatible_supervisor_receives_role_request(monkeypatch):

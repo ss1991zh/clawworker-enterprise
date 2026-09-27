@@ -25,7 +25,11 @@ from host.llm_configs import (
     ProviderManager,
 )
 from host.notices import NoticeStore
-from host.admin_sections import build_data_usage_router, build_ops_router
+from host.admin_sections import (
+    build_data_usage_router,
+    build_ops_router,
+    build_security_audit_router,
+)
 from host.admin_data_permissions import DataPermissionAdminService, build_data_permissions_router
 from host.admin_llm import build_llm_router
 from host.admin_data_sources import build_data_sources_router
@@ -372,6 +376,13 @@ def build_admin_router(
         pop_messages=_pop_messages,
     ))
     router.include_router(build_data_usage_router(
+        templates=templates,
+        data_source_store=data_source_store,
+        data_access_store=data_access_store,
+        user_manager=user_manager,
+        pop_messages=_pop_messages,
+    ))
+    router.include_router(build_security_audit_router(
         templates=templates,
         data_source_store=data_source_store,
         data_access_store=data_access_store,

@@ -93,6 +93,7 @@ Source: "db_drivers\msodbcsql18-x64.msi"; DestDir: "{app}\packaging\windows\db_d
 #endif
 #if MyRole == "client"
 Source: "clawworker_desktop.py";     DestDir: "{app}\packaging\windows"
+Source: "desktop_companion.html";    DestDir: "{app}\packaging\windows"
 Source: "requirements-desktop.txt";  DestDir: "{app}\packaging\windows"
 Source: "webview2\MicrosoftEdgeWebView2RuntimeInstallerX64.exe"; DestDir: "{app}\packaging\windows\webview2"
 #endif

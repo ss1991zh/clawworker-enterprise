@@ -1,11 +1,13 @@
 """
 可信审计日志(append-only)—— Phase A:把"明文不出本机、LLM 只见 schema"从声称变成可核查的证据。
 
-记三类事件,按用户写 append-only JSONL(~/.agent-system/audit/<user>.jsonl):
+按用户写 append-only JSONL(~/.agent-system/audit/<user>.jsonl),主要事件包括:
   · llm_exposure   每次分析发给 LLM 的内容:只有 schema 字段名(+ 类型),并附"零明文断言"
                    (结构校验:发送内容不含任何数据行/单元值)。
   · decrypt_auth   每次解密授权门触发:谁、何时、哪个会话、授权/拒绝/保留密文。
   · document_exposure  用户确认后发送文档正文时，只记录文件名与字符数，不记录正文。
+  · llm_bypass     复用固化代码、整轮没有调用大模型。
+  · cipher_compute 已完成的密文计算、输入/输出指纹与执行方式。
 
 用途:合规审计、客户尽调、出事自证清白。日志只追加不改写,可导出合规报告。
 隐私:审计日志本身**不含任何明文数据值**,只记字段名 + 行为元数据。
@@ -61,16 +63,29 @@ def _read_last_hash(path: Path) -> str:
 
 # 请求作用域上下文(user, session)—— 在分析入口 set_context 一次,
 # 各埋点 record_* 不传 user/session 时从这里取(避免层层穿参)。
-_CTX: contextvars.ContextVar = contextvars.ContextVar("audit_ctx", default=("default", ""))
+_CTX: contextvars.ContextVar = contextvars.ContextVar(
+    "audit_ctx", default=("default", "", ""),
+)
 
 
-def set_context(user: Optional[str], session: Optional[str]) -> None:
-    _CTX.set((user or "default", session or ""))
+def set_context(user: Optional[str], session: Optional[str], message: Optional[str] = None) -> None:
+    """绑定一次分析的审计上下文。
+
+    message 是本轮 assistant 消息 ID。旧调用方只传 user/session 仍兼容；新链路
+    带上 message 后，界面可以把证据精确关联到某一次回答，而不是只关联到会话。
+    """
+    _CTX.set((user or "default", session or "", message or ""))
 
 
 def _ctx_user_session(user, session):
-    cu, cs = _CTX.get()
+    current = _CTX.get()
+    cu, cs = current[:2]
     return (user if user is not None else cu), (session if session is not None else cs)
+
+
+def _ctx_message() -> str:
+    current = _CTX.get()
+    return str(current[2]) if len(current) > 2 else ""
 
 
 def _now() -> str:
@@ -83,7 +98,7 @@ def _path(user: Optional[str]) -> Path:
     return AUDIT_DIR / f"{safe}.jsonl"
 
 
-def _append(user: Optional[str], event: dict) -> None:
+def _append(user: Optional[str], event: dict) -> dict:
     """写一行审计事件(带哈希链:seq + prev_hash + hash);失败绝不影响主流程。"""
     try:
         path = _path(user)
@@ -109,8 +124,9 @@ def _append(user: Optional[str], event: dict) -> None:
                     f.write("\n")
                 f.write(json.dumps(event, ensure_ascii=False) + "\n")
             _last_hash[key] = event["hash"]
+            return event
     except Exception:  # noqa: BLE001 —— 审计失败不能阻断分析
-        pass
+        return {}
 
 
 def verify_chain(user: Optional[str]) -> dict:
@@ -201,6 +217,7 @@ def record_llm_exposure(schema: dict, query: str, purpose: str = "analyze",
     _append(user, {
         "type": "llm_exposure",
         "session": session_id,
+        "message": _ctx_message(),
         "purpose": purpose,
         "fields": a["fields"],
         "field_count": a["field_count"],
@@ -228,6 +245,7 @@ def record_document_exposure(attachments: list[dict], purpose: str = "document_c
     _append(user, {
         "type": "document_exposure",
         "session": session_id,
+        "message": _ctx_message(),
         "purpose": purpose,
         "documents": documents,
         "document_count": len(documents),
@@ -243,9 +261,100 @@ def record_decrypt_auth(decision: str, detail: str = "",
     _append(user, {
         "type": "decrypt_auth",
         "session": session_id,
+        "message": _ctx_message(),
         "decision": decision,
         "detail": detail[:200],
     })
+
+
+def record_llm_bypass(purpose: str = "cache_reuse",
+                      user: Optional[str] = None,
+                      session_id: Optional[str] = None) -> None:
+    """记录本轮密文计算没有调用大模型（例如复用已固化的本地代码）。"""
+    user, session_id = _ctx_user_session(user, session_id)
+    _append(user, {
+        "type": "llm_bypass",
+        "session": session_id,
+        "message": _ctx_message(),
+        "purpose": purpose,
+        "no_plaintext": True,
+    })
+
+
+def record_cipher_computation(
+    *,
+    run_id: str,
+    input_fingerprint: str,
+    output_fingerprint: str = "",
+    skill_calls: Optional[list[str]] = None,
+    user: Optional[str] = None,
+    session_id: Optional[str] = None,
+) -> dict:
+    """记录一轮已经实际完成的密文计算，并返回可直接展示的证据摘要。
+
+    这里只保存密文文件指纹、执行方式和 LLM 暴露结论，不保存路径、SQL、明文值或
+    密钥。事件进入同一条 append-only 哈希链，界面展示的“已验证”由该事件产生。
+    """
+    user, session_id = _ctx_user_session(user, session_id)
+    message = _ctx_message()
+    related = [
+        event for event in read_events(user, limit=2000)
+        if event.get("session") == session_id
+        and (not message or event.get("message") == message)
+    ]
+    exposures = [event for event in related if event.get("type") == "llm_exposure"]
+    bypasses = [event for event in related if event.get("type") == "llm_bypass"]
+    document_exposures = [
+        event for event in related if event.get("type") == "document_exposure"
+    ]
+    no_structured_plaintext = (
+        bool(exposures)
+        and all(bool(event.get("no_plaintext")) for event in exposures)
+    ) or (not exposures and bool(bypasses))
+    event = _append(user, {
+        "type": "cipher_compute",
+        "session": session_id,
+        "message": message,
+        "run_id": (run_id or "")[:80],
+        "mode": "homomorphic_ciphertext",
+        "engine": "ZFHE",
+        "input_fingerprint": (input_fingerprint or "")[:64],
+        "output_fingerprint": (output_fingerprint or "")[:64],
+        "skill_calls": [str(item)[:80] for item in (skill_calls or [])[:30]],
+        "llm_exposure_count": len(exposures),
+        "llm_bypass_count": len(bypasses),
+        "document_exposure_count": len(document_exposures),
+        "no_structured_plaintext_to_llm": no_structured_plaintext,
+        "key_location": "client_local",
+        "encrypt_location": "client_local",
+        "decrypt_location": "client_local",
+    })
+    if not event:
+        return {}
+    chain = verify_chain(user)
+    return {
+        "verified": bool(
+            input_fingerprint
+            and no_structured_plaintext
+            and chain.get("ok")
+        ),
+        "task_id": run_id,
+        "mode": event["mode"],
+        "engine": event["engine"],
+        "input_fingerprint": event["input_fingerprint"],
+        "output_fingerprint": event["output_fingerprint"],
+        "skill_calls": event["skill_calls"],
+        "llm_exposure_count": event["llm_exposure_count"],
+        "llm_bypass_count": event["llm_bypass_count"],
+        "document_exposure_count": event["document_exposure_count"],
+        "no_structured_plaintext_to_llm": event["no_structured_plaintext_to_llm"],
+        "key_location": event["key_location"],
+        "encrypt_location": event["encrypt_location"],
+        "decrypt_location": event["decrypt_location"],
+        "created_at": event["ts"],
+        "audit_hash": event["hash"],
+        "chain_verified": bool(chain.get("ok")),
+    }
 
 
 def read_events(user: Optional[str], limit: int = 500, etype: Optional[str] = None) -> list[dict]:
@@ -277,6 +386,7 @@ def summary(user: Optional[str]) -> dict:
     exposures = [e for e in evs if e.get("type") == "llm_exposure"]
     document_exposures = [e for e in evs if e.get("type") == "document_exposure"]
     decrypts = [e for e in evs if e.get("type") == "decrypt_auth"]
+    computations = [e for e in evs if e.get("type") == "cipher_compute"]
     breaches = [e for e in exposures if not e.get("no_plaintext", True)]
     return {
         "user": user or "default",
@@ -284,6 +394,7 @@ def summary(user: Optional[str]) -> dict:
         "llm_exposures": len(exposures),
         "document_exposures": len(document_exposures),
         "decrypt_authorizations": len(decrypts),
+        "cipher_computations": len(computations),
         "decrypt_granted": sum(1 for e in decrypts if e.get("decision") == "granted"),
         "decrypt_denied": sum(1 for e in decrypts if e.get("decision") in ("denied", "keep_encrypted")),
         "zero_plaintext_holds": not breaches,    # 是否始终满足"LLM 只见 schema"

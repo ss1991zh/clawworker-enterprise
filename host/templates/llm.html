@@ -139,9 +139,9 @@
       const o = document.createElement('option');
       o.value = '__custom__'; o.textContent = '其他(手动输入)…';
       selectEl.appendChild(o);
-      selectEl.addEventListener('change', e => {
+      selectEl.addEventListener('change', async e => {
         if (e.target.value === '__custom__') {
-          const v = prompt('请输入模型名:', selected || '');
+          const v = await window.adminPrompt('填写服务商支持的模型标识。', selected || '', {title:'输入模型名称',confirmText:'使用此模型'});
           if (v) {
             const opt = document.createElement('option');
             opt.value = v; opt.textContent = v; opt.selected = true;

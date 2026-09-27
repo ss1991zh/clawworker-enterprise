@@ -95,7 +95,7 @@
     mask.classList.add("open");
     body.innerHTML = `<h2>选择企业数据库</h2>
       <p class="sub">选好后回到会话，直接在输入框里说要查什么、怎么算或要输出什么。</p>
-      <div class="db-safety-note"><strong>先加密，再分析</strong><span>模型规划查询时只看你获准访问的表结构；查询结果返回本机后立即加密，原始数据行不会进入大模型提示词。</span></div>
+      <div class="db-safety-note"><div><strong>先加密，再分析</strong><span>模型规划查询时只看你获准访问的表结构；查询结果返回本机后立即加密，原始数据行不会进入大模型提示词。</span><div class="db-safety-steps"><span>① 本机加密</span><span>② 密文计算</span><span>③ 本机解密</span></div></div></div>
       <div class="db-loading">正在读取你的数据库权限…</div>`;
     let sources = [];
     try { sources = await api("GET", "/api/data/sources"); }
@@ -114,7 +114,7 @@
     let selectedId = state.pendingDatabase?.id || sources[0].id;
     body.innerHTML = `<h2>选择企业数据库</h2>
       <p class="sub">选好后回到会话，直接在输入框里说要查什么、怎么算或要输出什么。</p>
-      <div class="db-safety-note"><strong>先加密，再分析</strong><span>模型规划查询时只看你获准访问的表结构；查询结果返回本机后立即加密，原始数据行不会进入大模型提示词。</span></div>
+      <div class="db-safety-note"><div><strong>先加密，再分析</strong><span>模型规划查询时只看你获准访问的表结构；查询结果返回本机后立即加密，原始数据行不会进入大模型提示词。</span><div class="db-safety-steps"><span>① 本机加密</span><span>② 密文计算</span><span>③ 本机解密</span></div></div></div>
       <div class="db-source-list" id="dbSourceList">${sources.map(s => `
         <button class="db-source-card ${s.id === selectedId ? "selected" : ""}" type="button" data-source-id="${esc(s.id)}">
           <span class="db-source-icon">DB</span><span class="db-source-copy"><strong>${esc(s.name)}</strong><small>${esc(s.engine || "企业数据库")}</small></span><span class="db-source-check">✓</span>

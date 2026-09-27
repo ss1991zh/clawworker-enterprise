@@ -8,7 +8,8 @@
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">Clawworker <span class="sub">Enterprise · Admin</span></div>
+    <div class="brand"><span class="brand-mark">C</span><span class="brand-copy">Clawworker <span class="sub">企业管理控制台</span></span></div>
+    <div class="nav-label">工作台</div>
     <nav>
       <a href="/admin/" class="{% if active=='dashboard' %}active{% endif %}">概览</a>
       <a href="/admin/users" class="{% if active=='users' %}active{% endif %}">用户</a>
@@ -16,6 +17,7 @@
       <a href="/admin/data-sources" class="{% if active=='data_sources' %}active{% endif %}">数据源</a>
       <a href="/admin/data-permissions" class="{% if active=='data_permissions' %}active{% endif %}">数据授权</a>
       <a href="/admin/data-usage" class="{% if active=='data_usage' %}active{% endif %}">数据使用记录</a>
+      <a href="/admin/security-audit" class="{% if active=='security_audit' %}active{% endif %}">密文计算审计</a>
       <a href="/admin/sessions" class="{% if active=='sessions' %}active{% endif %}">会话</a>
       <a href="/admin/ops" class="{% if active=='ops' %}active{% endif %}">运维</a>
       <a href="/admin/account" class="{% if active=='account' %}active{% endif %}">管理员</a>
@@ -33,13 +35,15 @@
         <button class="notice-pop__x" id="adminNoticeClose" type="button" aria-label="关闭">✕</button></div>
       <div class="notice-pop__body" id="adminNoticeList"></div>
     </div>
-    <form method="post" action="/admin/logout" class="logout-form">
+    <div class="admin-status">企业管理工作台</div>
+    <form method="post" action="/admin/logout" class="logout-form" data-confirm="确定退出管理端？">
       <button class="logout-btn" type="submit" title="退出登录">退出</button>
     </form>
   </header>
   <div class="notice-scrim" id="adminNoticeScrim" hidden></div>
 
   <main class="container">
+    <div class="mobile-admin-head"><button type="button" id="adminMenuBtn" aria-label="打开导航">☰</button><strong>Clawworker 管理端</strong></div>
     {% if messages %}
       {% for category, msg in messages %}
         <div class="alert {{ category }}">{{ msg }}</div>
@@ -51,6 +55,7 @@
       <a href="/docs" target="_blank">Swagger API 文档</a>
     </div>
   </main>
+  <div class="admin-nav-scrim" id="adminNavScrim"></div>
   <script src="/admin/static/admin.js?v={{ asset_ver('admin.js') }}"></script>
 </body>
 </html>

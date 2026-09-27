@@ -23,7 +23,7 @@
         {% endfor %}
       {% endif %}
 
-      <form method="post" action="/login">
+      <form method="post" action="/login" autocomplete="off">
         <div class="field">
           <label>主机地址
             <button type="button" id="scanBtn" class="scan-btn">扫描内网</button>
@@ -35,7 +35,7 @@
         </div>
         <div class="field">
           <label>用户名</label>
-          <input type="text" name="username" required autocomplete="username"
+          <input type="text" name="username" required autocomplete="off" spellcheck="false"
                  pattern="[a-zA-Z0-9_-]+" autofocus>
         </div>
         <div class="field">

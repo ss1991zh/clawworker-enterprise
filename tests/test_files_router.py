@@ -16,10 +16,12 @@ class _Storage:
         return list(self.ciphertext_dir.iterdir())
 
 
-def _client(root: Path) -> TestClient:
+def _client(root: Path, *, ingest=None, extract=None) -> TestClient:
     app = FastAPI()
     app.include_router(build_files_router(
         storage=_Storage(root),
+        ingest_plaintext_path=ingest or (lambda path, name: {"name": name, "path": str(path)}),
+        extract_text=extract or (lambda path: path.read_text(encoding="utf-8")),
         is_logged_in=lambda: True,
         need_login=lambda: {"error": "login"},
     ))
@@ -69,3 +71,36 @@ def test_owned_ciphertext_resolves_before_directory_boundary_check(tmp_path):
         assert getattr(exc, "status_code", None) == 404
     else:
         raise AssertionError("path traversal must be rejected")
+
+
+def test_files_router_upload_encrypts_plaintext_file(tmp_path):
+    root = tmp_path / "ciphertexts"
+    root.mkdir()
+    received = {}
+
+    def ingest(path: Path, name: str):
+        received.update(name=name, content=path.read_bytes())
+        return {"name": "sales_enc.csv", "path": str(root / "sales_enc.csv")}
+
+    response = _client(root, ingest=ingest).post(
+        "/api/files/upload",
+        files={"raw_file": ("sales.csv", b"amount\n10\n", "text/csv")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "sales_enc.csv"
+    assert received == {"name": "sales.csv", "content": b"amount\n10\n"}
+
+
+def test_files_router_extracts_text_attachment(tmp_path):
+    root = tmp_path / "ciphertexts"
+    root.mkdir()
+
+    response = _client(root, extract=lambda path: path.read_text(encoding="utf-8")).post(
+        "/api/files/text_extract",
+        files={"raw_file": ("formula.txt", "库存周转率=成本/库存".encode(), "text/plain")},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "formula.txt"
+    assert response.json()["content"] == "库存周转率=成本/库存"

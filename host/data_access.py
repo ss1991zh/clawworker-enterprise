@@ -173,6 +173,28 @@ class DataAccessStore:
                 );
                 CREATE INDEX IF NOT EXISTS ix_audit_user_time
                     ON query_audits(username,created_at DESC);
+
+                CREATE TABLE IF NOT EXISTS compute_proofs (
+                    id TEXT PRIMARY KEY,
+                    audit_hash TEXT NOT NULL UNIQUE,
+                    username TEXT NOT NULL,
+                    data_source_id TEXT NOT NULL DEFAULT '',
+                    task_id TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL,
+                    engine TEXT NOT NULL,
+                    input_fingerprint TEXT NOT NULL,
+                    output_fingerprint TEXT NOT NULL DEFAULT '',
+                    skill_calls_json TEXT NOT NULL DEFAULT '[]',
+                    llm_exposure_count INTEGER NOT NULL DEFAULT 0,
+                    document_exposure_count INTEGER NOT NULL DEFAULT 0,
+                    no_structured_plaintext INTEGER NOT NULL DEFAULT 0,
+                    chain_verified INTEGER NOT NULL DEFAULT 0,
+                    client_verified INTEGER NOT NULL DEFAULT 0,
+                    client_created_at TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_compute_proof_user_time
+                    ON compute_proofs(username,created_at DESC);
                 """
             )
             # 兼容 1.5.0 之前已经创建的控制库。
@@ -460,3 +482,88 @@ class DataAccessStore:
         return {"total": int(total), "success": int(success), "denied": int(denied),
                 "cancelled": int(cancelled), "timeout": int(timeout),
                 "rows": int(rows), "users": int(users)}
+
+    @staticmethod
+    def _fingerprint(value: object, *, required: bool = True) -> str:
+        text = str(value or "").strip().lower()
+        if not text and not required:
+            return ""
+        if not re.fullmatch(r"[0-9a-f]{64}", text):
+            raise ValueError("证据指纹格式无效")
+        return text
+
+    def record_compute_proof(self, *, username: str, proof: dict) -> str:
+        """接收客户端密文计算证据元数据；不接收文件路径、密文或业务明文。"""
+        audit_hash = self._fingerprint(proof.get("audit_hash"))
+        input_fingerprint = self._fingerprint(proof.get("input_fingerprint"))
+        output_fingerprint = self._fingerprint(
+            proof.get("output_fingerprint"), required=False,
+        )
+        mode = str(proof.get("mode") or "")[:80]
+        engine = str(proof.get("engine") or "")[:80]
+        if mode != "homomorphic_ciphertext" or not engine:
+            raise ValueError("密文计算证据类型无效")
+        skills = [str(item)[:80] for item in list(proof.get("skill_calls") or [])[:30]]
+        proof_id, now = secrets.token_hex(10), _now()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """INSERT OR IGNORE INTO compute_proofs
+                   (id,audit_hash,username,data_source_id,task_id,mode,engine,
+                    input_fingerprint,output_fingerprint,skill_calls_json,
+                    llm_exposure_count,document_exposure_count,no_structured_plaintext,
+                    chain_verified,client_verified,client_created_at,created_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    proof_id, audit_hash, username,
+                    str(proof.get("data_source_id") or "")[:160],
+                    str(proof.get("task_id") or "")[:80], mode, engine,
+                    input_fingerprint, output_fingerprint,
+                    json.dumps(skills, ensure_ascii=False),
+                    max(0, int(proof.get("llm_exposure_count") or 0)),
+                    max(0, int(proof.get("document_exposure_count") or 0)),
+                    int(bool(proof.get("no_structured_plaintext_to_llm"))),
+                    int(bool(proof.get("chain_verified"))),
+                    int(bool(proof.get("verified"))),
+                    str(proof.get("created_at") or "")[:40], now,
+                ),
+            )
+            row = conn.execute(
+                "SELECT id FROM compute_proofs WHERE audit_hash=?", (audit_hash,),
+            ).fetchone()
+        return str(row["id"] if row else proof_id)
+
+    def list_compute_proofs(self, limit: int = 500, *, username: str = "") -> list[dict]:
+        sql, params = "SELECT * FROM compute_proofs WHERE 1=1", []
+        if username:
+            sql += " AND username=?"
+            params.append(username)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        params.append(min(max(int(limit), 1), 1000))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            try:
+                item["skill_calls"] = json.loads(item.pop("skill_calls_json") or "[]")
+            except (TypeError, ValueError):
+                item["skill_calls"] = []
+            result.append(item)
+        return result
+
+    def compute_proof_summary(self) -> dict:
+        with self._connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM compute_proofs").fetchone()[0])
+            verified = int(conn.execute(
+                "SELECT COUNT(*) FROM compute_proofs WHERE client_verified=1 AND chain_verified=1"
+            ).fetchone()[0])
+            zero_plaintext = int(conn.execute(
+                "SELECT COUNT(*) FROM compute_proofs WHERE no_structured_plaintext=1"
+            ).fetchone()[0])
+            users = int(conn.execute(
+                "SELECT COUNT(DISTINCT username) FROM compute_proofs"
+            ).fetchone()[0])
+        return {
+            "total": total, "verified": verified,
+            "zero_plaintext": zero_plaintext, "users": users,
+        }
