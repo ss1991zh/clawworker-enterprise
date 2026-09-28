@@ -979,32 +979,12 @@ async function renderGeneralTab() {
   const cfg = await api("GET", "/api/config");
   $("modalBody").innerHTML = `
     <h2>${TABS.general.title}</h2>
-    <p class="sub">主机地址 · HE backend</p>
-    <div id="cfgAlert"></div>
-    <div class="field">
-      <label>主机地址</label>
-      <input type="text" id="cfgHost" value="${esc(cfg.host_url)}">
-      <p class="hint">修改后请登出 + 重新登录,新的 session 会走新主机</p>
-    </div>
-    <div class="field">
-      <label>HE Backend</label>
-      <select id="cfgBackend">
-        <option value="stub" ${cfg.backend === "stub" ? "selected" : ""}>stub(测试)</option>
-        <option value="real" ${cfg.backend === "real" ? "selected" : ""}>real(真实同态加密)</option>
-      </select>
-    </div>
-    <button class="btn-primary" id="cfgSave">保存</button>
+    <p class="sub">当前连接与计算环境，仅供查看。</p>
+    <dl class="settings-readonly">
+      <div><dt>主机地址</dt><dd>${esc(cfg.host_url || "未配置")}</dd></div>
+      <div><dt>HE 计算引擎</dt><dd>${cfg.backend === "real" ? "真实同态加密" : "未启用真实同态加密"}</dd></div>
+    </dl>
   `;
-  $("cfgSave").addEventListener("click", async () => {
-    try {
-      await api("POST", "/api/config", {
-        host_url: $("cfgHost").value, backend: $("cfgBackend").value,
-      });
-      $("cfgAlert").innerHTML = '<div class="alert-box success">已保存</div>';
-    } catch (e) {
-      $("cfgAlert").innerHTML = `<div class="alert-box">保存失败:${esc(e.message)}</div>`;
-    }
-  });
 }
 
 async function renderDatabaseTab() {
@@ -1090,65 +1070,77 @@ async function renderDatabaseTab() {
 // ============ 自启 / 运维 Tab(客户端自身开机自启 + 崩溃重启)============
 let _opsTimer = null;
 async function renderOpsTab() {
+  clearInterval(_opsTimer);
   $("modalBody").innerHTML = `
     <h2>${TABS.ops.title}</h2>
-    <p class="sub">让本机的用户端(数据面 :8444)开机自动启动、崩溃后自动重启。仅作用于这台电脑。</p>
-    <div id="opsAlert"></div>
-
-    <div class="ops-cards" id="opsCards"></div>
-
-    <div class="field form-action-row">
-      <button class="btn-primary" id="opsEnable">启用开机自启 + 守护</button>
-      <button class="btn-danger" id="opsDisable">停用</button>
-      <button class="btn-ghost" id="opsStart">仅启动守护(本次)</button>
-      <button class="btn-ghost" id="opsStop">停止守护</button>
-    </div>
-
-    <div class="alert-box info info-panel-spaced">
-      <strong>原理:</strong>开机自启在登录时拉起一个守护进程 <code>client_supervisor.py</code>,
-      由它启动、健康探测、崩溃后退避重启用户端(:8444)。三平台一致:
-      macOS 用 <code>LaunchAgent</code>、Linux 用 <code>systemd --user</code>、Windows 用计划任务。
-      与控制面 Host 的守护相互独立,互不影响。<br>
-      <strong>停用</strong>会移除开机自启并停止守护(用户端本身保留,界面不掉线)。
-    </div>`;
-
-  const renderCards = (s) => {
-    const sup = s.supervisor || {}, au = s.autostart || {}, cl = s.client || {};
-    $("opsCards").innerHTML = `
-      <div class="ops-card"><div class="ops-card__label">开机自启</div>
-        <div class="ops-card__val ${au.installed ? "ok" : "bad"}">${au.installed ? "已启用" : "未启用"}</div>
-        <div class="ops-card__hint">${esc(au.detail || "")}</div></div>
-      <div class="ops-card"><div class="ops-card__label">守护进程</div>
-        <div class="ops-card__val ${sup.running ? "ok" : "bad"}">${sup.running ? "运行中" : "未运行"}</div>
-        <div class="ops-card__hint">${sup.pid ? "pid " + sup.pid : "崩溃自愈未生效"}</div></div>
-      <div class="ops-card"><div class="ops-card__label">用户端 · :${cl.port || 8444}</div>
-        <div class="ops-card__val ${cl.healthy ? "ok" : "bad"}">${cl.healthy ? "健康" : "不可达"}</div>
-        <div class="ops-card__hint">${cl.managed ? "受守护 · 重启 " + (cl.restarts || 0) + " 次" : "未受守护"}</div></div>`;
+    <p class="sub">管理这台电脑的自动启动与运行状态。</p>
+    <div id="opsAlert" role="status"></div>
+    <section class="ops-settings">
+      <div class="ops-settings-heading"><h3>开机自动启动</h3><p>登录电脑后自动启动用户端，并在异常退出时自动恢复。</p></div>
+      <div class="ops-actions">
+        <button class="btn-primary" id="opsToggle" disabled>读取状态中…</button>
+      </div>
+      <div class="ops-status-list" id="opsCards"><p class="hint">正在读取状态…</p></div>
+    </section>
+    <p class="ops-footnote">停用不会关闭当前用户端。此设置仅影响本机，不影响管理端。</p>`;
+  const cards = $("opsCards");
+  const alert = $("opsAlert");
+  const toggle = $("opsToggle");
+  let busy = false, latest = null;
+  const updateButtons = () => {
+    toggle.disabled = busy || !latest;
+    if (!busy) toggle.textContent = !latest ? "状态暂不可用" : latest.autostart?.installed ? "停用" : "启用";
+    toggle.className = latest?.autostart?.installed ? "btn-ghost" : "btn-primary";
   };
   const refresh = async () => {
-    try { renderCards(await api("GET", "/api/ops/status")); } catch (e) {}
-  };
-  await refresh();
-  clearInterval(_opsTimer);
-  _opsTimer = setInterval(() => { if ($("opsCards")) refresh(); else clearInterval(_opsTimer); }, 4000);
-
-  const act = async (path, btn, busy) => {
-    const orig = btn.textContent; btn.disabled = true; btn.textContent = busy;
     try {
-      const r = await api("POST", path);
-      $("opsAlert").innerHTML = `<div class="alert-box success">${esc(r.msg || "已完成")}</div>`;
+      const s = await api("GET", "/api/ops/status");
+      if ($("opsCards") !== cards) return;
+      latest = s;
+      const sup = s.supervisor || {}, au = s.autostart || {}, cl = s.client || {};
+      cards.innerHTML = `
+        <div class="ops-status-row"><span>开机自启</span><strong class="ops-state ${au.installed ? "is-on" : "is-off"}">${au.installed ? "已启用" : "未启用"}</strong></div>
+        <div class="ops-status-row"><span>异常自动恢复</span><strong class="ops-state ${sup.running ? "is-on" : "is-off"}">${sup.running ? "已开启" : "未开启"}</strong></div>
+        <div class="ops-status-row"><span>用户端状态</span><strong class="ops-state ${cl.healthy ? "is-on" : "is-error"}">${cl.healthy ? "运行正常" : "暂时无法连接"}</strong></div>`;
+      updateButtons();
     } catch (e) {
-      $("opsAlert").innerHTML = `<div class="alert-box">操作失败:${esc(e.message)}</div>`;
-    } finally { btn.disabled = false; btn.textContent = orig; await refresh(); }
-  };
-  $("opsEnable").addEventListener("click", e => act("/api/ops/autostart/enable", e.target, "启用中…"));
-  $("opsDisable").addEventListener("click", async e => {
-    if (await ui.confirm("停用后用户端仍会继续运行，但异常退出后不会自动恢复。", { title: "停用开机自启和守护？", danger: true, confirmText: "确认停用" })) {
-      act("/api/ops/autostart/disable", e.target, "停用中…");
+      if ($("opsCards") !== cards) return;
+      latest = null;
+      cards.innerHTML = `<p class="hint">状态读取失败：${esc(e.message)}，稍后自动重试。</p>`;
+      updateButtons();
     }
+  };
+  const act = async (path, button, label) => {
+    if (busy) return;
+    busy = true; updateButtons();
+    const original = button.textContent; button.textContent = label;
+    try {
+      await api("POST", path);
+      if ($("opsCards") === cards) alert.innerHTML = '<div class="alert-box success">设置已更新</div>';
+    } catch (e) {
+      if ($("opsCards") === cards) alert.innerHTML = `<div class="alert-box">操作失败：${esc(e.message)}</div>`;
+    } finally {
+      busy = false; button.textContent = original; await refresh();
+    }
+  };
+  toggle.addEventListener("click", async () => {
+    if (busy || !latest) return;
+    const stopping = !!latest.autostart?.installed;
+    if (stopping) {
+      busy = true; updateButtons();
+      let confirmed;
+      try {
+        confirmed = await ui.confirm("停用后用户端仍会继续运行，但异常退出后不会自动恢复。", { title: "停用开机自启和自动恢复？", confirmText: "确认停用" });
+      } finally { busy = false; updateButtons(); }
+      if (!confirmed) return;
+    }
+    if ($("opsCards") === cards) await act(stopping ? "/api/ops/autostart/disable" : "/api/ops/autostart/enable", toggle, stopping ? "停用中…" : "启用中…");
   });
-  $("opsStart").addEventListener("click", e => act("/api/ops/supervisor/start", e.target, "启动中…"));
-  $("opsStop").addEventListener("click", e => act("/api/ops/supervisor/stop", e.target, "停止中…"));
+  await refresh();
+  if ($("opsCards") === cards) _opsTimer = setInterval(() => {
+    if ($("opsCards") === cards && $("modalMask").classList.contains("open")) refresh();
+    else clearInterval(_opsTimer);
+  }, 4000);
 }
 
 // ============ 定时任务 Tab ============

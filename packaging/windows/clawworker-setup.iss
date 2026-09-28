@@ -8,10 +8,10 @@
 #endif
 
 #if MyRole == "admin"
-  #define AppName "Clawworker 管理端"
+  #define AppName "ClawWorker 管理端"
   #define RoleArg "admin"
 #else
-  #define AppName "Clawworker 用户端"
+  #define AppName "ClawWorker 用户端"
   #define RoleArg "client"
 #endif
 
@@ -51,10 +51,16 @@ DefaultDirName={autopf}\Clawworker\{#RoleArg}
 DefaultGroupName=Clawworker
 DisableProgramGroupPage=yes
 OutputDir=dist
-OutputBaseFilename=Clawworker-{#RoleArg}-Setup-{#AppVersion}
+OutputBaseFilename=Clawworker-{#RoleArg}-Setup-{#AppVersion}-modern
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+WizardSizePercent=145
+DisableWelcomePage=yes
+DisableReadyPage=yes
+DisableDirPage=no
+SetupLogging=yes
+MinVersion=10.0
 #if MyRole == "admin"
 ; SQL Server ODBC Driver 18 是系统级驱动，管理端安装时需要一次 UAC 确认。
 PrivilegesRequired=admin
@@ -66,18 +72,20 @@ UninstallDisplayIcon={app}\packaging\windows\clawworker.ico
 ; 1.3.1 强制迁移到角色隔离目录。旧版可能仍记着共享目录 Clawworker\,
 ; 若复用旧目录会继续启动旧 launcher 并打开错误的 http://localhost:8443。
 DirExistsWarning=no
-UsePreviousAppDir=no
+UsePreviousAppDir=yes
 
 [Languages]
 Name: "cn"; MessagesFile: "compiler:Default.isl"
 
 [Files]
+Source: "installer-backdrop.bmp"; Flags: dontcopy
+Source: "installer-wave\*.bmp"; Flags: dontcopy
 ; ---- 应用源码(项目根的各目录)----
 Source: "..\..\host\*";              DestDir: "{app}\host";            Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
 Source: "..\..\client\*";            DestDir: "{app}\client";          Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
 Source: "..\..\shared\*";            DestDir: "{app}\shared";          Excludes: "__pycache__\*,*.pyc"; Flags: recursesubdirs createallsubdirs
 ; ---- 文档(含 LLM 系统 prompt,运行时会读 docs\llm_system_prompt.md)----
-Source: "..\..\docs\*";              DestDir: "{app}\docs";            Flags: recursesubdirs createallsubdirs
+Source: "..\..\docs\*.md";           DestDir: "{app}\docs"
 Source: "..\..\skill_packs\*";       DestDir: "{app}\skill_packs";     Flags: recursesubdirs createallsubdirs
 Source: "..\..\supervisor.py";       DestDir: "{app}"
 Source: "..\..\client_supervisor.py"; DestDir: "{app}"
@@ -120,17 +128,16 @@ Name: "{group}\Clawworker 用户端（浏览器诊断）"; Filename: "{app}\.ven
 
 [Run]
 ; 安装后用随包 Python 3.11 建 venv + 离线装角色依赖;用户端再装 HE 库
-Filename: "powershell.exe"; \
-  Parameters: "-ExecutionPolicy Bypass -NoProfile -File ""{app}\packaging\windows\install.ps1"" -Role {#RoleArg} -NoShortcut"; \
-  StatusMsg: "正在安装依赖与密态库(可能需要几分钟)..."; Flags: runhidden waituntilterminated
+; Dependencies are executed and checked by the modern interface below.
 ; 安装完成后可选:立即启动并打开界面
 Filename: "{app}\.venv\Scripts\pythonw.exe"; Parameters: """{app}\packaging\windows\clawworker_launch.py"" {#RoleArg}"; \
-  Description: "立即启动 {#AppName}"; Flags: postinstall nowait skipifsilent
+  Description: "立即启动 {#AppName}"; Flags: postinstall nowait skipifsilent; Check: InstallReady
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\.venv"
 
 [Code]
+#include "installer-modern.iss"
 // 覆盖安装:先停掉与本安装目录相关的服务进程,否则文件被锁 → 复制失败/残留旧文件。
 // 注意:此处只能用 // 注释 —— Pascal 的花括号注释会被安装目录常量里的右花括号提前闭合。
 //
@@ -145,6 +152,7 @@ var
   AppDir: String;
 begin
   AppDir := ExpandConstant('{app}');
+  StringChangeEx(AppDir, '''', '''''', True);
   Exec('powershell.exe',
     '-NoProfile -Command "$p=''' + AppDir + '''; 1..2 | ForEach-Object { ' +
     'Get-CimInstance Win32_Process | Where-Object { ' +

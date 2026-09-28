@@ -1359,6 +1359,8 @@ def _run_pipeline(
         _sessions.update_message(
             sid, asst_mid, status="cancelled",
             summary=result.get("summary", "") or "已停止 · 用户取消",
+            tokens=int(result.get("tokens", 0) or 0),
+            tokens_recorded="tokens" in result,
             error="",
             skill_calls=result.get("skill_calls", []),
             used_cipher=used_cipher,

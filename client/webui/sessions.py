@@ -52,6 +52,7 @@ class Message:
     status: str = "done"                       # pending / running / done / failed / needs_cipher
     duration_sec: float = 0.0
     tokens: int = 0                            # 本轮所有 LLM 调用的 token 用量合计
+    tokens_recorded: bool = False              # 区分历史未保存用量与已记录的零值
     remediation_note: str = ""                 # assistant-only:本轮是漏跑补救时,附在执行时间下方的说明
     used_cipher: str = ""                      # assistant 实际用了哪份 cipher
     security_proof: dict[str, Any] = field(default_factory=dict)  # assistant-only:本轮密文计算证据

@@ -179,7 +179,7 @@ def test_windows_installer_uses_role_specific_offline_payloads():
     assert '$Role -eq "client" -or $Role -eq "both"' in installer
     assert "检测到旧虚拟环境不可用" in installer
     assert '"wheels-$role"' in builder
-    assert "Get-FileHash" in builder and "SHA256SUMS-$AppVersion.txt" in builder
+    assert "Get-FileHash" in builder and "SHA256SUMS-$AppVersion-modern.txt" in builder
     assert 'Source: "wheels-admin\\*"' in inno
     assert 'Source: "wheels-client\\*"' in inno
     assert inno.index('#if MyRole == "client"\nSource: "he_libs\\*"') > 0

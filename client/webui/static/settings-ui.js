@@ -4,154 +4,166 @@
   function create({ api, $, esc, ui, title }) {
   async function renderKeysTab() {
     const k = await api("GET", "/api/keys");
-    const sizeKb = (p) => p ? "(已沙盒化)" : "—";
+    const keyCard = (name, code, present, zone, input, hint) => `
+      <details class="key-file-card" ${present ? "" : "open"}>
+        <summary><span class="key-file-name">${name} <span class="mono-tag">${code}</span></span>
+          <span class="badge ${present ? "ok" : "warn"}">${present ? "已导入" : "未导入"}</span>
+          <span class="key-file-action"><span class="key-file-closed">${present ? "更换" : "导入"}</span><span class="key-file-open">收起</span></span>
+        </summary>
+        <div class="key-upload-body">
+          <div class="sk-drop key-drop-compact" id="${zone}">
+            <span>拖入文件，或 <button type="button" class="sk-pick" data-pick="${code}">选择文件</button></span>
+            <input type="file" id="${input}" hidden>
+          </div>
+          <p class="key-upload-hint">${hint}</p>
+        </div>
+      </details>`;
     $("modalBody").innerHTML = `
       <h2>${title("keys")}</h2>
-      <p class="sub">本机沙盒 · sk / evk 永不出本机 · user_authorization 由主机签发</p>
-
-      <h3 class="keys-h3">解密密钥 <span class="mono-tag">sk</span></h3>
-      <div class="key-row">
-        <div class="key-meta">${k.sk_present
-          ? `<span class="badge ok">已导入</span>`
-          : `<span class="badge no">未导入</span>`}</div>
+      <p class="sub">私钥和计算字典仅保存在本机，用户授权由管理端签发。</p>
+      <div class="key-files">
+        ${keyCard("私钥", "sk", k.sk_present, "dropSk", "skFile", "用于授权后的本机解密。更换前请确认与计算字典配套。")}
+        ${keyCard("计算字典", "evk · dictf", k.evk_present, "dropEvk", "evkFile", "用于密文计算。仅在首次配置或更新字典时导入，大文件需要稍候。")}
       </div>
-      <div class="sk-drop" id="dropSk">
-        <div class="sk-drop__t"><strong>拖入</strong> 或 <span class="sk-pick" data-pick="sk">点击选择</span> sk 文件</div>
-        <div class="sk-drop__s">永不上传主机 · 仅本机沙盒读取</div>
-        <input type="file" id="skFile" hidden>
-      </div>
-
-      <h3 class="keys-h3">计算密钥 / 字典 <span class="mono-tag">evk · dictf</span></h3>
-      <div class="key-row">
-        <div class="key-meta">${k.evk_present
-          ? `<span class="badge ok">已导入</span>`
-          : `<span class="badge no">未导入</span>`}</div>
-      </div>
-      <div class="sk-drop" id="dropEvk">
-        <div class="sk-drop__t"><strong>拖入</strong> 或 <span class="sk-pick" data-pick="evk">点击选择</span> 计算密钥(evk,即字典 dictf)</div>
-        <div class="sk-drop__s">密态计算必需 · evk 与 dictf 是同一文件 · 文件较大,上传需稍候 · 仅本机沙盒</div>
-        <input type="file" id="evkFile" hidden>
-      </div>
-
-      <h3 class="keys-h3">用户授权 <span class="mono-tag">user_authorization</span></h3>
-      <div class="key-row">
-        <div class="key-meta">${k.user_auth_present
-          ? `<span class="badge ok">已同步</span>`
-          : `<span class="badge warn">未获取</span>`}</div>
-      </div>
-      <div class="auth-fetch">
-        <div class="af-body">
-          <div class="af-t">证书由 admin 统一签发 · 客户端从主机自动同步</div>
-          <div class="af-s">用户不上传 · admin 吊销后客户端 init 会失败</div>
-        </div>
-        <button class="btn-primary" id="fetchAuthBtn">${k.user_auth_present ? "重新拉取" : "从主机获取"}</button>
-      </div>
-
-      <h3 class="keys-h3">密钥体检 <span class="mono-tag">selfcheck</span></h3>
-      <div class="auth-fetch">
-        <div class="af-body">
-          <div class="af-t">在这套密钥上实测:能算什么、精度多少、能平稳跑多大规模</div>
-          <div class="af-s">导入密钥/字典后跑一次 · 不配套或损坏会当场暴露</div>
-        </div>
-        <button class="btn-primary" id="keycheckBtn">开始体检</button>
-      </div>
-      <div id="keycheckResult" style="margin-top:10px;"></div>
-
-      <div id="kStatus" style="margin-top:14px;"></div>
+      <section class="key-setting-card">
+        <div class="key-setting-row"><div class="key-setting-copy"><h3>用户授权 <span class="badge ${k.user_auth_present ? "ok" : "warn"}">${k.user_auth_present ? "已同步" : "未获取"}</span></h3><p>由管理端统一签发，无需手动上传。</p></div>
+          <button class="btn-ghost btn-sm" id="fetchAuthBtn">${k.user_auth_present ? "重新同步" : "获取授权"}</button></div>
+      </section>
+      <section class="key-setting-card key-check-card">
+        <div class="key-setting-row"><div class="key-setting-copy"><h3>计算能力检查</h3><p>检查当前环境的计算能力，导入或更新后建议运行一次。</p></div>
+          <button class="btn-ghost btn-sm" id="keycheckBtn" ${k.sk_present && k.evk_present ? "" : "disabled"}>开始检查</button></div>
+        ${k.sk_present && k.evk_present ? "" : '<p class="hint">请先导入私钥和计算字典。</p>'}
+        <div id="keycheckResult" aria-live="polite"></div>
+      </section>
+      <div id="kStatus" role="status"></div>
     `;
-
-    bindKeyDrop("dropSk", "skFile", "sk", "/api/keys/sk");
-    bindKeyDrop("dropEvk", "evkFile", "evk", "/api/keys/evk");
+    bindKeyDrop("dropSk", "skFile", "私钥", "/api/keys/sk");
+    bindKeyDrop("dropEvk", "evkFile", "计算字典", "/api/keys/evk");
 
     $("keycheckBtn").addEventListener("click", async () => {
       const btn = $("keycheckBtn");
-      btn.disabled = true; btn.textContent = "体检中…";
-      $("keycheckResult").innerHTML = '<div class="alert-box info">正在体检(对拍实测,约数秒)…</div>';
+      const resultBox = $("keycheckResult");
+      btn.disabled = true; btn.textContent = "检查中…";
+      resultBox.innerHTML = '<p class="key-check-pending" role="status">正在检查，请稍候…</p>';
       try {
         const rep = await api("GET", "/api/keycheck?quick=true");
-        $("keycheckResult").innerHTML = renderKeycheckResult(rep);
+        resultBox.innerHTML = renderKeycheckResult(rep);
       } catch (e) {
-        $("keycheckResult").innerHTML = `<div class="alert-box">体检失败:${esc(e.message)}</div>`;
+        resultBox.innerHTML = `<div class="alert-box">检查失败：${esc(e.message)}</div>`;
       } finally {
-        btn.disabled = false; btn.textContent = "重新体检";
+        btn.disabled = false; btn.textContent = "重新检查";
       }
     });
 
     $("fetchAuthBtn").addEventListener("click", async () => {
-      $("kStatus").innerHTML = '<div class="alert-box info">正在从主机拉取证书…</div>';
+      const statusBox = $("kStatus"), btn = $("fetchAuthBtn");
+      btn.disabled = true;
+      statusBox.innerHTML = '<div class="alert-box info">正在同步用户授权…</div>';
       try {
         const res = await api("POST", "/api/keys/fetch_auth");
-        $("kStatus").innerHTML = `<div class="alert-box success">✓ 已同步(${(res.size_bytes / 1024).toFixed(1)} KB)</div>`;
-        setTimeout(renderKeysTab, 600);
+        statusBox.innerHTML = '<div class="alert-box success">用户授权已同步</div>';
+        setTimeout(() => { if ($("kStatus") === statusBox) renderKeysTab(); }, 600);
       } catch (e) {
-        $("kStatus").innerHTML = `<div class="alert-box">同步失败:${esc(e.message)}</div>`;
-      }
+        statusBox.innerHTML = `<div class="alert-box">同步失败:${esc(e.message)}</div>`;
+      } finally { btn.disabled = false; }
     });
   }
 
   function renderKeycheckResult(rep) {
-    const head = rep.ok
-      ? '<div class="alert-box success">✓ 密钥可用 · 全部套件通过</div>'
-      : '<div class="alert-box">⚠ 部分套件未通过(详见下方)</div>';
-    // HE 库授权状态:ok=success,warn/critical/expired=醒目
+    const suites = rep.suites || [];
+    const descriptions = [
+      [/数组级/, "基础数值计算", "检查加减乘除等数值运算"],
+      [/表级/, "表格计算", "检查表格中的列计算与汇总"],
+      [/分组/, "分类汇总", "检查按类别分组后的统计计算"],
+      [/窗口|多条件/, "连续数据与条件统计", "检查前后期比较、滚动统计和多条件计算"],
+      [/规模/, "较大数据量测试", "检查较多数据下的计算结果与速度"],
+      [/模型级/, "预测模型", "检查本次选取的预测模型"],
+      [/深度/, "连续运算稳定性", "检查多次连续计算后的精度"],
+      [/有效域/, "数值范围检查", "检查不同数值范围下的计算误差"],
+      [/规划器/, "计算方案安全检查", "检查是否拦截不合规方案、标记需要授权解密的步骤"],
+    ];
+    const info = s => descriptions.find(([pattern]) => pattern.test(s.name || "")) || [null, "其他检查", "检查当前计算环境"];
+    const explain = s => {
+      const detail = String(s.detail || "");
+      const count = detail.match(/(\d+)\/(\d+)/);
+      let text = info(s)[2] + "。";
+      if (count) text += `本次 ${count[2]} 项中 ${count[1]} 项通过。`;
+      if (count && Number(count[1]) < Number(count[2]) && s.ok) {
+        text += "部分项目属于已知限制，不计入本次通过判定；不代表所有操作均可用。";
+      } else if (!s.ok) text += "本项未通过，建议重新检查配套文件；仍失败请联系管理员。";
+      else if (!count) text += "本次检查通过。";
+      return text;
+    };
+    const limited = suites.some(s => { const m = String(s.detail || "").match(/(\d+)\/(\d+)/); return s.ok && m && +m[1] < +m[2]; });
+    const head = `<div class="key-check-summary"><span class="badge ${rep.ok ? "ok" : "warn"}">${rep.ok ? "检查通过" : "需要处理"}</span><span>${rep.ok ? (limited ? "按当前判定标准通过，部分操作存在限制" : "本次计算检查通过") : "部分检查未通过，请查看详情"}</span></div>`;
     const lic = rep.license || {};
-    let licBox = "";
-    if (lic.message) {
-      const cls = (lic.level === "ok") ? "success" : (lic.level === "warn") ? "info" : "";
-      licBox = `<div class="alert-box ${cls}">${esc(lic.message)}</div>`;
-    }
-    const rows = (rep.suites || []).map(s =>
-      `<div class="key-row"><div class="key-meta">
-         <span class="badge ${s.ok ? "ok" : "no"}">${s.ok ? "通过" : "未过"}</span>
-         <strong>${esc(s.name)}</strong> <span class="af-s">· ${esc(s.detail)}</span>
-       </div></div>`).join("");
-    const t = rep.scale_tier || {};
-    const tier = t.max_smooth_n
-      ? `<div class="af-s" style="margin-top:8px;">规模:向量化聚合平稳到 ${Number(t.max_smooth_n).toLocaleString()} 行` +
-        `(group-by ${t.groupby_secs_at_max}s);排名/topk 大表自动走授权解密。</div>`
-      : "";
-    const brief = rep.capability_brief
-      ? `<details style="margin-top:8px;"><summary class="af-s" style="cursor:pointer;">能力清单(对拍实测)</summary>` +
-        `<pre class="keycheck-brief">${esc(rep.capability_brief)}</pre></details>`
-      : "";
-    return head + licBox + rows + tier + brief;
+    const rows = suites.map(s => `<div class="key-check-item">
+      <span class="badge ${s.ok ? "ok" : "warn"}">${s.ok ? "通过" : "未通过"}</span>
+      <div><div class="key-check-name">${esc(info(s)[1])}</div><p>${esc(explain(s))}</p></div>
+    </div>`).join("");
+    const tier = rep.scale_tier || {};
+    const size = Number(tier.max_smooth_n);
+    const scale = Number.isFinite(size) && size > 0 ? `<p class="key-check-note">本次测试中，分类汇总完成了 ${size.toLocaleString()} 行数据的处理。这是当前测试结果，不代表所有任务都能达到同样速度或规模。</p>` : "";
+    const raw = suites.map(s => `${s.name || ""}：${s.detail || ""}`).join("\n") + (lic.message ? "\n\n授权状态：" + lic.message : "") + (rep.capability_brief ? "\n\n" + rep.capability_brief : "");
+    const technical = `<details class="key-technical"><summary>技术记录（供管理员排查）</summary><pre class="keycheck-brief">${esc(raw)}</pre></details>`;
+    return head + `<details class="key-check-details"><summary>查看检查详情（${suites.length} 项）</summary>${rows}${scale}${technical}</details>`;
   }
 
-  async function renderAuditTab() {
+async function renderAuditTab() {
+    const body = $("modalBody");
+    body.innerHTML = '<h2>可信审计</h2><p id="auditLoading" class="sub">正在读取记录…</p>';
+    const loading = $("auditLoading");
     let data;
-    try {
-      data = await api("GET", "/api/audit?limit=100");
-    } catch (e) {
-      $("modalBody").innerHTML = `<h2>可信审计</h2><div class="alert-box">读取失败:${esc(e.message)}</div>`;
-      return;
-    }
-    const s = data.summary || {};
-    const chain = data.chain || {};
+    try { data = await api("GET", "/api/audit?limit=200"); }
+    catch (e) { if ($("auditLoading") === loading) body.innerHTML = '<h2>可信审计</h2><div class="alert-box">读取失败：' + esc(e.message) + '</div>'; return; }
+    if ($("auditLoading") !== loading) return;
+    const s = data.summary || {}, chain = data.chain || {};
     const events = (data.events || []).slice().reverse();
-    $("modalBody").innerHTML = `
-      <h2>可信审计</h2>
-      <p class="sub">证明：结构化数值先加密 · 文档正文需明确确认 · 解密均经本机授权可追溯</p>
-      <div class="alert-box ${s.zero_plaintext_holds ? "success" : ""}">${esc(s.statement || "暂无审计记录 —— 跑一次分析后这里会有台账。")}</div>
-      <div class="key-row"><div class="key-meta af-s">
-        LLM 暴露事件 <strong>${s.llm_exposures || 0}</strong> ·
-        密文计算 <strong>${s.cipher_computations || 0}</strong> ·
-        文档正文发送 <strong>${s.document_exposures || 0}</strong> ·
-        解密授权 <strong>${s.decrypt_authorizations || 0}</strong>
-        (授权 ${s.decrypt_granted || 0} / 拒绝或保留密文 ${s.decrypt_denied || 0}) ·
-        疑似明文外发 <strong>${s.plaintext_breaches || 0}</strong>
-      </div></div>
-      <div class="alert-box ${chain.ok ? "success" : ""}">${chain.ok ? `✓ 审计哈希链完整 · ${chain.total || 0} 条事件可核对` : `⚠ 审计链需要复核：${esc(chain.reason || "未知原因")}`}</div>
-      <h3 class="keys-h3">最近事件</h3>
-      <div>${events.length ? events.map(renderAuditEvent).join("") : '<div class="af-s">暂无记录。</div>'}</div>
-      <div style="margin-top:12px;"><button class="btn-primary" id="auditExportBtn">导出合规报告(Word)</button></div>
-    `;
-    $("auditExportBtn").addEventListener("click", () => {
-      // 服务端生成带排版、大白话的 .docx;用隐藏 <a> 触发下载(带登录 cookie)
-      const a = document.createElement("a");
-      a.href = "/api/audit/export";
-      a.download = "";
-      document.body.appendChild(a); a.click(); a.remove();
+    const categories = [["all","全部"],["llm_exposure","模型访问"],["cipher_compute","密文计算"],["decrypt_auth","解密授权"],["document_exposure","文档发送"],["llm_bypass","本地复用"],["other","其他"]];
+    const known = categories.slice(1,-1).map(c => c[0]);
+    const matches = (e, type) => type === "all" || (type === "other" ? !known.includes(e.type) : e.type === type);
+    const stats = [["模型访问",s.llm_exposures],["密文计算",s.cipher_computations],["解密授权",s.decrypt_authorizations],["文档发送",s.document_exposures]];
+    body.innerHTML = `
+      <div class="audit-heading"><h2>可信审计</h2><button class="btn-ghost btn-sm" id="auditExportBtn">导出合规报告</button></div>
+      <p class="sub">查看数据使用、计算及解密授权记录。</p>
+      <div class="audit-stats">${stats.map(([name,n])=>`<div><span>${name}</span><strong>${Number(n)||0}</strong></div>`).join("")}</div>
+      <div class="audit-integrity ${chain.ok ? "is-ok" : "is-warning"}">
+        <strong>${chain.ok ? "审计链完整" : "审计链需要复核"}</strong>
+        <p>${chain.ok ? "记录已通过完整性校验。" : "部分记录未通过完整性校验，请导出报告交由管理员排查。"}
+        ${Number(s.plaintext_breaches) ? `发现 ${Number(s.plaintext_breaches)} 次疑似明文外发。` : "记录中未发现疑似结构化明文外发。"}</p>
+        ${chain.ok ? "" : `<details><summary>查看异常原因</summary><p>${esc(chain.reason || "原因未记录")}</p></details>`}
+      </div>
+      <div class="audit-records-head"><h3>事件记录</h3><span>最近 ${events.length} 条 · 总记录 ${Number(s.total_events)||events.length} 条</span></div>
+      <div id="auditFilters" class="audit-filters" role="group" aria-label="事件分类">
+        ${categories.map(([type,label])=>`<button class="audit-filter" data-audit-type="${type}" aria-pressed="${type==="all"}">${label} <span>${events.filter(e=>matches(e,type)).length}</span></button>`).join("")}
+      </div>
+      <div id="auditEvents"></div>
+      <div class="audit-pagination"><span id="auditPageInfo" role="status"></span><div><button class="btn-ghost btn-sm" id="auditPrev">上一页</button><button class="btn-ghost btn-sm" id="auditNext">下一页</button></div></div>
+      <p class="audit-scope">分类和分页针对最近 200 条记录；报告导出不受当前分类和页码影响。</p>`;
+    let category="all", page=1;
+    const filters=$("auditFilters");
+    const renderPage=()=>{
+      const filtered=events.filter(e=>matches(e,category)), pages=Math.max(1,Math.ceil(filtered.length/8));
+      page=Math.max(1,Math.min(page,pages));
+      $("auditEvents").innerHTML=filtered.slice((page-1)*8,page*8).map(e=>{
+        const name=categories.find(c=>c[0]===e.type)?.[1]||"其他事件";
+        const detail=renderAuditEvent(e)||`<p>${esc(e.detail || e.type || "暂无说明")}</p>`;
+        const warning=(e.type==="llm_exposure" && !e.no_plaintext)||(e.type==="cipher_compute" && !e.no_structured_plaintext_to_llm);
+        const status=e.type==="decrypt_auth" ? ({granted:"已授权",denied:"已拒绝",keep_encrypted:"保留密文"})[e.decision]||"已取消" : warning ? "需要复核" : "已记录";
+        return `<details class="audit-event"><summary><span>${name}</span><span class="badge ${warning?"warn":""}">${status}</span><time>${esc((e.ts||"").replace("T"," ").slice(0,19))}</time></summary><div class="audit-event-detail">${detail}</div></details>`;
+      }).join("")||'<p class="audit-empty">此分类暂无记录</p>';
+      $("auditPageInfo").textContent=`第 ${page} / ${pages} 页 · ${filtered.length} 条`;
+      $("auditPrev").disabled=page===1; $("auditNext").disabled=page===pages;
+      filters.querySelectorAll("[data-audit-type]").forEach(btn=>btn.setAttribute("aria-pressed",String(btn.dataset.auditType===category)));
+    };
+    filters.querySelectorAll("[data-audit-type]").forEach(btn=>btn.addEventListener("click",()=>{category=btn.dataset.auditType;page=1;renderPage();}));
+    $("auditPrev").addEventListener("click",()=>{page--;renderPage();});
+    $("auditNext").addEventListener("click",()=>{page++;renderPage();});
+    $("auditExportBtn").addEventListener("click",()=>{
+      const a=document.createElement("a"); a.href="/api/audit/export";a.download="";
+      document.body.appendChild(a);a.click();a.remove();
     });
+    renderPage();
   }
 
   function renderAuditEvent(e) {
@@ -199,16 +211,20 @@
   function bindKeyDrop(zoneId, inputId, label, endpoint) {
     const zone = $(zoneId), inp = $(inputId);
     if (!zone || !inp) return;
+    let uploading = false;
     async function upload(file) {
+      if (uploading) return;
+      uploading = true; inp.disabled = true;
+      const statusBox = $("kStatus");
       const fd = new FormData(); fd.append("file", file);
-      $("kStatus").innerHTML = `<div class="alert-box info">${esc(label)} 写入沙盒中…</div>`;
+      statusBox.innerHTML = `<div class="alert-box info">正在导入${esc(label)}…</div>`;
       try {
         const res = await api("POST", endpoint, fd, true);
-        $("kStatus").innerHTML = `<div class="alert-box success">✓ ${esc(label)} 已写入沙盒(${(res.size_bytes / 1024).toFixed(1)} KB)</div>`;
-        setTimeout(renderKeysTab, 600);
+        statusBox.innerHTML = `<div class="alert-box success">${esc(label)}已导入</div>`;
+        setTimeout(() => { if ($("kStatus") === statusBox) renderKeysTab(); }, 600);
       } catch (e) {
-        $("kStatus").innerHTML = `<div class="alert-box">${esc(label)} 上传失败:${esc(e.message)}</div>`;
-      }
+        statusBox.innerHTML = `<div class="alert-box">${esc(label)}导入失败：${esc(e.message)}</div>`;
+      } finally { uploading = false; inp.disabled = false; inp.value = ""; }
     }
     inp.addEventListener("change", e => { if (e.target.files[0]) upload(e.target.files[0]); });
     zone.querySelectorAll("[data-pick]").forEach(p =>

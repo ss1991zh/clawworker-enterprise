@@ -1,0 +1,42 @@
+const fs = require('fs'), path = require('path'), vm = require('vm'), assert = require('assert');
+const elements = new Map();
+const $ = id => {
+  if (!elements.has(id)) elements.set(id, { innerHTML: '', querySelectorAll: () => [], addEventListener() {} });
+  return elements.get(id);
+};
+let present = true;
+const context = { window: {} };
+vm.createContext(context);
+vm.runInContext(fs.readFileSync(path.join(__dirname, '../client/webui/static/settings-ui.js'), 'utf8'), context);
+const ui = context.window.ClawSettingsUI.create({ $, esc: v => String(v).replaceAll('<', '&lt;'),
+  title: () => '同态密钥', api: async () => ({ sk_present: present, evk_present: present, user_auth_present: true }) });
+(async () => {
+  await ui.renderKeysTab();
+  let html = $('modalBody').innerHTML;
+  assert(html.includes('私钥'));
+  assert(html.includes('<h3>计算能力检查</h3>'));
+  assert(!html.includes('解密密钥'));
+  assert.equal((html.match(/<details class="key-file-card"\s*>/g) || []).length, 2);
+  assert(html.includes('更换'));
+  assert(html.indexOf('key-upload-hint') > html.indexOf('拖入文件'));
+  present = false;
+  await ui.renderKeysTab();
+  html = $('modalBody').innerHTML;
+  assert.equal((html.match(/<details class="key-file-card" open>/g) || []).length, 2);
+  assert(html.includes('id="keycheckBtn" disabled'));
+  const result = ui.renderKeycheckResult({ ok: false, suites: [{ ok: false, name: '<unsafe>', detail: 'error' }], license: { level: 'expired', message: '授权已过期' } });
+  assert(result.includes('需要处理'));
+  assert(result.includes('<details class="key-check-details">'));
+  assert(result.indexOf('授权已过期') > result.indexOf('class="key-technical"'));
+  assert(!result.includes('key-license-note'));
+  assert(!result.includes('<summary>能力清单</summary>'));
+  assert(!result.includes('<unsafe>'));
+  assert(!result.includes('alert-box'));
+  const limited = ui.renderKeycheckResult({ ok: true, suites: [{ ok: true, name: '数组级 (henumpy+synth)', detail: '33/37 通过(已知坏: greater)' }], license: { available: false, message: '未捕获到授权信息' } });
+  assert(limited.includes('基础数值计算'));
+  assert(limited.includes('37 项中 33 项通过'));
+  assert(limited.includes('不代表所有操作均可用'));
+  assert(!limited.includes('授权状态暂未确认'));
+  assert(limited.includes('技术记录（供管理员排查）'));
+  console.log('Compact key settings passed');
+})().catch(e => { console.error(e); process.exitCode = 1; });

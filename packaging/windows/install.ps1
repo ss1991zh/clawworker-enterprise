@@ -51,6 +51,7 @@ if (Test-Path $Wheels) {
 }
 
 # ---- 1. 固定 Python 3.11 运行时。----
+Write-Output 'CW_STAGE:PYTHON'
 # 离线 wheel 是 cp311/win_amd64 集合,不能因为目标机已有 Python 3.12/3.13 就误用它。
 # 优先复用可运行的 3.11;没有就静默安装随包 3.11。只有在没有离线包的源码安装模式下,
 # 才允许回退到其他 3.11+ 版本并联网解析依赖。
@@ -124,6 +125,7 @@ if (-not $venvReady) {
 if ($LASTEXITCODE -ne 0) { throw "初始化 pip 失败(退出码 $LASTEXITCODE)。" }
 
 # ---- 3. 装依赖 ----
+Write-Output 'CW_STAGE:DEPENDENCIES'
 if (-not (Test-Path $RoleRequirements)) {
     throw "缺少角色依赖清单:$RoleRequirements"
 }
@@ -142,6 +144,7 @@ if ($Role -eq "client" -or $Role -eq "both") {
 }
 
 # ---- 4. 用户端装 4 个 HE 库；管理端不携带、不安装密态计算运行库 ----
+Write-Output 'CW_STAGE:HE'
 if ($Role -eq "client" -or $Role -eq "both") {
     $libs = @("crypto_toolkit-64_dev", "henumpy-dev", "pandaseal-dev", "helearn-dev")
     if (Test-Path $HeLibs) {
@@ -168,6 +171,7 @@ if ($Role -eq "client" -or $Role -eq "both") {
 }
 
 # ---- 4.4 管理端 SQL Server ODBC 运行环境。----
+Write-Output 'CW_STAGE:SYSTEM'
 # pyodbc 只是 Python 绑定，真正连接 SQL Server 还需要微软 ODBC Driver 18。
 # 管理端安装包内置微软签名 MSI；已有驱动则跳过，避免重复安装。
 if ($Role -eq "admin" -or $Role -eq "both") {
@@ -264,6 +268,7 @@ if ($Role -eq "admin" -or $Role -eq "both") {
 }
 
 # ---- 4.75 真实启动自检。----
+Write-Output 'CW_STAGE:VERIFY'
 # 仅能 import 不代表 lifespan、控制库、调度器和本地存储真正可用；用随机 loopback
 # 端口启动一次角色服务并等待 /readyz，失败就拒绝完成安装并给出日志路径。
 $PostInstallSmoke = Join-Path $Here "post_install_smoke.py"

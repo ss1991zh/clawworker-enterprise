@@ -4,11 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>{% block title %}Admin · Clawworker Enterprise{% endblock %}</title>
+  <link rel="icon" type="image/png" href="/admin/static/logo.png?v={{ asset_ver('logo.png') }}">
   <link rel="stylesheet" href="/admin/static/admin.css?v={{ asset_ver('admin.css') }}">
 </head>
 <body>
   <header class="topbar">
-    <div class="brand"><span class="brand-mark">C</span><span class="brand-copy">Clawworker <span class="sub">企业管理控制台</span></span></div>
+    <div class="brand"><img class="brand-mark" src="/admin/static/logo.png?v={{ asset_ver('logo.png') }}" alt="Clawworker"><span class="brand-copy">Clawworker <span class="sub">企业管理控制台</span></span></div>
     <div class="nav-label">工作台</div>
     <nav>
       <a href="/admin/" class="{% if active=='dashboard' %}active{% endif %}">概览</a>

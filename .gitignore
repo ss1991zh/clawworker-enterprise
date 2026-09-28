@@ -101,3 +101,9 @@ local_data/
 *.log
 logs/
 .test-deps/
+.build-tools/
+# Generated installer artwork (recreated by build_installers.ps1)
+packaging/windows/installer-wave/
+packaging/windows/installer-backdrop.bmp
+packaging/windows/installer-circle.bmp
+packaging/windows/installer-logo.bmp

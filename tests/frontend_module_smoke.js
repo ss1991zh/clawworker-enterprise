@@ -54,6 +54,9 @@ if (!waitingHtml.includes('data-choice="decrypt"') || !waitingHtml.includes('dat
 const cancelledHtml = chat.renderMessage({ ...waitingMessage, status: "cancelled" }).innerHTML;
 if (cancelledHtml.includes(waitingMessage.summary) || cancelledHtml.includes('class="ask-card"')) throw new Error("cancelled run rendered analysis as warning");
 if (!cancelledHtml.includes("恢复问题与数据")) throw new Error("cancelled run missing recovery action");
+if (!cancelledHtml.includes('class="bubble md" role="status"') || !cancelledHtml.includes("已记录 Token：未记录")) throw new Error("stopped message must use body style and distinguish missing usage");
+const stoppedUsageHtml = chat.renderMessage({ ...waitingMessage, status: "cancelled", tokens: 1234, tokens_recorded: true, duration_sec: 12.5 }).innerHTML;
+if (!stoppedUsageHtml.includes("1,234") || !stoppedUsageHtml.includes("12.50 秒")) throw new Error("stopped message lost usage statistics");
 if (cancelledHtml.includes("data-copy-message") || initialWaitingHtml.includes("data-copy-message")) throw new Error("unfinished message exposes hover actions");
 if (!waitingHtml.includes('data-stage="0"')) throw new Error("initial authorization render skipped playback");
 const playbackState = { typedMids: new Set() };

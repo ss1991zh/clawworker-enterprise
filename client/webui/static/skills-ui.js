@@ -130,7 +130,10 @@
     if (!box) return;
     const list = state.skills?.skill_md || [];
     if (!list.length) { box.innerHTML = '<div class="alert-box info">还没有技能 · 拖入技能包添加</div>'; return; }
-    box.innerHTML = list.map(s => `
+    const builtin = list.filter(s => !s.is_user);
+    const custom = list.filter(s => s.is_user);
+    const expanded = !!box.querySelector('.builtin-skill-group')?.open;
+    const renderRows = items => items.map(s => `
       <div class="list-item">
         <div class="grow">
           <div class="t">${esc(s.name)}
@@ -144,6 +147,10 @@
           : `<span class="badge ok">内置</span>`}
       </div>
     `).join("");
+    box.innerHTML = `<details class="builtin-skill-group" ${expanded ? 'open' : ''}>
+      <summary>内置技能 <span class="skill-count">${builtin.length}</span></summary>
+      <div class="builtin-skill-list">${renderRows(builtin)}</div>
+    </details>${custom.length ? `<h3 class="section-heading">我的技能 <span class="skill-count">${custom.length}</span></h3>${renderRows(custom)}` : ''}`;
     box.querySelectorAll("[data-view-md]").forEach(b => b.addEventListener("click", () => {
       showSkillMd(b.dataset.viewMd);
     }));

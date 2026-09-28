@@ -22,6 +22,7 @@ $AppVersion = $VersionMatch.Matches[0].Groups[1].Value
 # 找 Inno Setup 编译器 ISCC.exe
 $iscc = $null
 foreach ($p in @(
+    "$PSScriptRoot\..\..\.build-tools\inno\ISCC.exe",
     "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
     "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
     "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe")) {
@@ -85,6 +86,14 @@ if (-not $py) {
 }
 if (-not $py) { throw "未找到 Python，无法解析并验证角色离线依赖。" }
 
+# Artwork is generated locally, not stored as large binary frames in Git.
+& $py -c "import PIL, numpy"
+if ($LASTEXITCODE -ne 0) {
+    throw "构建背景需要 Pillow 和 NumPy；请在构建 Python 中安装 requirements-artwork.txt。"
+}
+& $py (Join-Path $Here "render_installer_backdrop.py")
+if ($LASTEXITCODE -ne 0) { throw "安装器背景生成失败。" }
+
 foreach ($role in @("admin", "client")) {
     $roleReq = Join-Path $Here "requirements-$role.txt"
     if (-not (Test-Path $roleReq)) { throw "缺少角色依赖清单:$roleReq" }
@@ -136,14 +145,14 @@ foreach ($role in @("admin", "client")) {
 }
 
 $dist = Join-Path $Here "dist"
-$built = @(Get-ChildItem -LiteralPath $dist -Filter "Clawworker-*-Setup-$AppVersion.exe")
+$built = @(Get-ChildItem -LiteralPath $dist -Filter "Clawworker-*-Setup-$AppVersion-modern.exe")
 if ($built.Count -ne 2) { throw "预期生成 2 个 $AppVersion 安装包，实际为 $($built.Count) 个。" }
 $hashLines = @()
 foreach ($file in ($built | Sort-Object Name)) {
     $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     $hashLines += "$hash *$($file.Name)"
 }
-$hashFile = Join-Path $dist "SHA256SUMS-$AppVersion.txt"
+$hashFile = Join-Path $dist "SHA256SUMS-$AppVersion-modern.txt"
 [IO.File]::WriteAllLines($hashFile, $hashLines, [Text.UTF8Encoding]::new($false))
 
 Write-Host ""

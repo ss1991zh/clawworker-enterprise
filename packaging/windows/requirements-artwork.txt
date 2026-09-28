@@ -1,0 +1,3 @@
+# Build-time only; not installed on end-user computers.
+Pillow>=10
+numpy>=1.26

@@ -177,7 +177,10 @@
         const cancelText = waitingForDecrypt
           ? "解密授权未完成，任务已取消（可能已超时）。请重新发起任务，再选择解密查看或保留密文。"
           : "任务已停止，可恢复问题后重新发送。";
-        content += `<div class="cancel-notice" role="status">${cancelText}</div>`;
+        content += `<div class="bubble md" role="status">${cancelText}</div>`;
+        const stoppedTokens = m.tokens_recorded || Number(m.tokens) > 0 ? Number(m.tokens || 0).toLocaleString() : "未记录";
+        const stoppedTime = Number.isFinite(m.duration_sec) ? `${m.duration_sec.toFixed(2)} 秒` : "未记录";
+        content += `<div class="run-meta" title="Token 为停止前已收到的模型用量；中断请求未返回的用量可能未计入。">已记录 Token：${stoppedTokens} · 总用时：${stoppedTime}</div>`;
         content += `<div class="db-recovery-actions"><button type="button" class="btn-ghost" data-restore-request>恢复问题与数据</button></div>`;
       } else if (awaitingDecrypt && !authorizationReady) {
         content += `<div class="run-meta">正在展示计算过程，完成后请选择结果的展示方式。</div>`;
